@@ -24,8 +24,8 @@ dev = [
     "pre-commit>=3.7",
 ]
 
-[tool.hatch.build.targets.wheel]
-packages = ["src/myproject"]
+[tool.uv.build-backend]
+module-name = "team_project"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -35,9 +35,6 @@ line-length = 88
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
-
-[project.scripts]
-6700-team-project = "6700_team_project:main"
 
 [build-system]
 requires = ["uv_build>=0.12.13,<0.13.0"]
