@@ -18,3 +18,9 @@ These will be installed automatically below.
 3. ```cd 6700-team-project```
 2. Then use ```uv sync --extra dev --frozen``` to install dependencies
 3. Use ```uv pytest``` to run
+
+
+#### Key functions 
+``` enter functions here```
+``` enter functions here```
+``` enter functions here```
