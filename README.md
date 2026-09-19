@@ -21,6 +21,6 @@ These will be installed automatically below.
 
 
 #### Key functions 
-``` enter functions here```
-``` enter functions here```
-``` enter functions here```
+``` enter docstrings from functions here```
+``` enter docstrings from functions here```
+``` enter docstrings from functions here```
