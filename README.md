@@ -1,5 +1,5 @@
 ### Homework 1
-For this assignment, we were tasked with building a Python package. Specifically using uv as a package manager for the toml and src benefits. 
+For this assignment, we were tasked with building a Python package. Specifically using uv as a package manager for the benefits of the toml file and src file structure.
 
 #### Dependencies 
 These will be installed automatically below. 
