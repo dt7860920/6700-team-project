@@ -13,6 +13,8 @@ These will be installed automatically below.
 - uvicorn
 
 #### Running the code
-1. In terminal, install ```uv``` using ```pip install uv```
+1. In terminal, install ```uv``` using ```pip install uv``` or ```pipx install uv```
 2. Clone the repo using ```git clone <repo link>```
-2. Then use ```uv sync --frozen``` to install dependencies
+3. ```cd 6700-team-project```
+2. Then use ```uv sync --extra dev --frozen``` to install dependencies
+3. Use ```uv pytest``` to run
