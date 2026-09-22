@@ -2,7 +2,7 @@
 For this assignment, we were tasked with building a Python package. Specifically using uv as a package manager for the benefits of the toml file and src file structure.
 
 #### Dependencies 
-These will be installed automatically below. 
+These will be installed automatically in step 4. 
 - fastapi
 - httpx
 - mypy
