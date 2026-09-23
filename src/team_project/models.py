@@ -1,9 +1,9 @@
-from enum import Enum
+from enum import StrEnum
 
 from pydantic import BaseModel, Field, field_validator
 
 
-class InterestCategory(str, Enum):
+class InterestCategory(StrEnum):
     reading = "reading"
     exercise = "exercise"
     exploring = "exploring"

@@ -15,10 +15,11 @@ def test_health_returns_ok(client):
 
 def test_predict_returns_relevant_categories(client, grad_student_request):
     '''
-    Sending the test grad student's sample categories to the prediction endpoint. Asserts that health endpoint returns 200 and '
-    the categories are either reading, exercies, or exploring. 
+    Sending the grad student's sample categories to the prediction endpoint.
+    Asserts that the response is 200 and the categories are a subset of the
+    expected recommendation categories.
 
-    Args: 
+    Args:
     client - Test client used for this assignment
     grad_student_requests - grad student's user_id and interests.
     '''
@@ -30,10 +31,11 @@ def test_predict_returns_relevant_categories(client, grad_student_request):
 
 def test_predict_respects_max_results(client, pentagon_worker_request):
     '''
-    Sending the test pentagon employee's sample categories to the prediction endpoint. Asserts that health endpoint returns 200 and 
-    the length of the recommendatons is no longer than a specific value (3). 
+    Sending the pentagon employee's sample categories to the prediction
+    endpoint. Asserts that the response is 200 and the number of
+    recommendations does not exceed the request max.
 
-    Args: 
+    Args:
     client - Test client used for this assignment
     pentagon_worker_requests - pentagon employee's user_id and interests.
     '''
