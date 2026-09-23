@@ -16,8 +16,9 @@ These will be installed automatically in step 4.
 1. In terminal, install ```uv``` using ```pip install uv``` or ```pipx install uv```
 2. Clone the repo using ```git clone <repo link>```
 3. ```cd 6700-team-project```
-2. Then use ```uv sync --extra dev --frozen``` to install dependencies
-3. Use ```uv run pytest``` to run
+4. Then use ```uv sync --extra dev --frozen``` to install dependencies
+5. Use ```uv run pytest``` to run tests on our dependencies
+6. use ```uv run uvicorn --app-dir src team_project.api:app --reload``` to 'open' the app
 
 
 #### Key functions 
