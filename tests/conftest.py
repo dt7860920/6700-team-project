@@ -12,9 +12,9 @@ def client():
 
 @pytest.fixture
 def grad_student_request():
-    '''
+    """
     Building a user. A grad student with interest in reading, running, and exploring.
-    '''
+    """
     return RecommendationRequest(
         user_id="grad_student_1",
         interests=["reading", "running", "exploring"],
@@ -23,12 +23,9 @@ def grad_student_request():
 
 @pytest.fixture
 def pentagon_worker_request():
-    '''
-    Building a user. A pentagon worker with interest in food and sports bars. 
-    '''
+    """
+    Building a user. A pentagon worker with interest in food and sports bars.
+    """
     return RecommendationRequest(
         user_id="pentagon_worker_1", interests=["food", "sports_bar"], max_results=3
     )
-
-
-
