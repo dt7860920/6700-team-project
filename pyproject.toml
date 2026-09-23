@@ -5,7 +5,8 @@ description = "Add your description here"
 readme = "README.md"
 authors = [
     { name = "Jeffrey Pinarchick", email = "jp2249@georgetown.edu" }, 
-    { name = "Kenedy Ducheine", email = "kd937@georgetown.edu"}
+    { name = "Kenedy Ducheine", email = "kd937@georgetown.edu"},
+    { name = "Sazan Khalid", email = "sk2153@georgetown.edu"}
 ]
 requires-python = ">=3.13"
 dependencies = [
