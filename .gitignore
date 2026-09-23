@@ -1,2 +1,8 @@
-.env.example.local
-.env.example.production
+.env
+__pycache__/
+.DS_Store
+.venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+dist/
