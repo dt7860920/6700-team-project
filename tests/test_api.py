@@ -10,7 +10,7 @@ def test_health_returns_ok(client):
     """
     response = client.get("/health")
     assert response.status_code == 200
-    assert response.json()["status"] == "ok"
+    assert response.json() == {"status": "ok"}
 
 
 def test_predict_returns_relevant_categories(client, grad_student_request):
@@ -42,16 +42,3 @@ def test_predict_respects_max_results(client, pentagon_worker_request):
     response = client.post("/predict", json=pentagon_worker_request.model_dump())
     body = response.json()
     assert len(body["recommendations"]) <= pentagon_worker_request.max_results
-
-def test_health_returns_ok(client):
-    """
-    Makes sure that our /health only returns the status of our app rather than leaking
-    enironmental details.  Asserts that our status code is 200 (server recieved, understood, and processed the request)
-    and provided a status of "ok"
-
-    Args:
-    client - Test client
-    """
-    response = client.get("/health")
-    assert response.status_code == 200
-    assert response.json() == {"status": "ok"}
