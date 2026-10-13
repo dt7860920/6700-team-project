@@ -12,7 +12,7 @@ app = FastAPI(title=settings.app_name)
 
 @app.get("/health")
 def health() -> dict[str, str]:
-    return {"status": "ok", "environment": settings.environment}
+    return {"status": "ok"}
 
 
 @app.post("/predict", response_model=RecommendationResponse)
