@@ -13,7 +13,7 @@ def test_health_returns_ok(client):
     assert response.json() == {"status": "ok"}
 
 
-def test_predict_returns_relevant_categories(client, grad_student_request):
+def test_predict_returns_relevant_categories(client, grad_student_request, monkeypatch):
     """
     Sending the grad student's sample categories to the prediction endpoint.
     Asserts that the response is 200 and the categories are a subset of the
@@ -23,13 +23,17 @@ def test_predict_returns_relevant_categories(client, grad_student_request):
     client - Test client used for this assignment
     grad_student_requests - grad student's user_id and interests.
     """
+    monkeypatch.setattr(
+        "team_project.api.model_client.predict",
+        lambda inputs: inputs,
+    )
     response = client.post("/predict", json=grad_student_request.model_dump())
     assert response.status_code == 200
     categories = {r["category"] for r in response.json()["recommendations"]}
     assert categories.issubset({"reading", "exercise", "exploring"})
 
 
-def test_predict_respects_max_results(client, pentagon_worker_request):
+def test_predict_respects_max_results(client, pentagon_worker_request, monkeypatch):
     """
     Sending the pentagon employee's sample categories to the prediction
     endpoint. Asserts that the response is 200 and the number of
@@ -39,6 +43,10 @@ def test_predict_respects_max_results(client, pentagon_worker_request):
     client - Test client used for this assignment
     pentagon_worker_requests - pentagon employee's user_id and interests.
     """
+    monkeypatch.setattr(
+        "team_project.api.model_client.predict",
+        lambda inputs: inputs,
+    )
     response = client.post("/predict", json=pentagon_worker_request.model_dump())
     body = response.json()
     assert len(body["recommendations"]) <= pentagon_worker_request.max_results

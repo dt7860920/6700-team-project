@@ -11,7 +11,7 @@ class ModelBackend(Protocol):
 
 
 class LocalModel:
-    """In-process backend; wraps the stub model until a real one replaces it."""
+    """In-process backend that owns the model loaded at application startup."""
 
     def __init__(self, path: str, device: str) -> None:
         self.path = path
