@@ -3,6 +3,7 @@ from typing import Protocol
 import httpx
 
 from team_project.config import Settings, settings
+from team_project.fakemodel import FakeModel
 
 
 class ModelBackend(Protocol):
@@ -10,14 +11,15 @@ class ModelBackend(Protocol):
 
 
 class LocalModel:
-    """Temporary in-process backend until the real model replaces the stub."""
+    """In-process backend; wraps the stub model until a real one replaces it."""
 
     def __init__(self, path: str, device: str) -> None:
         self.path = path
         self.device = device
+        self._model = FakeModel()
 
     def predict(self, inputs: list[str]) -> list[str]:
-        return inputs
+        return self._model.predict(inputs)
 
 
 class RemoteModel:
@@ -48,7 +50,6 @@ class ModelClient:
                 device=app_settings.model_device,
             )
         else:
-            # Settings validation guarantees the service URL is present here.
             assert app_settings.model_service_url is not None
             api_key = (
                 app_settings.model_service_api_key.get_secret_value()

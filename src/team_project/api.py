@@ -3,7 +3,7 @@ import asyncio
 from fastapi import FastAPI
 
 from team_project.config import settings
-from team_project.fakemodel import model
+from team_project.model_client import model_client
 from team_project.models import (
     Alias_To_Cat,
     Recommendation,
@@ -23,7 +23,9 @@ def health() -> dict[str, str]:
 async def predict(req: RecommendationRequest) -> RecommendationResponse:
     # Offload the blocking model call to a worker thread so the event loop
     # stays responsive under concurrent requests.
-    predicted = await asyncio.to_thread(model.predict, [c.value for c in req.interests])
+    predicted = await asyncio.to_thread(
+        model_client.predict, [c.value for c in req.interests]
+    )
     predicted = predicted[: req.max_results]
     recommendations: list[Recommendation] = []
     for item in predicted:
