@@ -3,6 +3,7 @@ from typing import Protocol
 import httpx
 
 from team_project.config import Settings, settings
+from team_project.fakemodel import FakeModel
 
 
 class ModelBackend(Protocol):
@@ -10,14 +11,15 @@ class ModelBackend(Protocol):
 
 
 class LocalModel:
-    """Temporary in-process backend until the real model replaces the stub."""
+    """In-process backend that owns the model loaded at application startup."""
 
     def __init__(self, path: str, device: str) -> None:
         self.path = path
         self.device = device
+        self._model = FakeModel()
 
     def predict(self, inputs: list[str]) -> list[str]:
-        return inputs
+        return self._model.predict(inputs)
 
 
 class RemoteModel:
