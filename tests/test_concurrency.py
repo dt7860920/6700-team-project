@@ -28,5 +28,8 @@ async def main():
 asyncio.run(main())
 
 #Wall-Clock Time (Pre-Fix): 15.058 Seconds
-#Slowest Request (Pre-Fix): Request 9 (15.0485 seconds)
+#Slowest Request (Pre-Fix): Request 9 (15.0485 Seconds)
+
+#Wall-Clock Time (Post-Fix): 1.528 Seconds
+#Slowest Request (Post-Fix): Request 0 (1.5251 Seconds)
 

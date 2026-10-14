@@ -20,7 +20,7 @@ def health() -> dict[str, str]:
 
 @app.post("/predict", response_model=RecommendationResponse)
 async def predict(req: RecommendationRequest) -> RecommendationResponse:
-    predicted_categories = model.predict([c.value for c in req.interests])
+    predicted_categories = await asyncio.to_thread(model.predict, [c.value for c in req.interests], ) #Changed to use model.predict and c.value rather than predicting each value!
     predicted_categories = predicted_categories[: req.max_results]
     recommendations: list[Recommendation] = []
     for item in predicted_categories:
@@ -30,11 +30,3 @@ async def predict(req: RecommendationRequest) -> RecommendationResponse:
             continue
         recommendations.append(Recommendation(name=f"Sample {category.value}", category=category, distance_miles=0.5,))
     return RecommendationResponse(user_id=req.user_id, recommendations=recommendations,)
-
-#Keeping old Code for reference
-# def predict(req: RecommendationRequest) -> RecommendationResponse:
-#     fake_results = [
-#         Recommendation(name=f"Sample {c.value}", category=c, distance_miles=0.5)
-#         for c in req.interests[: req.max_results]
-#     ]
-#     return RecommendationResponse(user_id=req.user_id, recommendations=fake_results)
