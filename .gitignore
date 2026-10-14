@@ -1,2 +1,7 @@
-.env.example.local
-.env.example.production
+.env
+.env.*
+!.env.example.local
+!.env.example.production
+__pycache__/
+*.py[cod]
+.pytest_cache/
