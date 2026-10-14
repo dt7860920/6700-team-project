@@ -8,6 +8,7 @@ from team_project.models import (
     RecommendationResponse,
 )
 from team_project.fakemodel import model
+import asyncio
 
 app = FastAPI(title=settings.app_name)
 
@@ -18,7 +19,7 @@ def health() -> dict[str, str]:
 
 
 @app.post("/predict", response_model=RecommendationResponse)
-def predict(req: RecommendationRequest) -> RecommendationResponse:
+async def predict(req: RecommendationRequest) -> RecommendationResponse:
     predicted_categories = model.predict([c.value for c in req.interests])
     predicted_categories = predicted_categories[: req.max_results]
     recommendations: list[Recommendation] = []

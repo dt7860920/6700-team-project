@@ -10,7 +10,7 @@ async def one_request(client, payload):
 
 async def main():
     payload = {"user_id": "test", "interests": ["reading"]}
-    async with httpx.AsyncClient(base_url="http://127.0.0.1:8000") as client:
+    async with httpx.AsyncClient(base_url="http://127.0.0.1:8000", timeout=30.0) as client:
         tasks = [one_request(client, payload) for _ in range(10)]
         batch_start = time.perf_counter()
         results = await asyncio.gather(*tasks)
@@ -27,5 +27,6 @@ async def main():
     print(f"All Succeeded: {all(r.status_code == 200 for r in responses)}")
 asyncio.run(main())
 
-#Wall-Clock Time (Pre-Fix): 1.526 Seconds
-#Slowest Request (Pre-Fix): Request 0 (1.5221 seconds)
+#Wall-Clock Time (Pre-Fix): 15.058 Seconds
+#Slowest Request (Pre-Fix): Request 9 (15.0485 seconds)
+
