@@ -10,6 +10,8 @@ RUN uv sync --frozen --no-dev --no-install-project
 COPY --chown=app . . 
 RUN uv sync --frozen --no-dev 
 
+RUN mkdir -p /home/app/.cache && chown -R app /home/app/.cache
+
 USER app
 EXPOSE 8000
 
