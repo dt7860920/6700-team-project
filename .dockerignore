@@ -1,0 +1,27 @@
+## things to ignore
+# Required: never in the image (**/ also catches copies in subfolders)
+**/.venv/
+.git/
+.env
+.env.*
+!.env.example
+
+# Stray old folder with its own 86 MB virtual environment
+6700-team-project/
+
+# Python caches and tool output
+**/__pycache__/
+**/*.pyc
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+**/.DS_Store
+
+# Not needed to run the service
+.github/
+tests/
+.pre-commit-config.yaml
+
+# Docker files themselves
+Dockerfile
+.dockerignore
