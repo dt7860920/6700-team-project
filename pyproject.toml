@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 authors = [
-    { name = "Jeffrey Pinarchick", email = "jp2249@georgetown.edu" }, 
+    { name = "Jeffrey Pinarchick", email = "jp2249@georgetown.edu" },
     { name = "Kenedy Ducheine", email = "kd937@georgetown.edu"},
     { name = "Sazan Khalid", email = "sk2153@georgetown.edu"},
     { name = "Junyi Tang", email = "dt786@georgetown.edu" }
@@ -31,6 +31,7 @@ dev = [
 module-name = "team_project"
 
 [tool.pytest.ini_options]
+asyncio_mode = "auto"
 testpaths = ["tests"]
 pythonpath = ["src"]
 
@@ -43,3 +44,8 @@ select = ["E", "F", "I", "UP", "B"]
 [build-system]
 requires = ["uv_build>=0.12.13,<0.13.0"]
 build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest-asyncio>=1.4.0",
+]

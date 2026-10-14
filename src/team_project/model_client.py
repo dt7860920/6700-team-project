@@ -50,7 +50,6 @@ class ModelClient:
                 device=app_settings.model_device,
             )
         else:
-            # Settings validation guarantees the service URL is present here.
             assert app_settings.model_service_url is not None
             api_key = (
                 app_settings.model_service_api_key.get_secret_value()
