@@ -52,6 +52,15 @@ docker compose up -d
 project has no external service dependency (no database), so `compose.yml`
 defines only the app service.
 
+## Deployment
+
+The service is deployed on Jetstream2 using `docker compose up -d`, with only the
+application port (8000) published to the internet.
+
+- **Live URL:** http://149.165.168.237:8000
+- **Health check:** `curl http://149.165.168.237:8000/health` → `{"status":"ok"}`
+- **Interactive API docs:** http://149.165.168.237:8000/docs
+
 ## Endpoints
 ```bash
 curl http://localhost:8000/health
