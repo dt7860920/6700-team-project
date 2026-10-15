@@ -31,6 +31,7 @@ dev = [
 module-name = "team_project"
 
 [tool.pytest.ini_options]
+asyncio_mode = "auto"
 testpaths = ["tests"]
 pythonpath = ["src"]
 
@@ -43,3 +44,8 @@ select = ["E", "F", "I", "UP", "B"]
 [build-system]
 requires = ["uv_build>=0.12.13,<0.13.0"]
 build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest-asyncio>=1.4.0",
+]
