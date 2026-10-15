@@ -1,7 +1,11 @@
+import asyncio
+
 from fastapi import FastAPI
 
 from team_project.config import settings
+from team_project.fakemodel import model
 from team_project.models import (
+    Alias_To_Cat,
     Recommendation,
     RecommendationRequest,
     RecommendationResponse,
@@ -16,9 +20,21 @@ def health() -> dict[str, str]:
 
 
 @app.post("/predict", response_model=RecommendationResponse)
-def predict(req: RecommendationRequest) -> RecommendationResponse:
-    fake_results = [
-        Recommendation(name=f"Sample {c.value}", category=c, distance_miles=0.5)
-        for c in req.interests[: req.max_results]
-    ]
-    return RecommendationResponse(user_id=req.user_id, recommendations=fake_results)
+async def predict(req: RecommendationRequest) -> RecommendationResponse:
+    # Offload the blocking model call to a worker thread so the event loop
+    # stays responsive under concurrent requests.
+    predicted = await asyncio.to_thread(model.predict, [c.value for c in req.interests])
+    predicted = predicted[: req.max_results]
+    recommendations: list[Recommendation] = []
+    for item in predicted:
+        category = Alias_To_Cat.get(item.strip().lower())
+        if category is None:
+            continue
+        recommendations.append(
+            Recommendation(
+                name=f"Sample {category.value}",
+                category=category,
+                distance_miles=0.5,
+            )
+        )
+    return RecommendationResponse(user_id=req.user_id, recommendations=recommendations)
