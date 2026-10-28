@@ -65,8 +65,10 @@ the user-facing workflow from the analysis and deployment foundation.
 
 ## 3. Technical architecture
 
-> **TODO — technical architecture diagram:** Insert the team's proposed
-> technical architecture showing the website/Streamlit interface, ZIP upload,
+> **Status — waiting on Kenedy's PR:** Kenedy is preparing the proposed
+> technical architecture diagram. After that PR is reviewed and merged, insert
+> the diagram in this section. It should show the website/Streamlit interface,
+> ZIP upload,
 > Jetstream2 GPU boundary, read-only sandbox, Qwen hunter, independent verifier,
 > patch model, unified-diff output, and results returned to the user. Clearly
 > label the model pipeline as proposed or planned until it is integrated.
