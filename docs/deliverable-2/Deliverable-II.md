@@ -1,4 +1,4 @@
-# Deliverable II architecture documentation
+# Final Project Deliverable II — Solution Architecture
 
 This directory contains architecture material for the DSAN 6700 Final Project
 Deliverable II midpoint check-in.
