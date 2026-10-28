@@ -26,6 +26,9 @@ dev = [
     "mypy>=1.10",
     "pre-commit>=3.7",
 ]
+ui = [
+    "streamlit>=1.40",
+]
 
 [tool.uv.build-backend]
 module-name = "team_project"
@@ -33,7 +36,7 @@ module-name = "team_project"
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
-pythonpath = ["src"]
+pythonpath = ["src", "ui"]
 
 [tool.ruff]
 line-length = 88
