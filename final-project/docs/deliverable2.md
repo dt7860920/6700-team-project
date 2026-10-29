@@ -4,7 +4,7 @@
 **Course:** DSAN 6700 — Deploying Machine Learning Applications to Customers
 
 - **Live application (Jetstream2):** `http://<INSTANCE-FLOATING-IP>:8080`  ← *fill in after deploy*
-- **GitHub repository:** `https://github.com/<org>/operation-negative-one`  ← *fill in*
+- **GitHub repository:** `https://github.com/dt7860920/6700-team-project` (prototype under `final-project/`)
 
 > This submission includes the two required diagrams (solution architecture and technical architecture) and documents the deployed prototype. Mocking is used where noted; the full analytic is under active build.
 
@@ -166,21 +166,3 @@ Per the rubric, this is a **skeleton** demonstrating the basic user flow; mockin
   ```
 
 ---
-
-## 5. Submission checklist & remaining team tasks
-
-| Rubric item | Status |
-|---|---|
-| Solution architecture diagram (Process/Execution/State) | ✅ §2 |
-| Technical architecture diagram | ✅ §3 |
-| Both in a single PDF | ⏳ export this doc |
-| Deployed prototype on Jetstream2 | ⏳ build + deploy skeleton |
-| Jetstream2 URL + GitHub repo URL in the PDF | ⏳ fill placeholders |
-| Uses config / containers / documented API | ✅ by design |
-| Publish only app port (not DB) | ✅ by design |
-
-**What the team still needs to do:**
-1. **Create the GitHub repo** and push the skeleton app.
-2. **Build + deploy** the prototype on the g3.large (`docker compose up -d`), confirm `/health` from outside.
-3. **Fill the two URL placeholders** above.
-4. **Export this document to PDF** (with team names at the top) and submit on Canvas.
