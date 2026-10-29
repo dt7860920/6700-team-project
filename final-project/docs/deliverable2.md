@@ -159,7 +159,8 @@ Per the rubric, this is a **skeleton** demonstrating the basic user flow; mockin
 - **Course concepts demonstrated:** configuration through settings (`model_backend`, allowlist), containerized deployment (Docker + Compose), a documented API (OpenAPI `/docs`), deployed on Jetstream2 with **only the app port published**.
 - **How to run (fresh clone):**
   ```bash
-  git clone <REPO-URL> && cd operation-negative-one
+  git clone https://github.com/dt7860920/6700-team-project
+  cd 6700-team-project/final-project
   cp .env.example.production .env
   docker compose up -d
   curl http://localhost:8080/health
