@@ -36,6 +36,7 @@ testpaths = ["tests"]
 pythonpath = ["src"]
 
 [tool.ruff]
+extend-exclude = ["final-project"]
 line-length = 88
 
 [tool.ruff.lint]

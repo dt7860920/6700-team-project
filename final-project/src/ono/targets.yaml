@@ -1,0 +1,57 @@
+# Operation: Negative One - target allowlist (the registry).
+#
+# This file IS the authorization boundary. A scan request is accepted only if its
+# `target_id` is a key below; anything else is rejected with HTTP 403 before any
+# analysis starts. The agent is never handed a URL or hostname - only a target_id
+# that resolves, through this registry, to a snapshot we host ourselves.
+#
+# Every entry is an authorized, self-hosted target:
+#   * practice-app  - an intentionally-vulnerable training application we run in
+#                     the egress-blocked sandbox (OWASP PyGoat, OWASP Juice Shop).
+#   * repo          - an open-source GitHub repository we have *ingested*: cloned
+#                     once into the sandbox as a pinned snapshot. The origin is
+#                     never contacted again and no live third-party system is touched.
+#   * snippet       - a pseudo-target for code pasted directly into the UI/API.
+#
+# Keep this an exact allowlist (a mapping), not a probabilistic structure.
+
+targets:
+  pygoat:
+    name: OWASP PyGoat
+    kind: practice-app
+    languages: [python]
+    description: >-
+      Intentionally vulnerable Django application used to teach the OWASP Top 10.
+      Runs in the egress-blocked sandbox; the canonical golden-path target (SQLi).
+    source: https://github.com/adeyosemanputra/pygoat
+    snapshot: "sandbox/pygoat@pinned"
+
+  juice-shop:
+    name: OWASP Juice Shop
+    kind: practice-app
+    languages: [javascript, typescript]
+    description: >-
+      Intentionally vulnerable Node.js/Express web shop. Runs in the egress-blocked sandbox.
+    source: https://github.com/juice-shop/juice-shop
+    snapshot: "sandbox/juice-shop@pinned"
+
+  flask-notes-repo:
+    name: flask-notes (ingested OSS repo)
+    kind: repo
+    languages: [python]
+    description: >-
+      Example of the "ingested open-source GitHub repo" target kind: a small Flask
+      note-taking app cloned once into the sandbox as a pinned snapshot. Stands in for
+      any authorized OSS repository the team ingests.
+    source: https://github.com/example-org/flask-notes
+    snapshot: "sandbox/flask-notes@3f9c2a1"
+
+  snippet:
+    name: Pasted code snippet
+    kind: snippet
+    languages: [python]
+    description: >-
+      Pseudo-target for code the analyst pastes into the UI (or sends in
+      `options.snippet`). Analyzed statically in-process; nothing is executed.
+    source: inline
+    snapshot: "n/a"

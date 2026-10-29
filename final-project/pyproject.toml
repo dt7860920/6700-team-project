@@ -1,0 +1,98 @@
+[project]
+name = "ono"
+version = "0.2.0"
+description = "Operation: Negative One - agentic vulnerability analysis of authorized code targets (Deliverable 2 prototype)"
+readme = "README.md"
+requires-python = ">=3.13"
+authors = [
+  { name = "Sazan Khalid" },
+  { name = "Kenedy Ducheine" },
+  { name = "Junyi Tang" },
+  { name = "Jeffrey Pinarchick" },
+]
+keywords = ["security", "vulnerability-detection", "agentic", "fastapi", "gradio"]
+classifiers = [
+  "Programming Language :: Python :: 3.13",
+  "Framework :: FastAPI",
+  "Topic :: Security",
+]
+dependencies = [
+  "fastapi>=0.115",
+  "gradio>=5.0",
+  "httpx>=0.27",
+  "pydantic>=2.9",
+  "pydantic-settings>=2.6",
+  "pyyaml>=6.0",
+  "uvicorn[standard]>=0.32",
+]
+
+[project.optional-dependencies]
+dev = [
+  "mypy>=1.13",
+  "pre-commit>=4.0",
+  "pytest>=8.3",
+  "pytest-asyncio>=0.24",
+  "ruff>=0.8",
+  "types-PyYAML>=6.0",
+]
+
+[project.scripts]
+ono = "ono.__main__:main"
+
+[project.urls]
+Repository = "https://github.com/<org>/operation-negative-one"
+
+[build-system]
+requires = ["uv_build>=0.8.0,<0.12.0"]
+build-backend = "uv_build"
+
+# ---------------------------------------------------------------------------
+# Tooling
+# ---------------------------------------------------------------------------
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+src = ["src", "tests", "scripts"]
+
+[tool.ruff.lint]
+select = [
+  "E",   # pycodestyle errors
+  "W",   # pycodestyle warnings
+  "F",   # pyflakes
+  "I",   # isort
+  "B",   # flake8-bugbear
+  "UP",  # pyupgrade
+  "N",   # pep8-naming
+  "SIM", # flake8-simplify
+  "RUF", # ruff-specific
+  "PTH", # use pathlib
+  "T20", # no stray print() in library code
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101"]
+"scripts/*" = ["T20"]  # smoke scripts are allowed to print
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+plugins = ["pydantic.mypy"]
+warn_unreachable = true
+show_error_codes = true
+
+[[tool.mypy.overrides]]
+# Gradio ships partial type information; do not let it block the strict gate on our own code.
+module = ["gradio", "gradio.*"]
+ignore_missing_imports = true
+follow_imports = "skip"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+addopts = "-ra -q"
+filterwarnings = [
+  "ignore::DeprecationWarning:websockets.*",
+  "ignore::DeprecationWarning:gradio.*",
+]
