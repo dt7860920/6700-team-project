@@ -1,10 +1,13 @@
-.PHONY: install dev lint format typecheck test check smoke-ci smoke-live docker-build docker-run compose-up compose-down
+.PHONY: install dev executor lint format typecheck test test-docker check smoke-ci smoke-live docker-build docker-run compose-up compose-down
 
 install:          ## Install runtime + dev dependencies
 	uv sync --extra dev
 
 dev:              ## Run locally with auto-reload (reads .env)
 	uv run ono
+
+executor:         ## Run the sandbox Executor locally (needs Docker + EXECUTOR_TOKEN in .env)
+	uv run ono-executor
 
 lint:
 	uv run ruff check
@@ -15,8 +18,11 @@ format:
 typecheck:
 	uv run mypy src/
 
-test:
+test:             ## Unit tests (+ the real-Docker stress tests when a daemon is reachable)
 	uv run pytest
+
+test-docker:      ## Only the real-Docker sandbox stress tests (forces them on, e.g. in CI)
+	ONO_DOCKER_TESTS=1 uv run pytest -m docker -v
 
 check: lint typecheck test   ## Everything CI runs
 	uv run ruff format --check

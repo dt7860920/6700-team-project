@@ -17,6 +17,7 @@ classifiers = [
   "Topic :: Security",
 ]
 dependencies = [
+  "docker>=7.2.0",
   "fastapi>=0.115",
   "gradio>=5.0",
   "httpx>=0.27",
@@ -39,6 +40,7 @@ dev = [
 
 [project.scripts]
 ono = "ono.__main__:main"
+ono-executor = "ono.executor.__main__:main"
 
 [project.urls]
 Repository = "https://github.com/<org>/operation-negative-one"
@@ -88,11 +90,20 @@ module = ["gradio", "gradio.*"]
 ignore_missing_imports = true
 follow_imports = "skip"
 
+[[tool.mypy.overrides]]
+# docker-py ships no type information (no py.typed, no stubs on typeshed). The sandbox
+# layer coerces every value it reads from the SDK to a concrete type.
+module = ["docker", "docker.*"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 addopts = "-ra -q"
+markers = [
+  "docker: needs a reachable Docker daemon (real jailed containers); skipped when unavailable or in CI",
+]
 filterwarnings = [
   "ignore::DeprecationWarning:websockets.*",
   "ignore::DeprecationWarning:gradio.*",

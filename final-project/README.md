@@ -80,14 +80,15 @@ On the instance (Docker + Compose plugin installed; security group allows inboun
 ```bash
 git clone <REPO-URL> && cd operation-negative-one
 cp .env.example.production .env
+echo "EXECUTOR_TOKEN=$(openssl rand -hex 32)" >> .env   # the Executor refuses to start without one
 docker compose up -d --build
-docker compose ps                              # wait for "healthy"
+docker compose ps                              # wait for both services to be "healthy"
 curl http://localhost:8080/health
 ```
 
 From your laptop: `uv run scripts/golden_path.py --base-url http://<FLOATING-IP>:8080`.
 
-`compose.yml` defines **one service** and publishes **one port** (8080). There is deliberately no database in the skeleton — scan state is in-memory. When the findings DB, threat-intel cache, and vLLM join the stack in Deliverable 3 they are added as internal services *without* a `ports:` block, so the published surface stays exactly `:8080`.
+`compose.yml` defines **two services** and publishes **one port** (8080): the app, and the sandbox **Executor** (see [The sandbox Executor](#the-sandbox-executor-step-3a)) on an `internal: true` network with no `ports:` block. There is deliberately no database in the skeleton — scan state is in-memory. When the findings DB, threat-intel cache, and vLLM join the stack they are added the same way, as internal services *without* `ports:`, so the published surface stays exactly `:8080`.
 
 ---
 
@@ -156,9 +157,21 @@ All configuration is read by `ono.config.Settings` (pydantic-settings) from envi
 | `MAX_CANDIDATES` | `20` | 1–200. Cap on SAST candidates kept per scan — and therefore on model calls |
 | `CONTEXT_LINES` | `25` | 5–200. Lines of code shown to the model on each side of a candidate sink |
 | `CLONE_TIMEOUT_S` | `120` | 5–1800. Hard timeout for the shallow `git clone` |
-| `MAX_CLONE_MB` | `200` | 1–5000. Snapshots larger than this (after `.git` is stripped) abort the scan |
+| `MAX_CLONE_MB` | `200` | 1–5000. Snapshots larger than this (after `.git` is stripped) abort the scan; also the cap on a workspace archive uploaded to the Executor |
+| `EXECUTOR_URL` | `http://127.0.0.1:8081` | Where the app reaches the Executor (`http://executor:8081` under Compose) |
+| `EXECUTOR_TOKEN` | — | `SecretStr`, ≥16 chars. **Required by the Executor** (it refuses to start without it); sent as `Authorization: Bearer` |
+| `EXECUTOR_HOST` / `EXECUTOR_PORT` | `127.0.0.1` / `8081` | Executor bind address. Loopback by default; `0.0.0.0` only inside the Compose internal network. Never published |
+| `SANDBOX_IMAGE` | `python:3.13-slim` | Base image of the jailed target containers (pulled if missing) |
+| `SANDBOX_MEM_MB` | `1024` | 64–65536. Memory limit per jail, swap disabled; the tmpfs workspace counts against it |
+| `SANDBOX_CPUS` | `1.0` | 0.1–64. CPU quota per jail |
+| `SANDBOX_PIDS_LIMIT` | `256` | 16–8192. PID limit per jail (fork bombs) |
+| `SANDBOX_CMD_TIMEOUT_S` | `300` | 1–3600. Hard cap on any single `run()` / `run_tests()` |
+| `SANDBOX_TTL_S` | `1800` | 30–86400. Max jail age; the sweeper force-removes older containers, orphans included |
+| `SANDBOX_OUTPUT_CAP_BYTES` | `1000000` | 1 KB–50 MB. Per-stream cap on captured stdout/stderr and on file reads |
+| `SANDBOX_WORKSPACE_MB` | `512` | 16–16384. Size of the writable tmpfs holding the workspace (`/tmp` gets half) |
+| `SANDBOX_MAX_ACTIVE` | `8` | 1–64. Max concurrently live jails per Executor |
 
-The ingest/SAST settings apply to the `service` backend (`mock` never clones or runs Semgrep).
+The ingest/SAST settings apply to the `service` backend (`mock` never clones or runs Semgrep). The `EXECUTOR_*` / `SANDBOX_*` settings configure the Executor service (step 3a); the analyzer pipeline does not call it yet (that is step 3b).
 
 The **target allowlist** lives in [`src/ono/targets.yaml`](src/ono/targets.yaml) and is loaded into an exact mapping (`TargetRegistry`). Adding a target means adding an entry there — nothing is accepted that is not in the file. Three real, cloneable targets ship: `pygoat` and `juice-shop` (practice apps) and `vulpy` (a small intentionally vulnerable Flask repo, the "ingested OSS repo" kind).
 
@@ -179,9 +192,19 @@ operation-negative-one/
 │   ├── targets.py      TargetRegistry (exact allowlist) + targets.yaml
 │   ├── store.py        ScanStore protocol + in-memory implementation
 │   ├── config.py       Settings (pydantic-settings)
-│   └── __main__.py     `ono` / `python -m ono` entrypoint (uvicorn)
-├── tests/              pytest: config, API (incl. 403 allowlist test), analyzers, ingest, SAST
-│   └── fixtures/       tiny vulnerable sample repo + a real Semgrep JSON document (tests stay offline)
+│   ├── __main__.py     `ono` / `python -m ono` entrypoint (uvicorn)
+│   └── executor/       step 3a: the sandboxed "hands" (separate, internal-only service)
+│       ├── sandbox.py      SandboxManager / Sandbox: jailed per-scan containers, exec protocol, TTL sweeper
+│       ├── _guest.py       stdlib helper that runs INSIDE the jail: confined read/tree/grep, diff applier
+│       ├── archive.py      workspace <-> gzipped tar (ship in, validate, snapshot for reset)
+│       ├── app.py          the Executor FastAPI service (bearer-token auth on everything but /health)
+│       ├── client.py       ExecutorClient: typed HTTP client the orchestrator (3b) will use
+│       ├── models.py       request/response schemas shared by service and client
+│       └── __main__.py     `ono-executor` / `python -m ono.executor`
+├── tests/              pytest: config, API (incl. 403 allowlist test), analyzers, ingest, SAST, executor
+│   ├── fixtures/       tiny vulnerable sample repo + a real Semgrep JSON document (tests stay offline)
+│   ├── fakedocker.py   fake docker-py client (extracts the tar, runs the real guest helper) for CI
+│   └── test_executor_docker.py   REAL-container stress tests (`-m docker`; auto-skipped in CI / without a daemon)
 ├── scripts/golden_path.py   smoke heartbeat (live server or --in-process)
 ├── Dockerfile · compose.yml · .dockerignore
 ├── .env.example.local · .env.example.production
@@ -231,6 +254,49 @@ curl -s -X POST localhost:8080/scans -H 'content-type: application/json' \
 ```
 
 The `.pipeline` array in the response shows each stage's status and timing (`ingest` reports the workspace path, `sast` the candidate count). Clone or Semgrep problems surface as `status: "failed"` with the reason in the server log — never as a silent empty result.
+
+---
+
+## The sandbox Executor (step 3a)
+
+Rung 3/4 output ("the PoC reaches the sink", "the patch applies and the tests still pass") means **running untrusted target code**. That happens only inside the **Executor**: a separate, internal-only, token-authenticated FastAPI service (`ono.executor.app`, container C in `compose.yml`) that spins up **one ephemeral, jailed Docker container per scan**, runs operations against it over `docker exec`, and destroys it afterwards (on `DELETE`, on Executor shutdown, or when the TTL sweeper finds it).
+
+**Trust boundary.** The Executor is *privileged* — it mounts the host Docker socket, which is equivalent to root on the host — so it is kept tiny and audited, never published (Compose puts it on an `internal: true` network with no `ports:`), and runs nothing untrusted itself. The **target containers it spawns are the untrusted, jailed ones**:
+
+| Jail flag | Why |
+|---|---|
+| `network_mode=none` | no egress at all: only `lo`; cannot reach the internet, the Executor, the app, the model, or another sandbox |
+| non-root, two uids | PID 1 (`docker-init` + `sleep`) runs as uid 10002, every exec as uid 10001 — so a `kill -9 -1` *as the sandbox user* reaps every stray process (including `setsid` escapes) without touching PID 1, and the inmate cannot kill its own container |
+| `cap_drop=ALL`, `no-new-privileges`, `nosuid,nodev` mounts | zero capabilities, no privilege-escalation path |
+| `read_only=True` rootfs + bounded `tmpfs` for `/workspace` (owned by uid 10001) and `/tmp` | the image is immutable; writable space is sized |
+| `mem_limit` (= `memswap_limit`), `nano_cpus`, `pids_limit`, `init=True`, `oom_score_adj=1000` | memory hogs are OOM-killed inside the jail, fork bombs hit the PID wall, zombies are reaped, and under host memory pressure sandbox processes die first |
+| no volumes at all | the Docker socket is never mounted into a target |
+| labels `ono.sandbox` / `ono.scan_id` / `ono.created_at` | the TTL sweeper force-removes orphans (e.g. after an Executor crash) |
+
+**Operations** — all executed *inside* the jail, all with a hard deadline and a byte cap: `read_file` / `read_lines` / `tree` / `grep` (path-confined: no absolute paths, no `..`, every component opened with `O_NOFOLLOW` so a planted symlink is never followed), `apply_patch` (strict all-or-nothing unified-diff applier), `run(cmd, timeout_s)` (`timeout -s KILL` plus a host-side socket deadline; strays reaped afterwards; `timed_out` / `oom_killed` / `truncated` reported), `run_tests()` (pytest / npm detection, best-effort), and `reset()` (destroy + recreate from the snapshot kept on the trusted side — about 100 ms — which also revives a jail that died).
+
+```bash
+# Run the Executor locally (Docker required; it pulls python:3.13-slim on first use)
+echo "EXECUTOR_TOKEN=$(openssl rand -hex 32)" >> .env
+make executor                        # == uv run ono-executor  -> http://127.0.0.1:8081/docs
+
+# Drive it from Python (this is what the orchestrator in step 3b will do)
+uv run python -c '
+from pathlib import Path
+from ono.executor.client import ExecutorClient
+client = ExecutorClient("http://127.0.0.1:8081", "<EXECUTOR_TOKEN>")
+with client.sandbox("scn_demo", Path("tests/fixtures/vuln_repo")) as sbx:
+    print(sbx.grep(r"os\.system", path="app").matches)
+    print(sbx.run("python3 -c \"import urllib.request as u; u.urlopen(\"http://example.com\")\"", timeout_s=5).exit_code)  # != 0: no egress
+    print(sbx.run("sleep 999", timeout_s=2).timed_out)      # True
+'
+
+# The real-container stress suite: egress, timeouts, OOM, fork bombs, disk fill, path
+# escapes, teardown-on-error, orphan sweeper, concurrency, patch/reset, service auth.
+make test-docker
+```
+
+The stress tests live in `tests/test_executor_docker.py` and run automatically with plain `pytest` whenever a Docker daemon is reachable (they are skipped in CI, where the unit tests exercise the same code paths against `tests/fakedocker.py`).
 
 ---
 

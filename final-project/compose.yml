@@ -1,14 +1,26 @@
-# Operation: Negative One - Compose stack for the Deliverable-2 prototype.
+# Operation: Negative One - Compose stack.
 #
-# One service, one published port. There is deliberately NO database service
-# in the skeleton: scan state is in-memory. When the findings DB / threat-intel
-# cache / vLLM are added (Deliverable 3) they join this file as internal
-# services on the default network WITHOUT a `ports:` block - only the app's
-# 8080 is ever published to the host.
+# Two services, ONE published port (the app's 8080). Everything else is internal.
 #
-#   cp .env.example.production .env
-#   docker compose up -d
+#   app       the ONO API + UI (container A). Unprivileged, read-only rootfs.
+#   executor  the sandbox Executor (container C, Deliverable 3 step 3a). PRIVILEGED:
+#             it mounts the host Docker socket so it can spawn one jailed target
+#             container per scan. It is token-authenticated, sits on the `internal`
+#             network only, and has NO `ports:` block - it is never reachable from
+#             outside the stack. The target containers it spawns run with
+#             network_mode=none, cap_drop=ALL, read-only rootfs, non-root, cgroup
+#             limits (see src/ono/executor/sandbox.py) and never see the socket.
+#
+#   cp .env.example.production .env          # and set EXECUTOR_TOKEN (openssl rand -hex 32)
+#   docker compose up -d --build
 #   curl http://localhost:8080/health
+#
+# Why the socket mount is acceptable here, and nowhere else: holding the Docker socket
+# is equivalent to root on the host, so the Executor is kept tiny and audited (one
+# FastAPI module + the sandbox manager), accepts only token-bearing requests from the
+# internal network, validates every input, and runs nothing untrusted itself - all
+# untrusted code runs inside the jails it creates. The findings DB / threat-intel
+# cache / vLLM (later steps) join as further internal services without `ports:`.
 
 services:
   app:
@@ -19,8 +31,14 @@ services:
     container_name: ono-app
     env_file:
       - .env
+    environment:
+      # How the harness reaches the Executor (step 3b wires the orchestrator to it).
+      EXECUTOR_URL: http://executor:8081
     ports:
-      - "8080:8080"          # the ONLY published port
+      - "8080:8080"          # the ONLY published port in the whole stack
+    networks:
+      - default
+      - internal
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=2).status == 200 else 1)"]
@@ -33,3 +51,56 @@ services:
       - /tmp                 # WORKSPACE_DIR=/tmp/ono-workspace (per-scan clones) lives here
     security_opt:
       - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+  executor:
+    image: ono:prototype     # same image, different entrypoint - nothing extra to build
+    container_name: ono-executor
+    command: ["python", "-m", "ono.executor"]
+    env_file:
+      - .env
+    environment:
+      EXECUTOR_HOST: 0.0.0.0           # reachable only on the internal network below
+      EXECUTOR_PORT: "8081"
+      # The shared secret. `.env` must define EXECUTOR_TOKEN (the service refuses to
+      # start without one); the `:?` makes `docker compose up` fail loudly if it is unset.
+      EXECUTOR_TOKEN: ${EXECUTOR_TOKEN:?EXECUTOR_TOKEN must be set in .env}
+      # Jail limits (defaults shown; see Settings.sandbox_* for the full list).
+      SANDBOX_IMAGE: ${SANDBOX_IMAGE:-python:3.13-slim}
+      SANDBOX_MEM_MB: ${SANDBOX_MEM_MB:-1024}
+      SANDBOX_CPUS: ${SANDBOX_CPUS:-1.0}
+      SANDBOX_PIDS_LIMIT: ${SANDBOX_PIDS_LIMIT:-256}
+      SANDBOX_CMD_TIMEOUT_S: ${SANDBOX_CMD_TIMEOUT_S:-300}
+      SANDBOX_TTL_S: ${SANDBOX_TTL_S:-1800}
+    volumes:
+      # PRIVILEGE: the host Docker socket. This is the one place in the stack it appears.
+      # The Executor needs it to create/exec/destroy the jailed target containers; the
+      # targets themselves never get it (no volumes at all - see jail_kwargs()).
+      - /var/run/docker.sock:/var/run/docker.sock
+    # The socket is root-owned on the host; the image's `ono` user cannot open it. Running
+    # the Executor as root *inside its own container* adds no privilege beyond what the
+    # socket already grants. (Alternative: keep `user: ono` and add the host docker gid
+    # via `group_add: ["<gid>"]`.) The container itself still drops every capability.
+    user: "0:0"
+    networks:
+      - internal             # no `ports:` - never published
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8081/health', timeout=2).status == 200 else 1)"]
+      interval: 30s
+      timeout: 3s
+      start_period: 10s
+      retries: 3
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+networks:
+  default:
+  internal:
+    internal: true           # no route to the outside world; app <-> executor only
