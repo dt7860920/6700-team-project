@@ -5,8 +5,8 @@ which reads environment variables and an optional ``.env`` file. Nothing else in
 the codebase reads ``os.environ`` directly - this is the single source of truth
 that the Docker image, Compose file, and CI all configure through.
 
-Secrets (``model_service_api_key``) are ``SecretStr`` and are never rendered by
-``repr``/``str``, so they cannot leak through logs or the ``/info`` endpoint.
+Secrets (``model_service_api_key``, ``executor_token``) are ``SecretStr`` and are never
+rendered by ``repr``/``str``, so they cannot leak through logs or the ``/info`` endpoint.
 """
 
 from __future__ import annotations
@@ -117,6 +117,71 @@ class Settings(BaseSettings):
         ge=1,
         le=5000,
         description="Snapshots larger than this (after .git is stripped) abort the scan.",
+    )
+
+    # -- Executor service + sandbox jail (Deliverable 3, step 3a) ----------------------
+    # The Executor is a separate, internal-only, token-authenticated service that owns
+    # the Docker socket and spawns one jailed container per scan. ``executor_*`` is how
+    # the two processes find and trust each other; ``sandbox_*`` are the jail's limits.
+    executor_url: str = Field(
+        default="http://127.0.0.1:8081",
+        description="Base URL the ONO app uses to reach the Executor (never published).",
+    )
+    executor_token: SecretStr | None = Field(
+        default=None,
+        description=(
+            "Shared secret for the Executor API (Authorization: Bearer). The Executor refuses "
+            "to start without one. Never logged or returned by any endpoint."
+        ),
+    )
+    executor_host: str = Field(
+        default="127.0.0.1",
+        description="Bind address of the Executor service. Loopback by default; 0.0.0.0 only "
+        "inside the Compose internal network.",
+    )
+    executor_port: int = Field(default=8081, ge=1, le=65535, description="Executor bind port.")
+    sandbox_image: str = Field(
+        default="python:3.13-slim",
+        description="Image the jailed target containers start from (pulled if missing).",
+    )
+    sandbox_mem_mb: int = Field(
+        default=1024,
+        ge=64,
+        le=65536,
+        description="Memory limit per sandbox (no swap). Includes the tmpfs workspace contents.",
+    )
+    sandbox_cpus: float = Field(
+        default=1.0, ge=0.1, le=64.0, description="CPU quota per sandbox (nano_cpus)."
+    )
+    sandbox_pids_limit: int = Field(
+        default=256, ge=16, le=8192, description="PID limit per sandbox (fork bombs)."
+    )
+    sandbox_cmd_timeout_s: float = Field(
+        default=300.0,
+        ge=1.0,
+        le=3600.0,
+        description="Hard cap on any single run()/run_tests() inside a sandbox.",
+    )
+    sandbox_ttl_s: float = Field(
+        default=1800.0,
+        ge=30.0,
+        le=86400.0,
+        description="Max sandbox age; the sweeper force-removes older (orphaned) containers.",
+    )
+    sandbox_output_cap_bytes: int = Field(
+        default=1_000_000,
+        ge=1024,
+        le=50_000_000,
+        description="Per-stream cap on captured stdout/stderr (and on file reads).",
+    )
+    sandbox_workspace_mb: int = Field(
+        default=512,
+        ge=16,
+        le=16384,
+        description="Size of the writable tmpfs holding the workspace (/tmp gets half of it).",
+    )
+    sandbox_max_active: int = Field(
+        default=8, ge=1, le=64, description="Max concurrently live sandboxes on this Executor."
     )
 
     @model_validator(mode="after")
