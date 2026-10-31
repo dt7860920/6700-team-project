@@ -151,8 +151,16 @@ All configuration is read by `ono.config.Settings` (pydantic-settings) from envi
 | `MODEL_SERVICE_URL` | — | **Required when `MODEL_BACKEND=service`** (startup fails otherwise). OpenAI-compatible base URL, e.g. `http://localhost:11434/v1` |
 | `MODEL_SERVICE_API_KEY` | — | `SecretStr`: never logged, never returned by `/info` |
 | `MAX_VERIFIER_RETRIES` | `3` | 1–5. Hard cap on the verifier self-correction loop |
+| `WORKSPACE_DIR` | `.ono-workspace` | Per-scan clone workspaces (`<dir>/<scan_id>/`), removed when each scan ends. Must be writable; the image sets `/tmp/ono-workspace` |
+| `SAST_RULESET` | `p/owasp-top-ten` | Comma-separated Semgrep `--config` values (registry packs or local rule files). A language pack (`p/python`, `p/javascript`, …) is appended per target language. Empty = skip Semgrep, regex scanner only |
+| `MAX_CANDIDATES` | `20` | 1–200. Cap on SAST candidates kept per scan — and therefore on model calls |
+| `CONTEXT_LINES` | `25` | 5–200. Lines of code shown to the model on each side of a candidate sink |
+| `CLONE_TIMEOUT_S` | `120` | 5–1800. Hard timeout for the shallow `git clone` |
+| `MAX_CLONE_MB` | `200` | 1–5000. Snapshots larger than this (after `.git` is stripped) abort the scan |
 
-The **target allowlist** lives in [`src/ono/targets.yaml`](src/ono/targets.yaml) and is loaded into an exact mapping (`TargetRegistry`). Adding a target means adding an entry there — nothing is accepted that is not in the file.
+The ingest/SAST settings apply to the `service` backend (`mock` never clones or runs Semgrep).
+
+The **target allowlist** lives in [`src/ono/targets.yaml`](src/ono/targets.yaml) and is loaded into an exact mapping (`TargetRegistry`). Adding a target means adding an entry there — nothing is accepted that is not in the file. Three real, cloneable targets ship: `pygoat` and `juice-shop` (practice apps) and `vulpy` (a small intentionally vulnerable Flask repo, the "ingested OSS repo" kind).
 
 ---
 
@@ -164,13 +172,16 @@ operation-negative-one/
 │   ├── api.py          FastAPI app: documented endpoints + mounted Gradio UI
 │   ├── ui.py           Gradio analyst UI (target picker / snippet -> Analyze -> finding cards)
 │   ├── service.py      ScanService: allowlist gate -> run pipeline -> persist
-│   ├── analyzer.py     Pipeline skeleton (ingest/sast/plan/analyze/verify) + MockAnalyzer
+│   ├── analyzer.py     Pipeline skeleton (ingest/sast/plan/analyze/verify) + MockAnalyzer + ServiceAnalyzer
+│   ├── ingest.py       Stage 1 for real backends: shallow clone / snippet file into a per-scan workspace
+│   ├── sast.py         Stage 2 for real backends: Semgrep JSON -> Candidate queue, regex fallback
 │   ├── models.py       Pydantic schemas: ScanRequest, Finding, Scan, ScanResponse, ...
 │   ├── targets.py      TargetRegistry (exact allowlist) + targets.yaml
 │   ├── store.py        ScanStore protocol + in-memory implementation
 │   ├── config.py       Settings (pydantic-settings)
 │   └── __main__.py     `ono` / `python -m ono` entrypoint (uvicorn)
-├── tests/              pytest: config validation, API (incl. 403 allowlist test), analyzer
+├── tests/              pytest: config, API (incl. 403 allowlist test), analyzers, ingest, SAST
+│   └── fixtures/       tiny vulnerable sample repo + a real Semgrep JSON document (tests stay offline)
 ├── scripts/golden_path.py   smoke heartbeat (live server or --in-process)
 ├── Dockerfile · compose.yml · .dockerignore
 ├── .env.example.local · .env.example.production
@@ -186,24 +197,40 @@ operation-negative-one/
 
 | Stage | Mock today | Real (Deliverable 3) |
 |---|---|---|
-| `ingest` | returns the pinned snapshot ref | clone into the egress-blocked sandbox, strip `.git`/CVE strings, tree-sitter + call graph |
-| `sast_shortlist` | canned candidates (regex SAST for snippets) | Semgrep + CodeQL → SARIF → normalized `Candidate` queue |
+| `ingest` | returns the pinned snapshot ref | **done (step 2):** shallow clone into a per-scan workspace, `.git` stripped, size/time bounded (`ono/ingest.py`). Still to come: the egress-blocked sandbox container around it, CVE-string stripping, tree-sitter + call graph |
+| `sast_shortlist` | canned candidates (regex SAST for snippets) | **done (step 2):** Semgrep JSON → normalized, ranked, deduplicated `Candidate` queue with a regex fallback (`ono/sast.py`). Still to come: CodeQL → SARIF |
 | `plan` | fixed step list | **frozen Qwen2.5-Coder, planner role** emits the per-target scaffold (Fugu-inspired, no training) |
 | `analyze` | canned findings | **Qwen analyst role** in a bounded LangGraph ReAct loop (read_file / callers / grep / retrieve_cwe), served by vLLM |
 | `verify` | passes `verified=True` | **deterministic verifier** (plain code): line exists, PoC reaches sink, patch applies, PoC no longer fires, tests pass; failure reasons feed a bounded self-correction loop (`MAX_VERIFIER_RETRIES`) |
 
 Switching is a config change: `MODEL_BACKEND=local` (vLLM on the same box, never published) or `MODEL_BACKEND=service` (remote OpenAI-compatible endpoint). `build_analyzer()` is the only place that needs to know. The in-memory `ScanStore` is likewise the seam for the internal findings database.
 
-### Service backend today: the stock-Qwen baseline
+### Service backend today: real ingest + Semgrep shortlist (step 2)
 
-`ServiceAnalyzer` (`MODEL_BACKEND=service`) is Deliverable 3, step 1. Only the `analyze` stage calls the model, through an OpenAI-compatible `/chat/completions` endpoint, and asks for strict-JSON findings over the pasted `snippet`. There is deliberately **no scaffold yet**: `sast_shortlist` returns nothing, `plan` is a single step, and `verify` passes findings through, so every finding is `verified=False` and at most rung 2 (model-asserted CWE + patch). Practice-app / repo targets return no findings until real ingest lands. With Ollama running on the instance:
+`ServiceAnalyzer` (`MODEL_BACKEND=service`) analyzes **real repository files**:
+
+1. **ingest** — `repo` / `practice-app` targets are shallow-cloned (`git clone --depth 1 --no-tags --single-branch`, timeout `CLONE_TIMEOUT_S`, cap `MAX_CLONE_MB`) into `WORKSPACE_DIR/<scan_id>/`; `.git` is deleted immediately, so the origin is contacted exactly once and nothing cloned is ever executed. A `snippet` is written to `snippet.py` in the same workspace. The workspace is removed when the scan ends, success or failure.
+2. **sast_shortlist** — Semgrep (`semgrep scan --json --metrics=off --config <SAST_RULESET> …`) over the workspace; results are normalized to `Candidate{file, line, cwe_hint, rule, excerpt}` (file relative to the clone root, CWE from the rule's metadata), ranked by severity, deduplicated and capped at `MAX_CANDIDATES`. If Semgrep is missing, fails or times out, a built-in regex scanner takes over so the stage never fails a scan (the log says which engine ran).
+3. **analyze** — one model call **per candidate** (so a large repo fans out to at most `MAX_CANDIDATES` calls) over the real code `CONTEXT_LINES` around the sink. The model confirms or dismisses; each `Finding` is anchored to the candidate's real `file:line` and carries a one-hop trace naming the SAST rule.
+4. **plan** is still a fixed step list and **verify** is still a pass-through, so findings remain `verified=False` and at most rung 2. The deterministic verifier + self-correction loop is the next step.
+
+With Ollama serving `qwen2.5-coder:7b` on the instance (`git` is on `PATH`; Semgrep arrives with `uv sync`):
 
 ```bash
 cp .env.example.service .env        # MODEL_BACKEND=service, MODEL_SERVICE_URL=http://localhost:11434/v1, MODEL_NAME=qwen2.5-coder:7b
 uv run ono
+
+# A real repository, end to end. The first run clones PyGoat and lets Semgrep fetch its
+# rule packs, then makes up to MAX_CANDIDATES model calls - expect a minute or two.
+curl -s -X POST localhost:8080/scans -H 'content-type: application/json' \
+  -d '{"target_id":"pygoat"}' | jq '.pipeline, .findings[] | {cwe, file, line_range, rung, verified, title}'
+
+# The pasted-snippet path works the same way (snippet -> SAST -> model).
 curl -s -X POST localhost:8080/scans -H 'content-type: application/json' \
   -d '{"target_id":"snippet","options":{"snippet":"import os\nos.system(\"ping \" + host)\n"}}' | jq .
 ```
+
+The `.pipeline` array in the response shows each stage's status and timing (`ingest` reports the workspace path, `sast` the candidate count). Clone or Semgrep problems surface as `status: "failed"` with the reason in the server log — never as a silent empty result.
 
 ---
 

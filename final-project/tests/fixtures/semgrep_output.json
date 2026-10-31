@@ -1,0 +1,190 @@
+{
+  "version": "1.183.0",
+  "errors": [],
+  "paths": {
+    "scanned": [
+      "README.md",
+      "app/util.py",
+      "app/views.py"
+    ]
+  },
+  "results": [
+    {
+      "check_id": "python.django.security.injection.sql.sql-injection-using-db-cursor-execute.sql-injection-db-cursor-execute",
+      "path": "app/views.py",
+      "start": {
+        "line": 13,
+        "col": 5,
+        "offset": 207
+      },
+      "end": {
+        "line": 16,
+        "col": 57,
+        "offset": 357
+      },
+      "extra": {
+        "lines": "requires login",
+        "message": "User-controlled data from a request is passed to 'execute()'. This could lead to a SQL injection and therefore protected information could be leaked. Instead, u",
+        "severity": "WARNING",
+        "metadata": {
+          "cwe": [
+            "CWE-89: Improper Neutralization of Special Elements used in an SQL Command ('SQL Injection')"
+          ],
+          "category": "security",
+          "owasp": [
+            "A01:2017 - Injection",
+            "A03:2021 - Injection",
+            "A05:2025 - Injection"
+          ],
+          "confidence": "MEDIUM"
+        }
+      }
+    },
+    {
+      "check_id": "python.flask.security.injection.tainted-sql-string.tainted-sql-string",
+      "path": "app/views.py",
+      "start": {
+        "line": 16,
+        "col": 17,
+        "offset": 317
+      },
+      "end": {
+        "line": 16,
+        "col": 56,
+        "offset": 356
+      },
+      "extra": {
+        "lines": "requires login",
+        "message": "Detected user input used to manually construct a SQL string. This is usually bad practice because manual construction could accidentally result in a SQL injecti",
+        "severity": "ERROR",
+        "metadata": {
+          "cwe": [
+            "CWE-704: Incorrect Type Conversion or Cast"
+          ],
+          "category": "security",
+          "owasp": [
+            "A01:2017 - Injection",
+            "A03:2021 - Injection",
+            "A05:2025 - Injection"
+          ],
+          "confidence": "MEDIUM"
+        }
+      }
+    },
+    {
+      "check_id": "python.django.security.injection.command.command-injection-os-system.command-injection-os-system",
+      "path": "app/views.py",
+      "start": {
+        "line": 22,
+        "col": 5,
+        "offset": 427
+      },
+      "end": {
+        "line": 23,
+        "col": 42,
+        "offset": 513
+      },
+      "extra": {
+        "lines": "requires login",
+        "message": "Request data detected in os.system. This could be vulnerable to a command injection and should be avoided. If this must be done, use the 'subprocess' module ins",
+        "severity": "ERROR",
+        "metadata": {
+          "cwe": [
+            "CWE-78: Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection')"
+          ],
+          "category": "security",
+          "owasp": [
+            "A01:2017 - Injection",
+            "A03:2021 - Injection",
+            "A05:2025 - Injection"
+          ],
+          "confidence": "MEDIUM"
+        }
+      }
+    },
+    {
+      "check_id": "python.flask.security.injection.os-system-injection.os-system-injection",
+      "path": "app/views.py",
+      "start": {
+        "line": 23,
+        "col": 12,
+        "offset": 483
+      },
+      "end": {
+        "line": 23,
+        "col": 42,
+        "offset": 513
+      },
+      "extra": {
+        "lines": "requires login",
+        "message": "User data detected in os.system. This could be vulnerable to a command injection and should be avoided. If this must be done, use the 'subprocess' module instea",
+        "severity": "ERROR",
+        "metadata": {
+          "cwe": [
+            "CWE-78: Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection')"
+          ],
+          "category": "security",
+          "owasp": [
+            "A01:2017 - Injection",
+            "A03:2021 - Injection",
+            "A05:2025 - Injection"
+          ],
+          "confidence": "MEDIUM"
+        }
+      }
+    },
+    {
+      "check_id": "python.lang.security.dangerous-system-call.dangerous-system-call",
+      "path": "app/views.py",
+      "start": {
+        "line": 23,
+        "col": 12,
+        "offset": 483
+      },
+      "end": {
+        "line": 23,
+        "col": 42,
+        "offset": 513
+      },
+      "extra": {
+        "lines": "requires login",
+        "message": "Found user-controlled data used in a system call. This could allow a malicious actor to execute commands. Use the 'subprocess' module instead, which is easier t",
+        "severity": "ERROR",
+        "metadata": {
+          "cwe": [
+            "CWE-78: Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection')"
+          ],
+          "category": "security",
+          "owasp": [
+            "A01:2017 - Injection",
+            "A03:2021 - Injection",
+            "A05:2025 - Injection"
+          ],
+          "confidence": "MEDIUM"
+        }
+      }
+    },
+    {
+      "check_id": "python.lang.best-practice.open-never-closed.open-never-closed",
+      "path": "app/util.py",
+      "start": {
+        "line": 8,
+        "col": 5,
+        "offset": 0
+      },
+      "end": {
+        "line": 8,
+        "col": 20,
+        "offset": 0
+      },
+      "extra": {
+        "lines": "requires login",
+        "message": "file object opened without corresponding close",
+        "severity": "WARNING",
+        "metadata": {
+          "category": "best-practice"
+        }
+      }
+    }
+  ]
+}

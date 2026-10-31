@@ -32,7 +32,12 @@ class Target(BaseModel):
     kind: TargetKind
     languages: list[str] = Field(default_factory=list)
     description: str = ""
-    source: str = Field(description="Where the snapshot came from (informational only).")
+    source: str = Field(
+        description=(
+            "Where ingest materializes the snapshot from: an https git URL (shallow-cloned "
+            "once per scan) or a local directory (copied). 'inline' for the snippet target."
+        )
+    )
     snapshot: str = Field(description="Pinned snapshot reference inside the sandbox.")
     authorized: Literal[True] = Field(
         default=True,

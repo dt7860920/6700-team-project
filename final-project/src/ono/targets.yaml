@@ -35,16 +35,17 @@ targets:
     source: https://github.com/juice-shop/juice-shop
     snapshot: "sandbox/juice-shop@pinned"
 
-  flask-notes-repo:
-    name: flask-notes (ingested OSS repo)
+  vulpy:
+    name: vulpy (ingested OSS repo)
     kind: repo
     languages: [python]
     description: >-
-      Example of the "ingested open-source GitHub repo" target kind: a small Flask
-      note-taking app cloned once into the sandbox as a pinned snapshot. Stands in for
-      any authorized OSS repository the team ingests.
-    source: https://github.com/example-org/flask-notes
-    snapshot: "sandbox/flask-notes@3f9c2a1"
+      The "ingested open-source GitHub repo" target kind: a small, intentionally
+      vulnerable Flask app (SQLi, XSS, weak crypto, ...) shallow-cloned once per scan
+      into the workspace; .git is stripped and the origin is never contacted again.
+      Stands in for any authorized OSS repository the team ingests.
+    source: https://github.com/fportantier/vulpy
+    snapshot: "sandbox/vulpy@5249cc8"
 
   snippet:
     name: Pasted code snippet
