@@ -138,7 +138,7 @@ The scan is synchronous today. `ScanService.start_scan` is already split into *a
 
 ## Configuration
 
-All configuration is read by `ono.config.Settings` (pydantic-settings) from environment variables or a `.env` file. Two profiles ship: `.env.example.local` and `.env.example.production`. Invalid values fail fast at startup.
+All configuration is read by `ono.config.Settings` (pydantic-settings) from environment variables or a `.env` file. Three profiles ship: `.env.example.local`, `.env.example.production`, and `.env.example.service` (real model via Ollama, see below). Invalid values fail fast at startup.
 
 | Variable | Default | Values / notes |
 |---|---|---|
@@ -146,9 +146,9 @@ All configuration is read by `ono.config.Settings` (pydantic-settings) from envi
 | `ENVIRONMENT` | `local` | `local` · `staging` · `production` (validated) |
 | `LOG_LEVEL` | `INFO` | Any Python logging level name (validated) |
 | `HOST` / `PORT` | `0.0.0.0` / `8080` | Bind address; 8080 is the one published port |
-| `MODEL_BACKEND` | `mock` | `mock` · `local` · `service` (validated). **Deliverable 2 runs `mock`.** |
-| `MODEL_NAME` | `Qwen/Qwen2.5-Coder-7B-Instruct` | Informational for `mock`; used by `local`/`service` |
-| `MODEL_SERVICE_URL` | — | **Required when `MODEL_BACKEND=service`** (startup fails otherwise) |
+| `MODEL_BACKEND` | `mock` | `mock` · `local` · `service` (validated). **Deliverable 2 runs `mock`**; `service` calls a real model; `local` is not implemented yet. |
+| `MODEL_NAME` | `Qwen/Qwen2.5-Coder-7B-Instruct` | Informational for `mock`; sent as the `model` field by `service` (e.g. `qwen2.5-coder:7b` for Ollama) |
+| `MODEL_SERVICE_URL` | — | **Required when `MODEL_BACKEND=service`** (startup fails otherwise). OpenAI-compatible base URL, e.g. `http://localhost:11434/v1` |
 | `MODEL_SERVICE_API_KEY` | — | `SecretStr`: never logged, never returned by `/info` |
 | `MAX_VERIFIER_RETRIES` | `3` | 1–5. Hard cap on the verifier self-correction loop |
 
@@ -193,6 +193,17 @@ operation-negative-one/
 | `verify` | passes `verified=True` | **deterministic verifier** (plain code): line exists, PoC reaches sink, patch applies, PoC no longer fires, tests pass; failure reasons feed a bounded self-correction loop (`MAX_VERIFIER_RETRIES`) |
 
 Switching is a config change: `MODEL_BACKEND=local` (vLLM on the same box, never published) or `MODEL_BACKEND=service` (remote OpenAI-compatible endpoint). `build_analyzer()` is the only place that needs to know. The in-memory `ScanStore` is likewise the seam for the internal findings database.
+
+### Service backend today: the stock-Qwen baseline
+
+`ServiceAnalyzer` (`MODEL_BACKEND=service`) is Deliverable 3, step 1. Only the `analyze` stage calls the model, through an OpenAI-compatible `/chat/completions` endpoint, and asks for strict-JSON findings over the pasted `snippet`. There is deliberately **no scaffold yet**: `sast_shortlist` returns nothing, `plan` is a single step, and `verify` passes findings through, so every finding is `verified=False` and at most rung 2 (model-asserted CWE + patch). Practice-app / repo targets return no findings until real ingest lands. With Ollama running on the instance:
+
+```bash
+cp .env.example.service .env        # MODEL_BACKEND=service, MODEL_SERVICE_URL=http://localhost:11434/v1, MODEL_NAME=qwen2.5-coder:7b
+uv run ono
+curl -s -X POST localhost:8080/scans -H 'content-type: application/json' \
+  -d '{"target_id":"snippet","options":{"snippet":"import os\nos.system(\"ping \" + host)\n"}}' | jq .
+```
 
 ---
 

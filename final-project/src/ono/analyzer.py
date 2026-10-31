@@ -19,18 +19,25 @@ Where the real system slots in (Deliverable 3):
 
 Both ``local`` (in-box vLLM) and ``service`` (remote OpenAI-compatible endpoint)
 backends reuse the same stages; only the model client differs.
+
+Today :class:`ServiceAnalyzer` is the *stock-Qwen baseline* (Deliverable 3, step 1):
+only ``analyze`` calls the model, with no scaffold around it yet.
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import re
+import threading
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+
+import httpx
 
 from ono.config import Settings
 from ono.models import Finding, ScanOptions, Severity, StageName, StageResult, TraceStep
@@ -599,6 +606,278 @@ def _indent_of(line: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Service backend (Deliverable 3, step 1: the stock-Qwen baseline)
+# ---------------------------------------------------------------------------
+#
+# The model is called through an OpenAI-compatible ``/chat/completions`` endpoint
+# (the team runs Ollama at http://localhost:11434/v1 with ``qwen2.5-coder:7b``).
+# Only the ``analyze`` stage talks to the model; there is deliberately NO scaffold
+# yet - no SAST shortlist, no planner, no verifier - so this backend measures what
+# the bare model can do. Those stages are stubs with TODO(D3) markers.
+
+_MODEL_TIMEOUT_S = 120.0
+
+_SYSTEM_PROMPT = (
+    "You are a senior application-security reviewer. You find real, exploitable security "
+    "vulnerabilities in source code and respond ONLY with strict JSON - no prose, no "
+    "markdown fences, no comments."
+)
+
+_USER_PROMPT = """\
+Review the following code for security vulnerabilities (injection, command execution,
+unsafe deserialization, path traversal, hard-coded secrets, broken authentication,
+SSRF, etc.). Report only genuine issues; do not pad the list.
+
+Respond with a JSON array. Each element must have exactly these keys:
+  "cwe": string such as "CWE-89"
+  "title": short string
+  "severity": one of "low", "medium", "high", "critical"
+  "file": string (use "{file}" for this input)
+  "line_start": integer, 1-based line of the vulnerable sink
+  "line_end": integer >= line_start
+  "description": why this is exploitable and how
+  "suggested_patch": a unified diff (or minimal corrected code) that fixes it
+  "confidence": number between 0 and 1
+
+If there are no vulnerabilities, respond with [].
+
+File: {file} (each line is shown as "N | code"; the "N |" prefix is not part of the code)
+```
+{numbered_code}
+```
+"""
+
+_SNIPPET_FILE = "snippet.py"
+_JSON_FENCE = re.compile(r"```(?:json|JSON)?\s*(.*?)```", re.DOTALL)
+_CWE_NUMBER = re.compile(r"(\d+)")
+_SEVERITY_ALIASES: dict[str, Severity] = {
+    "low": "low",
+    "info": "low",
+    "informational": "low",
+    "medium": "medium",
+    "moderate": "medium",
+    "high": "high",
+    "critical": "critical",
+}
+
+
+class ServiceAnalyzer(BaseAnalyzer):
+    """Calls a remote OpenAI-compatible endpoint; the model analyzes the code directly.
+
+    Step 1 of Deliverable 3. Findings are model-asserted (``verified=False``) and
+    capped at rung 2 because nothing has proven them yet.
+    """
+
+    backend = "service"
+
+    def __init__(self, settings: Settings) -> None:
+        super().__init__(settings)
+        if not settings.model_service_url:  # Settings already validates this; be explicit.
+            msg = "ServiceAnalyzer requires settings.model_service_url"
+            raise ValueError(msg)
+        self.base_url = settings.model_service_url.rstrip("/")
+        # One long-lived client (connection reuse). Tests swap in httpx.MockTransport.
+        self._http = httpx.Client(timeout=_MODEL_TIMEOUT_S)
+        # ``run`` executes all stages on one thread, so the ingested code can travel
+        # from ``ingest`` to ``analyze`` in a thread-local without cross-scan leakage.
+        # TODO(D3): replace with the sandbox workspace the analyst reads via tools.
+        self._local = threading.local()
+
+    # -- Stage 1 ------------------------------------------------------------
+    def ingest(self, target: Target, options: ScanOptions) -> str:
+        # TODO(D3): clone the pinned snapshot into the egress-blocked sandbox,
+        # strip .git / CVE strings, parse with tree-sitter, build the call graph.
+        if target.kind == "snippet":
+            code = options.snippet or ""
+            self._local.code = code
+            return f"inline snippet ({len(code)} chars)"
+        self._local.code = None
+        return target.snapshot
+
+    # -- Stage 2 ------------------------------------------------------------
+    def sast_shortlist(self, target: Target, options: ScanOptions) -> list[Candidate]:
+        # TODO(D3): Semgrep + CodeQL -> SARIF -> normalized Candidate queue.
+        # The stock-Qwen baseline has no SAST scaffold: the model sees the whole input.
+        return []
+
+    # -- Stage 3 ------------------------------------------------------------
+    def plan(self, target: Target, candidates: list[Candidate]) -> Plan:
+        # TODO(D3): prompt the frozen Qwen planner role to emit the scaffold.
+        return Plan(steps=["ANALYZE whole input"])
+
+    # -- Stage 4 ------------------------------------------------------------
+    def analyze(
+        self, scan_id: str, target: Target, candidates: list[Candidate], plan: Plan
+    ) -> list[Finding]:
+        # TODO(D3): LangGraph ReAct loop over the Qwen analyst role with a hard
+        # tool-call budget. Step 1 is a single direct call over the pasted code.
+        if target.kind != "snippet":
+            log.info(
+                "service backend: target %r (%s) has no ingested code yet - real ingest is a "
+                "later step; returning no findings",
+                target.target_id,
+                target.kind,
+            )
+            return []
+        code: str = getattr(self._local, "code", None) or ""
+        if not code.strip():
+            log.info("service backend: empty snippet, skipping model call")
+            return []
+
+        numbered = "\n".join(
+            f"{i:4d} | {line}" for i, line in enumerate(code.splitlines(), start=1)
+        )
+        messages = [
+            {"role": "system", "content": _SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": _USER_PROMPT.format(file=_SNIPPET_FILE, numbered_code=numbered),
+            },
+        ]
+        content = self.chat(messages)
+        items = _parse_model_findings(content)
+        findings: list[Finding] = []
+        for item in items:
+            finding = _finding_from_model_item(scan_id, target.target_id, item)
+            if finding is not None:
+                findings.append(finding)
+        return findings
+
+    # -- Stage 5 ------------------------------------------------------------
+    def verify(self, target: Target, findings: list[Finding]) -> list[Finding]:
+        # TODO(D3): deterministic verifier (line/symbol exists, PoC reaches the sink,
+        # patch applies, PoC no longer fires, tests pass) with a bounded
+        # self-correction loop. Step 1 is a pass-through: findings stay verified=False.
+        return findings
+
+    # -- Model client -------------------------------------------------------
+    def chat(self, messages: list[dict[str, str]]) -> str:
+        """One ``/chat/completions`` round-trip; returns the assistant message text.
+
+        Transport errors (connection refused, 5xx, timeout) propagate so the scan is
+        reported as *failed* rather than silently "clean".
+        """
+        payload: dict[str, object] = {
+            "model": self.settings.model_name,
+            "messages": messages,
+            "temperature": 0,
+            "stream": False,
+        }
+        headers: dict[str, str] = {}
+        if self.settings.model_service_api_key is not None:
+            key = self.settings.model_service_api_key.get_secret_value()
+            headers["Authorization"] = f"Bearer {key}"
+        response = self._http.post(
+            f"{self.base_url}/chat/completions", json=payload, headers=headers
+        )
+        response.raise_for_status()
+        try:
+            content = response.json()["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError, ValueError) as exc:
+            msg = "model endpoint returned an unexpected chat-completions body"
+            raise ValueError(msg) from exc
+        return content if isinstance(content, str) else ""
+
+
+def _parse_model_findings(text: str) -> list[dict[str, object]]:
+    """Extract the list of finding dicts from the model's reply.
+
+    Tolerates markdown fences, surrounding prose, and a top-level object instead
+    of a list. Returns ``[]`` (with a warning) on anything unparseable.
+    """
+    candidates: list[str] = [m.strip() for m in _JSON_FENCE.findall(text)]
+    stripped = text.strip()
+    candidates.append(stripped)
+    # Fall back to the outermost bracketed region, for prose around bare JSON.
+    for open_ch, close_ch in (("[", "]"), ("{", "}")):
+        start, end = stripped.find(open_ch), stripped.rfind(close_ch)
+        if start != -1 and end > start:
+            candidates.append(stripped[start : end + 1])
+
+    for blob in candidates:
+        if not blob:
+            continue
+        try:
+            data = json.loads(blob)
+        except ValueError:
+            continue
+        items = _coerce_to_item_list(data)
+        if items is not None:
+            return items
+
+    log.warning("service backend: could not parse model output as JSON findings; dropping it")
+    log.debug("unparseable model output: %r", text[:2000])
+    return []
+
+
+def _coerce_to_item_list(data: object) -> list[dict[str, object]] | None:
+    if isinstance(data, list):
+        return [item for item in data if isinstance(item, dict)]
+    if isinstance(data, dict):
+        for key in ("findings", "vulnerabilities", "results", "issues"):
+            inner = data.get(key)
+            if isinstance(inner, list):
+                return [item for item in inner if isinstance(item, dict)]
+        if "cwe" in data:  # the model returned a single finding object
+            return [data]
+        if not data:
+            return []
+    return None
+
+
+def _finding_from_model_item(
+    scan_id: str, target_id: str, item: dict[str, object]
+) -> Finding | None:
+    """Map one model-emitted dict onto :class:`Finding`; ``None`` if unusable."""
+    cwe_match = _CWE_NUMBER.search(str(item.get("cwe", "")))
+    if cwe_match is None:
+        log.warning("service backend: dropping finding without a CWE: %r", item.get("title"))
+        return None
+    cwe = f"CWE-{cwe_match.group(1)}"
+
+    severity = _SEVERITY_ALIASES.get(str(item.get("severity", "")).strip().lower(), "medium")
+    file = str(item.get("file") or _SNIPPET_FILE)
+    line_start = max(1, _as_int(item.get("line_start", item.get("line")), default=1))
+    line_end = max(line_start, _as_int(item.get("line_end"), default=line_start))
+    confidence = min(1.0, max(0.0, _as_float(item.get("confidence"), default=0.5)))
+    patch = str(item.get("suggested_patch") or "")
+    title = str(item.get("title") or f"{cwe} reported by {target_id} model analysis")
+
+    return Finding(
+        finding_id=finding_id_for(target_id, file, line_start, cwe),
+        scan_id=scan_id,
+        target_id=target_id,
+        title=title,
+        cwe=cwe,
+        severity=severity,
+        file=file,
+        line_range=(line_start, line_end),
+        trace=[],  # the baseline model emits no source->sink trace
+        confidence=confidence,
+        # Rung 2 = finding + CWE + suggested patch, model-asserted. Without a patch the
+        # ladder only supports rung 1 (bare flag). Nothing is proven until the verifier.
+        rung=2 if patch else 1,
+        verified=False,
+        description=str(item.get("description") or ""),
+        patch_diff=patch,
+    )
+
+
+def _as_int(value: object, *, default: int) -> int:
+    try:
+        return int(str(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_float(value: object, *, default: float) -> float:
+    try:
+        return float(str(value))
+    except (TypeError, ValueError):
+        return default
+
+
+# ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
 
@@ -607,10 +886,11 @@ def build_analyzer(settings: Settings) -> BaseAnalyzer:
     """Select the analyzer backend from settings."""
     if settings.model_backend == "mock":
         return MockAnalyzer(settings)
-    # TODO(D3): LocalAnalyzer (vLLM on the same box) and ServiceAnalyzer
-    # (remote OpenAI-compatible endpoint, settings.model_service_url / api key).
+    if settings.model_backend == "service":
+        return ServiceAnalyzer(settings)
+    # TODO(D3): LocalAnalyzer - the same pipeline against an in-box vLLM.
     msg = (
-        f"model_backend={settings.model_backend!r} is not implemented in the Deliverable-2 "
-        "prototype; set MODEL_BACKEND=mock"
+        f"model_backend={settings.model_backend!r} is not implemented yet; "
+        "set MODEL_BACKEND=mock or MODEL_BACKEND=service"
     )
     raise NotImplementedError(msg)

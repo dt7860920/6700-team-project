@@ -361,6 +361,30 @@ Wrap as `make smoke-ci` (mock set, in GitHub Actions) and `make smoke-live` (rea
 
 ---
 
+## 8.6 Observability, cost & benchmark tracking
+
+Three layers, separated by purpose — and **no Postgres required**.
+
+**1 · Per-event structured logs (JSONL) — the source of truth.** Every model call and every scan appends one JSON record to an append-only log on a Jetstream **volume**. Read it back with **DuckDB** (`SELECT ... FROM read_json_auto('calls.jsonl')`) or pandas — SQL analytics over logs, no server. (SQLite is a fine single-file alternative; Postgres is overkill.)
+
+| Record | Key fields |
+|---|---|
+| **call** | ts, scan_id, call_id, stage, model, backend, prompt_tokens, completion_tokens, ttft_ms, latency_ms, est_cost_usd, ok |
+| **scan** | ts, scan_id, target_id, n_findings, n_calls, total_tokens, total_latency_ms, est_cost_usd, loop_round |
+| **loop/benchmark** | ts, loop_round, benchmark, detection_rate, fp_rate, mean_latency_ms, total_est_cost_usd, adapter_version |
+
+**2 · Live dashboards — Prometheus + Grafana.** A `/metrics` endpoint exposes histograms (request latency, TTFT, tokens/call) and counters (scans, errors, cumulative shadow-cost), plus GPU via DCGM. This is "is it healthy now," not "what did run X cost" (that's layer 1).
+
+**3 · Benchmark & cross-loop comparison.** Roll up the JSONL (DuckDB -> small Parquet) to plot the **improvement-across-loops curve** (detection/FP/cost per loop round). W&B (offline mode) is an option for richer dashboards, but the JSONL+DuckDB rollup keeps everything local and is enough.
+
+**Shadow cost model.** We run locally (actual $ ~= 0, just SUs/power), but log what each call *would* cost at a hosted rate: `est_cost_usd = prompt_tokens/1e6 * INPUT_RATE + completion_tokens/1e6 * OUTPUT_RATE`, storing the rate so it stays interpretable.
+
+**Where the numbers come from.** The Ollama/OpenAI response carries token counts (`usage`) and, for Ollama, nanosecond durations. **TTFT needs streaming** — measure wall-clock to the first token chunk; total latency is wall-clock around the call. vLLM additionally exposes a `/metrics` TTFT histogram.
+
+**Settings to add** (`config.py`, all default-safe): `metrics_log_dir`, `cost_input_rate`, `cost_output_rate`, `enable_prometheus`, `enable_metrics_log`. Metrics logging records token *counts* and timings only — **never secrets or full code**.
+
+---
+
 ## 9. Risk register
 
 ```mermaid
@@ -422,6 +446,16 @@ Expanding beyond intentionally-vulnerable practice apps to **real open-source pr
 - **Responsible disclosure** — if ONO finds a *real, undisclosed* vulnerability in real software, that triggers coordinated disclosure to the maintainer, **not publication**; the repo documents the disclosure process.
 
 The boundary never moves: we analyze **copies we host**, never a live third-party system.
+
+### Operational security & secrets hygiene
+
+Distinct from the dual-use guardrails above: this is day-to-day opsec, enforced in code and git.
+
+- **Secrets:** all are `SecretStr` (config) — never logged, never returned by `/info`. The real `.env` is **gitignored**; only `.env.example.*` is committed. No key, token, or credential-bearing URL ever lives in code or committed config.
+- **Git protection:** pre-commit runs `detect-private-key`; **add a secret scanner** (`gitleaks` or `detect-secrets`) as a pre-commit hook **and** a CI step, so a key cannot be pushed. Review diffs before committing anything under `final-project/`.
+- **Network exposure:** only the app port (**8080**) is in the security group. The model server (Ollama **:11434** / vLLM **:8000**), the database, and the sandbox targets are **localhost / internal-Docker only** and are **never** opened. Bind Ollama to localhost (`OLLAMA_HOST=127.0.0.1`) so it is unreachable off-box.
+- **Logging hygiene:** metrics/logs record token *counts* and timings, **never** secrets or full prompt/response code; verbose prompt logging is gated behind a debug flag and off in production. Nothing sensitive is sent to external services (if W&B is used: offline mode, no code payloads).
+- **Data:** ingested repos stay in the egress-blocked sandbox; logs/findings containing target code live on the volume, **not** in git.
 
 ## 11. Goals in three tiers (the scope-creep contract)
 
