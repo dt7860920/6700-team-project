@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-__all__ = ["PipelineError"]
+__all__ = ["PipelineError", "ScanBusyError"]
 
 
 class PipelineError(RuntimeError):
@@ -12,3 +12,19 @@ class PipelineError(RuntimeError):
     (anything else is reported generically), so raise this only with operator-oriented,
     secret-free text: "executor unreachable at ...", "clone failed ...".
     """
+
+
+class ScanBusyError(RuntimeError):
+    """The scan worker pool and its queue are full; the request was not accepted.
+
+    The API maps this to ``429 Too Many Requests``; the UI shows it as "busy, retry".
+    """
+
+    def __init__(self, active: int, queued: int, max_active: int, max_queued: int) -> None:
+        super().__init__(
+            f"ONO is busy: {active} scan(s) running and {queued} queued "
+            f"(limits: MAX_ACTIVE_SCANS={max_active}, MAX_QUEUED_SCANS={max_queued}). "
+            "Retry in a moment."
+        )
+        self.active = active
+        self.queued = queued

@@ -5,9 +5,10 @@ One process, one published port (8080). OpenAPI docs live at ``/docs``.
     GET  /health                     liveness
     GET  /info                       app / version / environment / backend (no secrets)
     GET  /targets                    the allowlist
-    POST /scans                      start a scan (403 if target_id is not allowlisted)
-    GET  /scans/{scan_id}            scan metadata
-    GET  /scans/{scan_id}/findings   findings for a scan
+    POST /scans                      start a scan in the background -> 202 + scan_id
+                                     (403 if target_id is not allowlisted, 429 if busy)
+    GET  /scans/{scan_id}            live scan record: status, progress, stages, count
+    GET  /scans/{scan_id}/findings   findings for a scan (so far)
     GET  /findings/{finding_id}      one finding
     GET  /ui                         Gradio analyst UI  (``/`` redirects here)
 """
@@ -15,6 +16,8 @@ One process, one published port (8080). OpenAPI docs live at ``/docs``.
 from __future__ import annotations
 
 import logging
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Annotated
 
 import gradio as gr
@@ -24,6 +27,7 @@ from fastapi.responses import JSONResponse, RedirectResponse
 from ono import __version__
 from ono.analyzer import build_analyzer
 from ono.config import Settings, configure_logging, get_settings
+from ono.errors import ScanBusyError
 from ono.models import (
     ErrorResponse,
     Finding,
@@ -31,7 +35,6 @@ from ono.models import (
     InfoResponse,
     Scan,
     ScanRequest,
-    ScanResponse,
     TargetsResponse,
     TargetSummary,
 )
@@ -71,6 +74,13 @@ def create_app(
         store=InMemoryScanStore(),
     )
 
+    @asynccontextmanager
+    async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        try:
+            yield
+        finally:
+            service.close()
+
     app = FastAPI(
         title=settings.app_name,
         version=__version__,
@@ -78,9 +88,13 @@ def create_app(
         description=(
             "ONO ingests an **authorized** code target, finds vulnerabilities, proves they are "
             "reachable, and proposes verified fixes. Scans are addressed by `target_id` from "
-            "the allowlist (`GET /targets`) - never by URL. "
+            "the allowlist (`GET /targets`) - never by URL. A scan runs in the background: "
+            "`POST /scans` answers **202** with a `scan_id`; poll `GET /scans/{scan_id}` "
+            "(status `queued` -> `running` -> `done` | `failed`, with a live `progress` line) "
+            "and read `GET /scans/{scan_id}/findings`. "
             f"Current analyzer backend: `{settings.model_backend}`."
         ),
+        lifespan=lifespan,
         docs_url="/docs",
         redoc_url="/redoc",
         openapi_tags=[
@@ -101,6 +115,15 @@ def create_app(
             content=ErrorResponse(
                 detail=f"{exc}. See GET /targets for the allowlist."
             ).model_dump(),
+        )
+
+    @app.exception_handler(ScanBusyError)
+    async def _busy(_: Request, exc: ScanBusyError) -> JSONResponse:
+        log.warning("rejected scan: %s", exc)
+        return JSONResponse(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            headers={"Retry-After": "10"},
+            content=ErrorResponse(detail=str(exc)).model_dump(),
         )
 
     # -- ops --------------------------------------------------------------
@@ -130,22 +153,30 @@ def create_app(
     # -- scans ------------------------------------------------------------
     @app.post(
         "/scans",
-        response_model=ScanResponse,
-        status_code=status.HTTP_201_CREATED,
+        response_model=Scan,
+        status_code=status.HTTP_202_ACCEPTED,
         tags=["scans"],
-        responses={403: {"model": ErrorResponse, "description": "target_id not allowlisted"}},
-        summary="Start a scan of an authorized target",
+        responses={
+            403: {"model": ErrorResponse, "description": "target_id not allowlisted"},
+            429: {"model": ErrorResponse, "description": "worker pool and queue are full"},
+        },
+        summary="Start a scan of an authorized target (asynchronous)",
+        description=(
+            "Validates the target against the allowlist, creates the scan with "
+            '`status="queued"` and runs it on a background worker. Returns **202** at '
+            "once; poll `GET /scans/{scan_id}` until `status` is `done` or `failed`."
+        ),
     )
-    async def create_scan(body: ScanRequest, svc: ServiceDep) -> ScanResponse:
-        # Synchronous in the prototype: the response carries the findings.
-        # Future: enqueue, return 202 + status="queued", poll GET /scans/{scan_id}.
-        return svc.start_scan(body)
+    async def create_scan(body: ScanRequest, svc: ServiceDep) -> Scan:
+        # submit_scan only authorizes and enqueues (no blocking work on the event loop).
+        return svc.submit_scan(body)
 
     @app.get(
         "/scans/{scan_id}",
         response_model=Scan,
         tags=["scans"],
         responses={404: {"model": ErrorResponse}},
+        summary="Live scan record (poll this)",
     )
     async def get_scan(scan_id: str, svc: ServiceDep) -> Scan:
         scan = svc.get_scan(scan_id)
@@ -158,6 +189,7 @@ def create_app(
         response_model=list[Finding],
         tags=["scans"],
         responses={404: {"model": ErrorResponse}},
+        summary="Findings for a scan (empty until it is done)",
     )
     async def get_scan_findings(scan_id: str, svc: ServiceDep) -> list[Finding]:
         findings = svc.get_findings(scan_id)
@@ -193,11 +225,12 @@ def create_app(
         )
 
     log.info(
-        "ONO %s ready (environment=%s, model_backend=%s, targets=%d)",
+        "ONO %s ready (environment=%s, model_backend=%s, targets=%d, max_active_scans=%d)",
         __version__,
         settings.environment,
         settings.model_backend,
         len(registry),
+        settings.max_active_scans,
     )
     return app
 

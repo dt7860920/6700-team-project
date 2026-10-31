@@ -53,6 +53,7 @@ from ono.models import (
     finding_id_for,
 )
 from ono.orchestrator import DetectionOrchestrator, DetectionReport, ExecutorProvider
+from ono.progress import NullProgress, ProgressSink
 from ono.sast import PATTERN_RULES, Candidate, scan_text
 from ono.targets import Target
 
@@ -94,35 +95,85 @@ class AnalysisResult:
         return f"{n} verified finding{'s' if n != 1 else ''}"
 
 
+_NULL_PROGRESS = NullProgress()
+
+
 class BaseAnalyzer(ABC):
-    """Shared pipeline skeleton. Subclasses implement the five stages."""
+    """Shared pipeline skeleton. Subclasses implement the five stages.
+
+    Progress: ``run(..., progress=sink)`` binds a :class:`~ono.progress.ProgressSink` to
+    the *calling thread* for the duration of the run (one analyzer instance serves
+    concurrent scans on different worker threads), so any stage can call
+    :meth:`report` without threading a callback through every signature.
+    """
 
     backend: str = "base"
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
+        self._progress_local = threading.local()
+
+    # -- Progress ---------------------------------------------------------
+    @property
+    def _progress(self) -> ProgressSink:
+        sink: ProgressSink | None = getattr(self._progress_local, "sink", None)
+        return sink if sink is not None else _NULL_PROGRESS
+
+    @contextmanager
+    def _bound_progress(self, sink: ProgressSink | None) -> Iterator[None]:
+        previous: ProgressSink | None = getattr(self._progress_local, "sink", None)
+        # A nested bind (ServiceAnalyzer.run -> BaseAnalyzer.run) keeps the outer sink.
+        self._progress_local.sink = sink if sink is not None else previous
+        try:
+            yield
+        finally:
+            self._progress_local.sink = previous
+
+    def report(self, message: str) -> None:
+        """Tell whoever is watching what the pipeline is doing right now."""
+        self._progress.step(message)
 
     # -- Orchestration ----------------------------------------------------
-    def run(self, scan_id: str, target: Target, options: ScanOptions) -> AnalysisResult:
+    def run(
+        self,
+        scan_id: str,
+        target: Target,
+        options: ScanOptions,
+        *,
+        progress: ProgressSink | None = None,
+    ) -> AnalysisResult:
+        with self._bound_progress(progress):
+            return self._run_stages(scan_id, target, options)
+
+    def _run_stages(self, scan_id: str, target: Target, options: ScanOptions) -> AnalysisResult:
         stages: list[StageResult] = []
 
         with self._timed("ingest", stages) as note:
+            self.report(
+                "Preparing the pasted snippet"
+                if target.kind == "snippet"
+                else f"Fetching the target snapshot ({target.name})"
+            )
             snapshot = self.ingest(target, options)
             note(f"snapshot {snapshot}")
 
         with self._timed("sast", stages) as note:
+            self.report("Static analysis: building the candidate shortlist")
             candidates = self.sast_shortlist(target, options)
             note(f"{len(candidates)} candidate(s)")
 
         with self._timed("plan", stages) as note:
+            self.report(f"Planning the investigation of {len(candidates)} candidate(s)")
             plan = self.plan(target, candidates)
             note(" -> ".join(plan.steps) if plan.steps else "no steps")
 
         with self._timed("analyze", stages) as note:
+            self.report(f"Analyzing {len(candidates)} candidate(s)")
             raw = self.analyze(scan_id, target, candidates, plan)
             note(f"{len(raw)} raw finding(s)")
 
         with self._timed("verify", stages) as note:
+            self.report(f"Verifying {len(raw)} raw finding(s)")
             verified = self.verify(target, raw)
             note(f"{len(verified)} passed the verifier")
 
@@ -142,12 +193,16 @@ class BaseAnalyzer(ABC):
             yield note
         except Exception as exc:
             elapsed = (time.perf_counter() - start) * 1000
-            sink.append(
-                StageResult(stage=stage, status="failed", duration_ms=elapsed, summary=str(exc))
+            failed = StageResult(
+                stage=stage, status="failed", duration_ms=elapsed, summary=str(exc)
             )
+            sink.append(failed)
+            self._progress.stage(failed)
             raise
         elapsed = (time.perf_counter() - start) * 1000
-        sink.append(StageResult(stage=stage, duration_ms=elapsed, summary=summary))
+        result = StageResult(stage=stage, duration_ms=elapsed, summary=summary)
+        sink.append(result)
+        self._progress.stage(result)
 
     # -- Stages (override in backends) -----------------------------------
     @abstractmethod
@@ -638,19 +693,29 @@ class ServiceAnalyzer(BaseAnalyzer):
         self._local = threading.local()
 
     # -- Orchestration ----------------------------------------------------
-    def run(self, scan_id: str, target: Target, options: ScanOptions) -> AnalysisResult:
+    def run(
+        self,
+        scan_id: str,
+        target: Target,
+        options: ScanOptions,
+        *,
+        progress: ProgressSink | None = None,
+    ) -> AnalysisResult:
         self._local.workspace = ingest.workspace_path(self.settings.workspace_dir, scan_id)
         try:
-            # Fail fast: an unreachable Executor fails the scan *before* cloning anything,
-            # with a message the API surfaces - never a silent fallback to host reads.
-            health = self.orchestrator.preflight()
-            log.info(
-                "service backend: executor ok (%d active sandbox(es)); model %s via %s",
-                health.active_sandboxes,
-                self.settings.model_name,
-                self.base_url,
-            )
-            return super().run(scan_id, target, options)
+            with self._bound_progress(progress):
+                # Fail fast: an unreachable Executor fails the scan *before* cloning
+                # anything, with a message the API surfaces - never a silent fallback to
+                # host reads.
+                self.report("Checking the sandbox Executor and the model endpoint")
+                health = self.orchestrator.preflight()
+                log.info(
+                    "service backend: executor ok (%d active sandbox(es)); model %s via %s",
+                    health.active_sandboxes,
+                    self.settings.model_name,
+                    self.base_url,
+                )
+                return super().run(scan_id, target, options)
         finally:
             # The clone is a copy we never keep: remove it whether or not the run succeeded.
             ingest.cleanup_workspace(self._local.workspace)
@@ -711,7 +776,9 @@ class ServiceAnalyzer(BaseAnalyzer):
     def analyze(
         self, scan_id: str, target: Target, candidates: list[Candidate], plan: Plan
     ) -> list[Finding]:
-        report = self.orchestrator.detect(scan_id, target.target_id, self._workspace, candidates)
+        report = self.orchestrator.detect(
+            scan_id, target.target_id, self._workspace, candidates, progress=self.report
+        )
         self.last_report = report
         log.info("service backend: %s", report.summary)
         return report.findings

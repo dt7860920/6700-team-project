@@ -101,11 +101,11 @@ Interactive documentation is generated from the code at **`/docs`** (Swagger UI)
 | `GET` | `/health` | Liveness → `{"status":"ok"}` |
 | `GET` | `/info` | App name, version, environment, model backend (no secrets) |
 | `GET` | `/targets` | The authorized-target allowlist |
-| `POST` | `/scans` | Start a scan. **403** if `target_id` is not allowlisted. Returns the scan **with findings** (201). |
-| `GET` | `/scans/{scan_id}` | Scan metadata (status, pipeline stage timings, findings count) |
-| `GET` | `/scans/{scan_id}/findings` | Findings for a scan |
+| `POST` | `/scans` | Start a scan **in the background**. **202** with the scan record (`status: "queued"`, `scan_id`). **403** if `target_id` is not allowlisted; **429** if the worker pool and queue are full. |
+| `GET` | `/scans/{scan_id}` | The **live** scan record: `status` (`queued → running → done \| failed`), `progress` (what it is doing now), `events` (activity log), `pipeline` (stage results so far), `findings_count`, `message` |
+| `GET` | `/scans/{scan_id}/findings` | Findings for a scan (empty until it is `done`) |
 | `GET` | `/findings/{finding_id}` | One finding |
-| `GET` | `/ui` | Gradio analyst UI (`/` redirects here) |
+| `GET` | `/ui` | Gradio analyst UI (`/` redirects here) — see [The analyst UI](#the-analyst-ui-handoff-surface) |
 
 ```bash
 BASE=http://localhost:8080
@@ -116,9 +116,18 @@ curl -s $BASE/health
 curl -s $BASE/targets | python -m json.tool
 # {"targets": [{"target_id": "pygoat", "name": "OWASP PyGoat", "kind": "practice-app", ...}, ...]}
 
-# Scan an authorized target (synchronous in the prototype: findings come back inline)
+# Start a scan of an authorized target: 202 Accepted, the scan runs in the background
 curl -s -X POST $BASE/scans -H 'content-type: application/json' \
      -d '{"target_id": "pygoat"}' | python -m json.tool
+# {"scan_id": "scn_…", "status": "queued", "progress": "Waiting for a free scan worker", ...}
+
+# Poll the live record until status is "done" or "failed"
+curl -s $BASE/scans/<scan_id> | jq '{status, progress, findings_count, pipeline: [.pipeline[].stage]}'
+# {"status": "running", "progress": "Analyzing candidate 2 of 3 - app/views.py:16 (CWE-89)", ...}
+
+# Then read the findings
+curl -s $BASE/scans/<scan_id>/findings
+curl -s $BASE/findings/<finding_id>
 
 # Scan a pasted snippet (the mock SAST reacts to the actual code)
 curl -s -X POST $BASE/scans -H 'content-type: application/json' \
@@ -128,12 +137,23 @@ curl -s -X POST $BASE/scans -H 'content-type: application/json' \
 curl -s -o /dev/null -w '%{http_code}\n' -X POST $BASE/scans \
      -H 'content-type: application/json' -d '{"target_id": "example.com"}'
 # 403
-
-curl -s $BASE/scans/<scan_id>/findings
-curl -s $BASE/findings/<finding_id>
 ```
 
-The scan is synchronous today. `ScanService.start_scan` is already split into *authorize → create → execute → persist*, so moving execution onto a worker (202 Accepted, `status="queued"`, poll `GET /scans/{id}`) is a local change that does not alter the resource model.
+**How a scan runs.** `POST /scans` only checks the allowlist and creates the record; the pipeline runs on a small **background worker pool** (`MAX_ACTIVE_SCANS` threads — a scan does blocking work: `git clone`, Semgrep, Docker, model HTTP calls — so it never touches the event loop). The worker writes into the record as it goes: `status`, a one-line `progress` (`Fetching the target snapshot` → `Static analysis` → `Analyzing candidate 2 of 3 - app/views.py:16` → `Candidate 2 of 3 dismissed: …`), the `events` log, and each `pipeline` stage result as it completes. On failure `status` is `failed` and `message` carries the reason (`analysis pipeline failed: executor unreachable at …`). Up to `MAX_QUEUED_SCANS` scans wait for a worker (`status: "queued"`); beyond that `POST /scans` answers **429** with a `Retry-After` header instead of growing an unbounded backlog of model sessions. `scripts/golden_path.py` shows the submit-then-poll loop in ten lines.
+
+---
+
+## The analyst UI (handoff surface)
+
+`http://<host>:8080/ui` is the only surface a reviewer needs; it is mounted inside the same FastAPI process (no extra port) and calls the same `ScanService` the API uses, so the allowlist check cannot be bypassed from the browser.
+
+1. **Pick a target** from the dropdown (name + kind: *practice app*, *repository*, or *paste code*). Choosing *Pasted code snippet* reveals a code box with an example.
+2. **Click Analyze.** The scan is submitted in the background and the page **polls** it every `UI_POLL_INTERVAL_S` seconds, so the browser never waits on a long request. The progress card shows a status pill (Queued / Running / Done / Failed), the elapsed time, the current step (`Cloning … → Static analysis → Analyzing candidate 2 of 3 - app/views.py:16 → Verifying`), a five-stage checklist with timings, and an expandable activity log (every candidate the agents confirmed or dismissed, and why).
+3. **Read the findings.** Each finding is a card: title; **CWE** linked to MITRE; **severity**; the **rung** badge (1–5, hover for what it means); **✔ verified** (the deterministic verifier passed) or **⚠ not verified** (model-asserted); **confidence**; `file:line`; the readable **source → sink trace**; the description; and the **proposed patch** as a collapsible colored diff (plus the detection rule on rung 5). Cards are ordered by severity. "How to read a finding" explains the ladder; "Raw JSON" shows exactly what the API returned.
+4. **No findings** is a clear green state ("No vulnerabilities found", with how many candidates were reviewed and dismissed). **A failed scan** shows the reason in plain language ("Scan failed: executor unreachable at …") with a hint to check the model endpoint and the Executor — never a stack trace. If ONO is at capacity you see "Busy … retry in a moment".
+5. **Long scans.** A real `service`-backend scan takes minutes. You can leave the page: the scan keeps running, and **Look up a scan by id** re-attaches to it (the id is in the status card and in the API response).
+
+The UI works unchanged on both backends: `mock` finishes in milliseconds (good for a first click), `service` streams real progress for the whole run.
 
 ---
 
@@ -152,6 +172,10 @@ All configuration is read by `ono.config.Settings` (pydantic-settings) from envi
 | `MODEL_SERVICE_URL` | — | **Required when `MODEL_BACKEND=service`** (startup fails otherwise). OpenAI-compatible base URL, e.g. `http://localhost:11434/v1` |
 | `MODEL_SERVICE_API_KEY` | — | `SecretStr`: never logged, never returned by `/info` |
 | `MAX_VERIFIER_RETRIES` | `3` | 1–5. Hard cap on the verifier self-correction loop |
+| `MAX_ACTIVE_SCANS` | `2` | 1–16. Scans that run at the same time (background worker threads). Each holds a model session and, on `service`, one sandbox |
+| `MAX_QUEUED_SCANS` | `8` | 0–100. Scans allowed to wait for a worker; beyond this `POST /scans` answers 429 (busy) |
+| `UI_POLL_INTERVAL_S` | `1.0` | 0.2–10. How often the UI refreshes a running scan's status card |
+| `UI_POLL_TIMEOUT_S` | `3600` | 30–86400. How long the UI keeps watching one scan (the scan itself continues; "Look up a scan by id" picks it up again) |
 | `WORKSPACE_DIR` | `.ono-workspace` | Per-scan clone workspaces (`<dir>/<scan_id>/`), removed when each scan ends. Must be writable; the image sets `/tmp/ono-workspace` |
 | `SAST_RULESET` | `p/owasp-top-ten` | Comma-separated Semgrep `--config` values (registry packs or local rule files). A language pack (`p/python`, `p/javascript`, …) is appended per target language. Empty = skip Semgrep, regex scanner only |
 | `MAX_CANDIDATES` | `20` | 1–200. Cap on SAST candidates kept per scan — and therefore on model calls |
@@ -190,8 +214,9 @@ The **target allowlist** lives in [`src/ono/targets.yaml`](src/ono/targets.yaml)
 operation-negative-one/
 ├── src/ono/
 │   ├── api.py          FastAPI app: documented endpoints + mounted Gradio UI
-│   ├── ui.py           Gradio analyst UI (target picker / snippet -> Analyze -> finding cards)
-│   ├── service.py      ScanService: allowlist gate -> run pipeline -> persist
+│   ├── ui.py           Gradio analyst UI (target picker -> Analyze -> live progress -> finding cards)
+│   ├── service.py      ScanService: allowlist gate -> background worker pool -> live scan record
+│   ├── progress.py     ProgressSink: how the pipeline reports "what I am doing now"
 │   ├── analyzer.py     Pipeline skeleton (ingest/sast/plan/analyze/verify) + MockAnalyzer + ServiceAnalyzer
 │   ├── ingest.py       Stage 1 for real backends: shallow clone / snippet file into a per-scan workspace
 │   ├── sast.py         Stage 2 for real backends: Semgrep JSON -> Candidate queue, regex fallback
@@ -281,14 +306,16 @@ uv run ono                                              # http://localhost:8080
 
 # terminal 3: scan the ingested OSS repo target. Expect: clone -> Semgrep -> one jail ->
 # up to MAX_CANDIDATES x (planner + analyst loop) model calls. Minutes, not seconds.
-curl -s -X POST localhost:8080/scans -H 'content-type: application/json' -d '{"target_id":"vulpy"}' \
-  | jq '.status, .message, .pipeline, (.findings[] | {cwe, file, line_range, rung, verified, title, trace})'
+# (Or open http://localhost:8080/ui, pick "vulpy", click Analyze and watch the progress card.)
+SCAN=$(curl -s -X POST localhost:8080/scans -H 'content-type: application/json' -d '{"target_id":"vulpy"}' | jq -r .scan_id)
+watch -n 2 "curl -s localhost:8080/scans/$SCAN | jq '{status, progress, pipeline: [.pipeline[] | {stage, status, summary}]}'"
+curl -s localhost:8080/scans/$SCAN/findings | jq '.[] | {cwe, file, line_range, rung, verified, title, trace}'
 
 # watch the agents work
 tail -f .ono-trajectories/scn_*.jsonl                   # if AGENT_TRAJECTORY_DIR=.ono-trajectories
 ```
 
-The `.pipeline` array shows each stage's status and timing; the `analyze` summary reads like `2 raw finding(s) from 9 candidate(s) (2 confirmed, 6 dismissed, 1 exhausted); 31/81 model call(s)`. If the Executor is down the response is `status: "failed"` with the reason in `.message`. Under Compose the same flow runs with `EXECUTOR_URL=http://executor:8081` (already set in `compose.yml`) and `MODEL_SERVICE_URL` pointing at the host's Ollama (`http://host.docker.internal:11434/v1` or the instance's internal address).
+The `.pipeline` array shows each stage's status and timing; the `analyze` summary reads like `2 raw finding(s) from 9 candidate(s) (2 confirmed, 6 dismissed, 1 exhausted); 31/81 model call(s)`, and the `events` log lists every candidate the agents confirmed or dismissed, with the reason. If the Executor is down the record ends with `status: "failed"` and the reason in `.message`. Under Compose the same flow runs with `EXECUTOR_URL=http://executor:8081` (already set in `compose.yml`) and `MODEL_SERVICE_URL` pointing at the host's Ollama (`http://host.docker.internal:11434/v1` or the instance's internal address).
 
 ---
 
