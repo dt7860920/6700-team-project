@@ -35,6 +35,51 @@ group: `pytest`, `pytest-asyncio`, `pytest-cov`, `ruff`, `mypy`, `pre-commit`.
    ```
    API at http://127.0.0.1:8000, interactive docs at http://127.0.0.1:8000/docs.
 
+## Web UI (Streamlit)
+The UI in `ui/` uploads a `.zip` codebase, shows scan progress, and lists each exploit with its proposed patch.
+
+- `ui/app.py`: the Streamlit page
+- `ui/client.py`: HTTP client for the backend job API
+- `ui/fake_backend.py`: in-process fake backend so the UI works before the real one exists
+
+Run it with fake data (no backend needed), then open http://localhost:8501:
+```
+MOCK_API=1 uv run --extra ui streamlit run ui/app.py
+```
+Run it against the real backend:
+```
+API_URL=http://localhost:8000 uv run --extra ui streamlit run ui/app.py
+```
+The upload limit is 50 MB. Change it in both `.streamlit/config.toml` and the `MAX_UPLOAD_MB` env var.
+
+### Backend API contract
+The UI expects the backend to implement these endpoints. A scan takes minutes, so the backend works as a job queue: the upload returns right away and the UI polls for status.
+
+| Method | Path | Returns |
+|---|---|---|
+| `GET` | `/health` | `{"status": "ok"}` |
+| `POST` | `/jobs` (multipart field `file`, a .zip) | `{"job_id": "..."}` |
+| `GET` | `/jobs/{job_id}` | `{"job_id", "status", "detail"}` |
+| `GET` | `/jobs/{job_id}/results` | `{"job_id", "backend", "files_scanned", "findings": [...]}` (409 until done) |
+| `DELETE` | `/jobs/{job_id}` | deletes the uploaded code and results |
+
+`status` is one of `queued`, `extracting`, `checking_license`, `license_rejected`, `hunting`, `verifying`, `patching`, `done`, `failed`. On `license_rejected` or `failed`, put the reason in `detail`.
+
+Each finding:
+```json
+{
+  "id": "f1",
+  "file": "app/db.py",
+  "line": 14,
+  "cwe": "CWE-89",
+  "title": "SQL injection in user lookup",
+  "explanation": "Why this is exploitable",
+  "trigger": "Example input that triggers it",
+  "patch": "unified diff (git apply format), or null if no fix was proposed"
+}
+```
+Errors should return an HTTP error code with `{"detail": "message"}` (FastAPI's default); the UI shows `detail` to the user.
+
 ## Running with Docker
 ```bash
 docker build -t team_project:latest .

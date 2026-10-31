@@ -1,0 +1,6 @@
+[server]
+# Keep in sync with MAX_UPLOAD_MB (ui/app.py) and the backend's upload limit
+maxUploadSize = 50
+
+[browser]
+gatherUsageStats = false
