@@ -33,8 +33,39 @@ def test_service_backend_requires_url() -> None:
 
 
 def test_service_backend_accepts_url() -> None:
-    s = Settings(_env_file=None, model_backend="service", model_service_url="http://vllm:8000/v1")
+    s = Settings(
+        _env_file=None,
+        model_backend="service",
+        model_service_url="http://vllm:8000/v1",
+        executor_token=SecretStr("unit-test-token-0123456789"),
+    )
     assert s.model_service_url == "http://vllm:8000/v1"
+
+
+def test_service_backend_requires_executor_token() -> None:
+    with pytest.raises(ValidationError, match="executor_token is required"):
+        Settings(_env_file=None, model_backend="service", model_service_url="http://vllm:8000/v1")
+
+
+def test_agent_settings_have_safe_defaults_and_bounds(monkeypatch: pytest.MonkeyPatch) -> None:
+    s = Settings(_env_file=None)
+    assert (s.planner_enabled, s.analyst_max_steps, s.agent_temperature) == (True, 8, 0.0)
+    assert s.agent_tool_protocol == "auto"
+    assert (s.agent_tool_output_chars, s.agent_candidate_timeout_s) == (6000, 300.0)
+    assert s.agent_trajectory_dir is None
+
+    monkeypatch.setenv("PLANNER_ENABLED", "false")
+    monkeypatch.setenv("ANALYST_MAX_STEPS", "4")
+    monkeypatch.setenv("AGENT_TOOL_PROTOCOL", "text")
+    monkeypatch.setenv("AGENT_TRAJECTORY_DIR", "/tmp/ono-traj")
+    s = Settings(_env_file=None)
+    assert (s.planner_enabled, s.analyst_max_steps, s.agent_tool_protocol) == (False, 4, "text")
+    assert s.agent_trajectory_dir == Path("/tmp/ono-traj")
+
+    with pytest.raises(ValidationError, match="analyst_max_steps"):
+        Settings(_env_file=None, analyst_max_steps=0)
+    with pytest.raises(ValidationError, match="agent_tool_protocol"):
+        Settings(_env_file=None, agent_tool_protocol="grpc")  # type: ignore[arg-type]
 
 
 def test_api_key_is_secret_and_never_rendered() -> None:
