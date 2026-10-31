@@ -20,18 +20,17 @@ Where the real system slots in (Deliverable 3):
 Both ``local`` (in-box vLLM) and ``service`` (remote OpenAI-compatible endpoint)
 backends reuse the same stages; only the model client differs.
 
-:class:`ServiceAnalyzer` is at Deliverable 3, step 2: real ``ingest`` (shallow clone
-into a per-scan workspace, :mod:`ono.ingest`) and a real Semgrep ``sast_shortlist``
-(:mod:`ono.sast`) feed the model real file context per candidate. ``plan`` is still
-a fixed step list and ``verify`` is still a pass-through.
+:class:`ServiceAnalyzer` is at Deliverable 3, step 3b-1: real ``ingest`` (shallow clone
+into a per-scan workspace, :mod:`ono.ingest`), a real Semgrep ``sast_shortlist``
+(:mod:`ono.sast`), and an ``analyze`` stage run by the deterministic
+:class:`~ono.orchestrator.DetectionOrchestrator`: one jailed sandbox per scan, then per
+candidate the *planner* agent and the *analyst* ReAct loop (:mod:`ono.agents`) reading
+the code through the Executor. ``verify`` is still a pass-through (step 3b-2).
 """
 
 from __future__ import annotations
 
-import hashlib
-import json
 import logging
-import re
 import threading
 import time
 from abc import ABC, abstractmethod
@@ -40,15 +39,32 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
-import httpx
-
 from ono import ingest, sast
+from ono.agents.model import ChatModel, ModelClient
 from ono.config import Settings
-from ono.models import Finding, ScanOptions, Severity, StageName, StageResult, TraceStep
+from ono.executor.client import ExecutorClient
+from ono.models import (
+    Finding,
+    ScanOptions,
+    Severity,
+    StageName,
+    StageResult,
+    TraceStep,
+    finding_id_for,
+)
+from ono.orchestrator import DetectionOrchestrator, DetectionReport, ExecutorProvider
 from ono.sast import PATTERN_RULES, Candidate, scan_text
 from ono.targets import Target
 
-__all__ = ["AnalysisResult", "BaseAnalyzer", "Candidate", "Plan", "build_analyzer"]
+__all__ = [
+    "AnalysisResult",
+    "BaseAnalyzer",
+    "Candidate",
+    "Plan",
+    "ServiceAnalyzer",
+    "build_analyzer",
+    "finding_id_for",
+]
 
 log = logging.getLogger(__name__)
 
@@ -76,12 +92,6 @@ class AnalysisResult:
     def summary(self) -> str:
         n = len(self.findings)
         return f"{n} verified finding{'s' if n != 1 else ''}"
-
-
-def finding_id_for(target_id: str, file: str, line: int, cwe: str) -> str:
-    """Stable id so the same (target, sink) yields the same finding across runs."""
-    digest = hashlib.sha1(f"{target_id}|{file}|{line}|{cwe}".encode()).hexdigest()
-    return f"fnd_{digest[:10]}"
 
 
 class BaseAnalyzer(ABC):
@@ -565,91 +575,64 @@ def _indent_of(line: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Service backend (Deliverable 3, step 2: real ingest + Semgrep shortlist)
+# Service backend (Deliverable 3, step 3b-1: the agentic detection core)
 # ---------------------------------------------------------------------------
 #
 # The model is called through an OpenAI-compatible ``/chat/completions`` endpoint
 # (the team runs Ollama at http://localhost:11434/v1 with ``qwen2.5-coder:7b``).
 # Shape of a run:
 #
-#   ingest  - clone / copy / write the target into <workspace_dir>/<scan_id>/
-#   sast    - Semgrep (regex fallback) over that directory -> bounded Candidate queue
-#   analyze - ONE model call per candidate, over the real code around the sink;
-#             the model confirms or dismisses and the Finding is anchored to the
-#             candidate's real file:line
-#   verify  - pass-through (the deterministic verifier is the next step)
+#   preflight - the Executor must answer /health (and see Docker) or the scan fails
+#               with an actionable message before anything is cloned
+#   ingest    - clone / copy / write the target into <workspace_dir>/<scan_id>/ (host)
+#   sast      - Semgrep (regex fallback) over that directory -> bounded Candidate queue
+#   plan      - deterministic: the queue the orchestrator will walk (the LLM planner
+#               runs per candidate inside ``analyze``)
+#   analyze   - ``DetectionOrchestrator.detect``: ONE jailed sandbox for the scan, then
+#               per candidate planner -> analyst ReAct loop (read-only sandbox tools) ->
+#               anchored Finding or dismissal. All target-code reads go through the jail.
+#   verify    - pass-through (the graded verifier is step 3b-2)
 #
 # The workspace is removed when the run ends, success or failure.
 
-_MODEL_TIMEOUT_S = 120.0
-
-_SYSTEM_PROMPT = (
-    "You are a senior application-security reviewer. You find real, exploitable security "
-    "vulnerabilities in source code and respond ONLY with strict JSON - no prose, no "
-    "markdown fences, no comments."
-)
-
-_CANDIDATE_PROMPT = """\
-A static-analysis tool flagged a possible vulnerability. Decide whether it is a GENUINE,
-exploitable issue by reading the surrounding code. Do not pad: if the flagged code is
-safe (input is validated, constant, or unreachable), dismiss it.
-
-Flag:
-  file: {file}
-  line: {line}
-  suspected CWE: {cwe_hint}
-  rule: {rule}
-
-Respond with ONE JSON object with exactly these keys:
-  "vulnerable": true or false
-  "cwe": string such as "CWE-89" (your best classification; may differ from the hint)
-  "title": short string
-  "severity": one of "low", "medium", "high", "critical"
-  "file": "{file}"
-  "line_start": integer, 1-based line of the vulnerable sink as numbered below
-  "line_end": integer >= line_start
-  "description": why this is exploitable and how (or why it is safe if dismissed)
-  "suggested_patch": a unified diff (or minimal corrected code) that fixes it; "" if dismissed
-  "confidence": number between 0 and 1
-
-File: {file}, lines {first}-{last} (each line is shown as "N | code"; the "N |" prefix is
-not part of the code; the flagged line is marked with ">>")
-```
-{numbered_code}
-```
-"""
-
-_SNIPPET_FILE = ingest.SNIPPET_FILE
-_JSON_FENCE = re.compile(r"```(?:json|JSON)?\s*(.*?)```", re.DOTALL)
-_CWE_NUMBER = re.compile(r"(\d+)")
-_SEVERITY_ALIASES: dict[str, Severity] = {
-    "low": "low",
-    "info": "low",
-    "informational": "low",
-    "medium": "medium",
-    "moderate": "medium",
-    "high": "high",
-    "critical": "critical",
-}
-
 
 class ServiceAnalyzer(BaseAnalyzer):
-    """Calls a remote OpenAI-compatible endpoint over real, SAST-shortlisted code.
+    """Planner + analyst agents on a remote OpenAI-compatible endpoint, reading through the jail.
 
-    Step 2 of Deliverable 3. Findings are model-asserted (``verified=False``) and
-    capped at rung 2 because nothing has proven them yet.
+    Findings are model-asserted (``verified=False``) and capped at rung 2 (CWE plus an
+    evidence-anchored source->sink trace); nothing is executed or proven until 3b-2.
     """
 
     backend = "service"
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        model: ChatModel | None = None,
+        executor: ExecutorProvider | None = None,
+    ) -> None:
         super().__init__(settings)
         if not settings.model_service_url:  # Settings already validates this; be explicit.
             msg = "ServiceAnalyzer requires settings.model_service_url"
             raise ValueError(msg)
         self.base_url = settings.model_service_url.rstrip("/")
-        # One long-lived client (connection reuse). Tests swap in httpx.MockTransport.
-        self._http = httpx.Client(timeout=_MODEL_TIMEOUT_S)
+        self.model: ChatModel = model if model is not None else ModelClient(settings)
+        if executor is None:
+            if settings.executor_token is None or not settings.executor_token.get_secret_value():
+                msg = (
+                    "ServiceAnalyzer requires settings.executor_token: the agents read target "
+                    "code only through the Executor sandbox (set EXECUTOR_TOKEN)"
+                )
+                raise ValueError(msg)
+            executor = ExecutorClient(
+                settings.executor_url,
+                settings.executor_token.get_secret_value(),
+                max_archive_bytes=settings.max_clone_mb * 1_000_000,
+            )
+        self.executor: ExecutorProvider = executor
+        self.orchestrator = DetectionOrchestrator(settings, model=self.model, executor=executor)
+        self.last_report: DetectionReport | None = None
         # ``run`` executes all stages on one thread, so the workspace path can travel
         # from ``ingest`` to ``analyze`` in a thread-local without cross-scan leakage.
         self._local = threading.local()
@@ -658,6 +641,15 @@ class ServiceAnalyzer(BaseAnalyzer):
     def run(self, scan_id: str, target: Target, options: ScanOptions) -> AnalysisResult:
         self._local.workspace = ingest.workspace_path(self.settings.workspace_dir, scan_id)
         try:
+            # Fail fast: an unreachable Executor fails the scan *before* cloning anything,
+            # with a message the API surfaces - never a silent fallback to host reads.
+            health = self.orchestrator.preflight()
+            log.info(
+                "service backend: executor ok (%d active sandbox(es)); model %s via %s",
+                health.active_sandboxes,
+                self.settings.model_name,
+                self.base_url,
+            )
             return super().run(scan_id, target, options)
         finally:
             # The clone is a copy we never keep: remove it whether or not the run succeeded.
@@ -706,251 +698,30 @@ class ServiceAnalyzer(BaseAnalyzer):
 
     # -- Stage 3 ------------------------------------------------------------
     def plan(self, target: Target, candidates: list[Candidate]) -> Plan:
-        # TODO(D3): prompt the frozen Qwen planner role to emit the scaffold.
+        # The target-level plan is the deterministic queue the orchestrator walks. The
+        # LLM *planner agent* runs per candidate inside ``analyze`` (its plan feeds the
+        # analyst directly), so this stage makes no model call.
         if not candidates:
             return Plan(steps=["REPORT none (no SAST candidates)"])
-        return Plan(steps=[f"CONFIRM {c.file}:{c.line} ({c.cwe_hint})" for c in candidates])
+        mode = "planner+analyst" if self.settings.planner_enabled else "analyst"
+        queue = candidates[: self.settings.max_candidates]
+        return Plan(steps=[f"{mode} {c.file}:{c.line} ({c.cwe_hint})" for c in queue])
 
     # -- Stage 4 ------------------------------------------------------------
     def analyze(
         self, scan_id: str, target: Target, candidates: list[Candidate], plan: Plan
     ) -> list[Finding]:
-        # TODO(D3): LangGraph ReAct loop over the Qwen analyst role with a hard
-        # tool-call budget. Step 2 is one direct call per candidate over the real
-        # code around the sink; findings are anchored to the candidate's file:line.
-        root = self._workspace
-        findings: list[Finding] = []
-        seen_ids: set[str] = set()
-        for c in candidates[: self.settings.max_candidates]:  # hard bound on model calls
-            window = _read_context(root, c, self.settings.context_lines)
-            if window is None:
-                log.warning("service backend: cannot read %s:%d; skipping", c.file, c.line)
-                continue
-            first, numbered = window
-            messages = [
-                {"role": "system", "content": _SYSTEM_PROMPT},
-                {
-                    "role": "user",
-                    "content": _CANDIDATE_PROMPT.format(
-                        file=c.file,
-                        line=c.line,
-                        cwe_hint=c.cwe_hint or "unknown",
-                        rule=c.rule,
-                        first=first,
-                        last=first + numbered.count("\n"),
-                        numbered_code=numbered,
-                    ),
-                },
-            ]
-            content = self.chat(messages)
-            items = _parse_model_findings(content)
-            if not items:
-                log.info("service backend: unparseable reply for %s:%d; skipped", c.file, c.line)
-            for item in items:
-                if _is_dismissed(item):
-                    log.info("service backend: model dismissed %s:%d (%s)", c.file, c.line, c.rule)
-                    continue
-                finding = _finding_from_model_item(
-                    scan_id, target.target_id, item, anchor=c, window=(first, numbered)
-                )
-                if finding is not None and finding.finding_id not in seen_ids:
-                    seen_ids.add(finding.finding_id)
-                    findings.append(finding)
-        return findings
+        report = self.orchestrator.detect(scan_id, target.target_id, self._workspace, candidates)
+        self.last_report = report
+        log.info("service backend: %s", report.summary)
+        return report.findings
 
     # -- Stage 5 ------------------------------------------------------------
     def verify(self, target: Target, findings: list[Finding]) -> list[Finding]:
-        # TODO(D3, NEXT STEP): deterministic verifier (line/symbol exists, PoC reaches
-        # the sink, patch applies, PoC no longer fires, tests pass) with a bounded
-        # self-correction loop. Until then this is a pass-through: verified=False.
+        # TODO(3b-2): the graded verifier (line/symbol exists, PoC reaches the sink, patch
+        # applies, PoC no longer fires, tests pass) with a bounded self-correction loop.
+        # Until then this is a pass-through: findings stay verified=False.
         return findings
-
-    # -- Model client -------------------------------------------------------
-    def chat(self, messages: list[dict[str, str]]) -> str:
-        """One ``/chat/completions`` round-trip; returns the assistant message text.
-
-        Transport errors (connection refused, 5xx, timeout) propagate so the scan is
-        reported as *failed* rather than silently "clean".
-        """
-        payload: dict[str, object] = {
-            "model": self.settings.model_name,
-            "messages": messages,
-            "temperature": 0,
-            "stream": False,
-        }
-        headers: dict[str, str] = {}
-        if self.settings.model_service_api_key is not None:
-            key = self.settings.model_service_api_key.get_secret_value()
-            headers["Authorization"] = f"Bearer {key}"
-        response = self._http.post(
-            f"{self.base_url}/chat/completions", json=payload, headers=headers
-        )
-        response.raise_for_status()
-        try:
-            content = response.json()["choices"][0]["message"]["content"]
-        except (KeyError, IndexError, TypeError, ValueError) as exc:
-            msg = "model endpoint returned an unexpected chat-completions body"
-            raise ValueError(msg) from exc
-        return content if isinstance(content, str) else ""
-
-
-def _parse_model_findings(text: str) -> list[dict[str, object]]:
-    """Extract the list of finding dicts from the model's reply.
-
-    Tolerates markdown fences, surrounding prose, and a top-level object instead
-    of a list. Returns ``[]`` (with a warning) on anything unparseable.
-    """
-    candidates: list[str] = [m.strip() for m in _JSON_FENCE.findall(text)]
-    stripped = text.strip()
-    candidates.append(stripped)
-    # Fall back to the outermost bracketed region, for prose around bare JSON.
-    for open_ch, close_ch in (("[", "]"), ("{", "}")):
-        start, end = stripped.find(open_ch), stripped.rfind(close_ch)
-        if start != -1 and end > start:
-            candidates.append(stripped[start : end + 1])
-
-    for blob in candidates:
-        if not blob:
-            continue
-        try:
-            data = json.loads(blob)
-        except ValueError:
-            continue
-        items = _coerce_to_item_list(data)
-        if items is not None:
-            return items
-
-    log.warning("service backend: could not parse model output as JSON findings; dropping it")
-    log.debug("unparseable model output: %r", text[:2000])
-    return []
-
-
-def _coerce_to_item_list(data: object) -> list[dict[str, object]] | None:
-    if isinstance(data, list):
-        return [item for item in data if isinstance(item, dict)]
-    if isinstance(data, dict):
-        for key in ("findings", "vulnerabilities", "results", "issues"):
-            inner = data.get(key)
-            if isinstance(inner, list):
-                return [item for item in inner if isinstance(item, dict)]
-        if "cwe" in data:  # the model returned a single finding object
-            return [data]
-        if not data:
-            return []
-    return None
-
-
-def _read_context(root: Path, c: Candidate, context_lines: int) -> tuple[int, str] | None:
-    """Numbered code around the candidate sink: ``(first_line_number, numbered_text)``.
-
-    Lines are rendered as ``"N | code"`` with the flagged line marked ``">>"``. Returns
-    ``None`` when the file cannot be read (gone, binary, or outside the workspace).
-    """
-    path = (root / c.file).resolve()
-    try:
-        if not path.is_relative_to(root.resolve()):  # a crafted path must never escape
-            return None
-        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-    except OSError:
-        return None
-    if not lines:
-        return None
-    first = max(1, c.line - context_lines)
-    last = min(len(lines), c.line + context_lines)
-    numbered = "\n".join(
-        f"{'>>' if i == c.line else '  '}{i:5d} | {lines[i - 1]}" for i in range(first, last + 1)
-    )
-    return first, numbered
-
-
-def _is_dismissed(item: dict[str, object]) -> bool:
-    """``{"vulnerable": false}`` (or string equivalents) means the model rejected the flag."""
-    value = item.get("vulnerable", True)
-    if isinstance(value, bool):
-        return not value
-    return str(value).strip().lower() in {"false", "no", "0", "none"}
-
-
-def _finding_from_model_item(
-    scan_id: str,
-    target_id: str,
-    item: dict[str, object],
-    *,
-    anchor: Candidate | None = None,
-    window: tuple[int, str] | None = None,
-) -> Finding | None:
-    """Map one model-emitted dict onto :class:`Finding`; ``None`` if unusable.
-
-    With an ``anchor`` candidate, the finding is pinned to the candidate's real file and
-    the model's line numbers are honoured only if they fall inside the code ``window`` it
-    was shown; otherwise the sink line is the candidate's. A one-hop trace records the
-    SAST rule that surfaced the sink.
-    """
-    cwe_match = _CWE_NUMBER.search(str(item.get("cwe", "")))
-    if cwe_match is None:
-        log.warning("service backend: dropping finding without a CWE: %r", item.get("title"))
-        return None
-    cwe = f"CWE-{cwe_match.group(1)}"
-
-    severity = _SEVERITY_ALIASES.get(str(item.get("severity", "")).strip().lower(), "medium")
-    reported_start = _as_int(item.get("line_start", item.get("line")), default=0)
-    line_start = max(1, reported_start) if reported_start else 1
-    line_end = max(line_start, _as_int(item.get("line_end"), default=line_start))
-    trace: list[TraceStep] = []
-    if anchor is not None:
-        file = anchor.file
-        if window is not None and (first := window[0]) <= reported_start <= (
-            last := first + window[1].count("\n")
-        ):
-            line_end = min(line_end, last)  # the model's lines, as long as it saw them
-        else:
-            line_start, line_end = anchor.line, anchor.line
-        trace.append(
-            TraceStep(
-                file=anchor.file,
-                line=anchor.line,
-                symbol=anchor.excerpt.strip() or f"line {anchor.line}",
-                note=f"sink flagged by SAST rule {anchor.rule}",
-            )
-        )
-    else:
-        file = str(item.get("file") or _SNIPPET_FILE)
-    confidence = min(1.0, max(0.0, _as_float(item.get("confidence"), default=0.5)))
-    patch = str(item.get("suggested_patch") or "")
-    title = str(item.get("title") or f"{cwe} reported by {target_id} model analysis")
-
-    return Finding(
-        finding_id=finding_id_for(target_id, file, line_start, cwe),
-        scan_id=scan_id,
-        target_id=target_id,
-        title=title,
-        cwe=cwe,
-        severity=severity,
-        file=file,
-        line_range=(line_start, line_end),
-        trace=trace,  # no source->sink flow yet: just the SAST-flagged sink
-        confidence=confidence,
-        # Rung 2 = finding + CWE + suggested patch, model-asserted. Without a patch the
-        # ladder only supports rung 1 (bare flag). Nothing is proven until the verifier.
-        rung=2 if patch else 1,
-        verified=False,
-        description=str(item.get("description") or ""),
-        patch_diff=patch,
-    )
-
-
-def _as_int(value: object, *, default: int) -> int:
-    try:
-        return int(str(value))
-    except (TypeError, ValueError):
-        return default
-
-
-def _as_float(value: object, *, default: float) -> float:
-    try:
-        return float(str(value))
-    except (TypeError, ValueError):
-        return default
 
 
 # ---------------------------------------------------------------------------

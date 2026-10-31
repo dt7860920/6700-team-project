@@ -8,6 +8,7 @@ OpenAPI document at ``/docs`` is the authoritative contract.
 
 from __future__ import annotations
 
+import hashlib
 from datetime import UTC, datetime
 from typing import Annotated, Literal
 
@@ -32,6 +33,12 @@ Rung = Annotated[
 
 def utcnow() -> datetime:
     return datetime.now(tz=UTC)
+
+
+def finding_id_for(target_id: str, file: str, line: int, cwe: str) -> str:
+    """Stable id so the same (target, sink) yields the same finding across runs."""
+    digest = hashlib.sha1(f"{target_id}|{file}|{line}|{cwe}".encode()).hexdigest()
+    return f"fnd_{digest[:10]}"
 
 
 # ---------------------------------------------------------------------------

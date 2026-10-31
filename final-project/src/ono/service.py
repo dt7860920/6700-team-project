@@ -16,6 +16,7 @@ import uuid
 
 from ono.analyzer import BaseAnalyzer
 from ono.config import Settings
+from ono.errors import PipelineError
 from ono.models import Finding, Scan, ScanRequest, ScanResponse, utcnow
 from ono.store import ScanStore
 from ono.targets import TargetRegistry
@@ -59,8 +60,15 @@ class ScanService:
         findings: list[Finding] = []
         try:
             result = self.analyzer.run(scan_id, target, request.options)
-        except Exception:
+        except Exception as exc:
             log.exception("scan %s failed", scan_id)
+            # PipelineError carries an operator-safe reason (e.g. "executor unreachable at
+            # ..."); anything else stays generic so internals never leak into the response.
+            message = (
+                f"analysis pipeline failed: {exc}"[:500]
+                if isinstance(exc, PipelineError)
+                else "analysis pipeline raised; see server logs"
+            )
             scan = Scan(
                 scan_id=scan_id,
                 target_id=target.target_id,
@@ -68,7 +76,7 @@ class ScanService:
                 model_backend=self.analyzer.backend,
                 created_at=created_at,
                 completed_at=utcnow(),
-                message="analysis pipeline raised; see server logs",
+                message=message,
             )
             self.store.put_scan(scan, findings)
             return ScanResponse(**scan.model_dump(), findings=findings)

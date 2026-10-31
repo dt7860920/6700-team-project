@@ -30,6 +30,9 @@ ModelBackend = Literal["mock", "local", "service"]
 * ``service`` - the same agent, but calling a remote OpenAI-compatible endpoint.
 """
 
+AgentToolProtocol = Literal["auto", "native", "text"]
+"""How agent tools are presented to the model (see ``Settings.agent_tool_protocol``)."""
+
 
 class Settings(BaseSettings):
     """Runtime settings, loaded from the environment / ``.env``.
@@ -119,6 +122,64 @@ class Settings(BaseSettings):
         description="Snapshots larger than this (after .git is stripped) abort the scan.",
     )
 
+    # -- Agentic detection core (Deliverable 3, step 3b-1) ---------------------------
+    # The planner and analyst are *definitions* (role prompt + tools + budget) on the one
+    # pinned model; the orchestrator is deterministic code that enforces these budgets.
+    # Upper bound on model calls per scan: max_candidates * (1 + analyst_max_steps).
+    planner_enabled: bool = Field(
+        default=True,
+        description=(
+            "Run the planner agent (one model call per candidate) to emit an investigation "
+            "plan for the analyst. False = a fixed default plan, no planner call."
+        ),
+    )
+    analyst_max_steps: int = Field(
+        default=8,
+        ge=1,
+        le=32,
+        description=(
+            "Hard cap on model calls in the analyst's ReAct loop per candidate (tool calls, "
+            "retries after malformed replies and the final verdict all count)."
+        ),
+    )
+    agent_temperature: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=2.0,
+        description="Sampling temperature for every agent call (0 = deterministic).",
+    )
+    agent_tool_protocol: AgentToolProtocol = Field(
+        default="auto",
+        description=(
+            "How the analyst's tools are exposed to the model: 'native' = OpenAI "
+            "function-calling, 'text' = one strict JSON action per reply, 'auto' = native "
+            "first, fall back to text (for the rest of the process) if the endpoint rejects "
+            "the tools field."
+        ),
+    )
+    agent_tool_output_chars: int = Field(
+        default=6000,
+        ge=500,
+        le=100_000,
+        description="Max characters of any single tool result fed back to the model (truncated).",
+    )
+    agent_candidate_timeout_s: float = Field(
+        default=300.0,
+        ge=10.0,
+        le=3600.0,
+        description=(
+            "Wall-clock budget per candidate (planner + analyst loop). Checked between steps; "
+            "an in-flight model call is additionally bounded by the model request timeout."
+        ),
+    )
+    agent_trajectory_dir: Path | None = Field(
+        default=None,
+        description=(
+            "If set, every agent trajectory (each model call, tool call and result) is "
+            "appended as JSON lines to <dir>/<scan_id>.jsonl - observability / learning data."
+        ),
+    )
+
     # -- Executor service + sandbox jail (Deliverable 3, step 3a) ----------------------
     # The Executor is a separate, internal-only, token-authenticated service that owns
     # the Docker socket and spawns one jailed container per scan. ``executor_*`` is how
@@ -188,6 +249,16 @@ class Settings(BaseSettings):
     def _service_backend_requires_url(self) -> Self:
         if self.model_backend == "service" and not self.model_service_url:
             msg = "model_service_url is required when model_backend == 'service'"
+            raise ValueError(msg)
+        if self.model_backend == "service" and not (
+            self.executor_token and self.executor_token.get_secret_value()
+        ):
+            # Every read of target code goes through the jailed Executor (step 3b-1);
+            # without its token the agents would have no hands at all.
+            msg = (
+                "executor_token is required when model_backend == 'service': the agents read "
+                "target code only through the Executor sandbox (set EXECUTOR_TOKEN)"
+            )
             raise ValueError(msg)
         return self
 

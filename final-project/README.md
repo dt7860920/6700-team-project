@@ -11,7 +11,7 @@ Team: Sazan Khalid · Kenedy Ducheine · Junyi Tang · Jeffrey Pinarchick
 | API docs (OpenAPI) | `http://<INSTANCE-FLOATING-IP>:8080/docs` |
 | Repository | `https://github.com/<org>/operation-negative-one` ← fill in |
 
-> **Deliverable 2 status.** This is the midpoint *skeleton*. The API, configuration, container, CI, and analyst UI are real and deployable. The **analyzer is mocked** (`MODEL_BACKEND=mock`): it is shaped exactly like the production pipeline — `ingest → SAST shortlist → plan → analyze → verify` — but returns deterministic, representative findings instead of calling a model. See [Where the real pipeline slots in](#where-the-real-pipeline-slots-in).
+> **Status.** The API, configuration, container, CI, and analyst UI are real and deployable. The default **analyzer is mocked** (`MODEL_BACKEND=mock`, what CI runs): it is shaped exactly like the production pipeline — `ingest → SAST shortlist → plan → analyze → verify` — but returns deterministic, representative findings instead of calling a model. `MODEL_BACKEND=service` runs the real pipeline up to and including **detection** (Deliverable 3, step 3b-1): real ingest, Semgrep shortlist, and a planner + analyst agent loop that reads the target only through the jailed sandbox Executor. See [Where the real pipeline slots in](#where-the-real-pipeline-slots-in).
 
 ---
 
@@ -158,8 +158,15 @@ All configuration is read by `ono.config.Settings` (pydantic-settings) from envi
 | `CONTEXT_LINES` | `25` | 5–200. Lines of code shown to the model on each side of a candidate sink |
 | `CLONE_TIMEOUT_S` | `120` | 5–1800. Hard timeout for the shallow `git clone` |
 | `MAX_CLONE_MB` | `200` | 1–5000. Snapshots larger than this (after `.git` is stripped) abort the scan; also the cap on a workspace archive uploaded to the Executor |
+| `PLANNER_ENABLED` | `true` | Run the planner agent (one model call per candidate) before the analyst. `false` = fixed default plan, no planner call |
+| `ANALYST_MAX_STEPS` | `8` | 1–32. Hard cap on model calls in the analyst's ReAct loop per candidate (tool calls, retries after malformed replies and the final verdict all count) |
+| `AGENT_TEMPERATURE` | `0.0` | 0–2. Sampling temperature for every agent call |
+| `AGENT_TOOL_PROTOCOL` | `auto` | `native` (OpenAI function calling) · `text` (one JSON action per reply) · `auto` (native first; falls back to text for the rest of the process if the endpoint rejects `tools`) |
+| `AGENT_TOOL_OUTPUT_CHARS` | `6000` | 500–100000. Max characters of any single tool result fed back to the model (truncated on whole lines) |
+| `AGENT_CANDIDATE_TIMEOUT_S` | `300` | 10–3600. Wall-clock budget per candidate (planner + analyst), checked between steps |
+| `AGENT_TRAJECTORY_DIR` | — | If set, every agent trajectory (each model call, tool call, result, verdict) is appended as JSON lines to `<dir>/<scan_id>.jsonl` |
 | `EXECUTOR_URL` | `http://127.0.0.1:8081` | Where the app reaches the Executor (`http://executor:8081` under Compose) |
-| `EXECUTOR_TOKEN` | — | `SecretStr`, ≥16 chars. **Required by the Executor** (it refuses to start without it); sent as `Authorization: Bearer` |
+| `EXECUTOR_TOKEN` | — | `SecretStr`, ≥16 chars. **Required by the Executor** (it refuses to start without it) **and by `MODEL_BACKEND=service`** (the agents read code only through the sandbox); sent as `Authorization: Bearer` |
 | `EXECUTOR_HOST` / `EXECUTOR_PORT` | `127.0.0.1` / `8081` | Executor bind address. Loopback by default; `0.0.0.0` only inside the Compose internal network. Never published |
 | `SANDBOX_IMAGE` | `python:3.13-slim` | Base image of the jailed target containers (pulled if missing) |
 | `SANDBOX_MEM_MB` | `1024` | 64–65536. Memory limit per jail, swap disabled; the tmpfs workspace counts against it |
@@ -171,7 +178,7 @@ All configuration is read by `ono.config.Settings` (pydantic-settings) from envi
 | `SANDBOX_WORKSPACE_MB` | `512` | 16–16384. Size of the writable tmpfs holding the workspace (`/tmp` gets half) |
 | `SANDBOX_MAX_ACTIVE` | `8` | 1–64. Max concurrently live jails per Executor |
 
-The ingest/SAST settings apply to the `service` backend (`mock` never clones or runs Semgrep). The `EXECUTOR_*` / `SANDBOX_*` settings configure the Executor service (step 3a); the analyzer pipeline does not call it yet (that is step 3b).
+The ingest/SAST/agent settings apply to the `service` backend (`mock` never clones, runs Semgrep, calls a model or opens a sandbox). The `EXECUTOR_URL` / `EXECUTOR_TOKEN` pair is how the app reaches the Executor service; the `SANDBOX_*` settings configure the jails the Executor spawns. Upper bound on model calls per scan: `MAX_CANDIDATES × (ANALYST_MAX_STEPS + 1 if PLANNER_ENABLED)` — 180 with the defaults — and the orchestrator enforces it as a hard counter.
 
 The **target allowlist** lives in [`src/ono/targets.yaml`](src/ono/targets.yaml) and is loaded into an exact mapping (`TargetRegistry`). Adding a target means adding an entry there — nothing is accepted that is not in the file. Three real, cloneable targets ship: `pygoat` and `juice-shop` (practice apps) and `vulpy` (a small intentionally vulnerable Flask repo, the "ingested OSS repo" kind).
 
@@ -188,6 +195,17 @@ operation-negative-one/
 │   ├── analyzer.py     Pipeline skeleton (ingest/sast/plan/analyze/verify) + MockAnalyzer + ServiceAnalyzer
 │   ├── ingest.py       Stage 1 for real backends: shallow clone / snippet file into a per-scan workspace
 │   ├── sast.py         Stage 2 for real backends: Semgrep JSON -> Candidate queue, regex fallback
+│   ├── orchestrator.py step 3b-1: the deterministic detection state machine (one sandbox per scan,
+│   │                   planner -> analyst per candidate, every budget enforced here)
+│   ├── agents/         step 3b-1: agent *definitions* on the one pinned model
+│   │   ├── definitions.py  PLANNER / ANALYST = role prompt + allowed tools + step budget + temperature
+│   │   ├── model.py        shared OpenAI-compatible client: native tool calling, text fallback, call budget
+│   │   ├── tools.py        read_lines / read_file / grep / tree dispatched to the jail; truncation; read ledger
+│   │   ├── protocol.py     tolerant parsing of model replies into tool calls / verdicts
+│   │   ├── planner.py      one call -> InvestigationPlan (degrades to a default plan)
+│   │   ├── analyst.py      the bounded ReAct loop -> anchored Finding or dismissal
+│   │   └── trajectory.py   per-run step log (JSONL sink) - observability / learning data
+│   ├── errors.py       PipelineError: scan failures whose message is safe to show
 │   ├── models.py       Pydantic schemas: ScanRequest, Finding, Scan, ScanResponse, ...
 │   ├── targets.py      TargetRegistry (exact allowlist) + targets.yaml
 │   ├── store.py        ScanStore protocol + in-memory implementation
@@ -201,10 +219,13 @@ operation-negative-one/
 │       ├── client.py       ExecutorClient: typed HTTP client the orchestrator (3b) will use
 │       ├── models.py       request/response schemas shared by service and client
 │       └── __main__.py     `ono-executor` / `python -m ono.executor`
-├── tests/              pytest: config, API (incl. 403 allowlist test), analyzers, ingest, SAST, executor
+├── tests/              pytest: config, API (incl. 403 allowlist test), analyzers, ingest, SAST, executor, agents
 │   ├── fixtures/       tiny vulnerable sample repo + a real Semgrep JSON document (tests stay offline)
 │   ├── fakedocker.py   fake docker-py client (extracts the tar, runs the real guest helper) for CI
-│   └── test_executor_docker.py   REAL-container stress tests (`-m docker`; auto-skipped in CI / without a daemon)
+│   ├── agentfakes.py   scripted model + local sandbox + fake Executor for the agent / orchestrator tests
+│   ├── test_agents.py  protocol parsing, tools + ledger, ReAct loop, planner, model wire format, orchestrator
+│   ├── test_executor_docker.py      REAL-container stress tests (`-m docker`; auto-skipped in CI / without a daemon)
+│   └── test_orchestrator_docker.py  REAL-jail end-to-end run of the detection core, model scripted (`-m docker`)
 ├── scripts/golden_path.py   smoke heartbeat (live server or --in-process)
 ├── Dockerfile · compose.yml · .dockerignore
 ├── .env.example.local · .env.example.production
@@ -222,38 +243,52 @@ operation-negative-one/
 |---|---|---|
 | `ingest` | returns the pinned snapshot ref | **done (step 2):** shallow clone into a per-scan workspace, `.git` stripped, size/time bounded (`ono/ingest.py`). Still to come: the egress-blocked sandbox container around it, CVE-string stripping, tree-sitter + call graph |
 | `sast_shortlist` | canned candidates (regex SAST for snippets) | **done (step 2):** Semgrep JSON → normalized, ranked, deduplicated `Candidate` queue with a regex fallback (`ono/sast.py`). Still to come: CodeQL → SARIF |
-| `plan` | fixed step list | **frozen Qwen2.5-Coder, planner role** emits the per-target scaffold (Fugu-inspired, no training) |
-| `analyze` | canned findings | **Qwen analyst role** in a bounded LangGraph ReAct loop (read_file / callers / grep / retrieve_cwe), served by vLLM |
+| `plan` | fixed step list | **done (step 3b-1):** the frozen Qwen **planner role** emits a compact per-candidate investigation plan (what to read, which taint to check, how to decide) that feeds the analyst (`ono/agents/planner.py`) |
+| `analyze` | canned findings | **done (step 3b-1):** the Qwen **analyst role** in a bounded ReAct loop over read-only sandbox tools (`read_lines` / `read_file` / `grep` / `tree`), driven by a deterministic orchestrator; findings are anchored to lines actually read through the jail (`ono/orchestrator.py`, `ono/agents/analyst.py`). Still to come (3b-2): the fixer agent and the execution tools |
 | `verify` | passes `verified=True` | **deterministic verifier** (plain code): line exists, PoC reaches sink, patch applies, PoC no longer fires, tests pass; failure reasons feed a bounded self-correction loop (`MAX_VERIFIER_RETRIES`) |
 
 Switching is a config change: `MODEL_BACKEND=local` (vLLM on the same box, never published) or `MODEL_BACKEND=service` (remote OpenAI-compatible endpoint). `build_analyzer()` is the only place that needs to know. The in-memory `ScanStore` is likewise the seam for the internal findings database.
 
-### Service backend today: real ingest + Semgrep shortlist (step 2)
+### Service backend today: the agentic detection core (step 3b-1)
 
-`ServiceAnalyzer` (`MODEL_BACKEND=service`) analyzes **real repository files**:
+`ServiceAnalyzer` (`MODEL_BACKEND=service`) analyzes **real repository files** with two agents on one pinned model, orchestrated by deterministic code:
 
-1. **ingest** — `repo` / `practice-app` targets are shallow-cloned (`git clone --depth 1 --no-tags --single-branch`, timeout `CLONE_TIMEOUT_S`, cap `MAX_CLONE_MB`) into `WORKSPACE_DIR/<scan_id>/`; `.git` is deleted immediately, so the origin is contacted exactly once and nothing cloned is ever executed. A `snippet` is written to `snippet.py` in the same workspace. The workspace is removed when the scan ends, success or failure.
-2. **sast_shortlist** — Semgrep (`semgrep scan --json --metrics=off --config <SAST_RULESET> …`) over the workspace; results are normalized to `Candidate{file, line, cwe_hint, rule, excerpt}` (file relative to the clone root, CWE from the rule's metadata), ranked by severity, deduplicated and capped at `MAX_CANDIDATES`. If Semgrep is missing, fails or times out, a built-in regex scanner takes over so the stage never fails a scan (the log says which engine ran).
-3. **analyze** — one model call **per candidate** (so a large repo fans out to at most `MAX_CANDIDATES` calls) over the real code `CONTEXT_LINES` around the sink. The model confirms or dismisses; each `Finding` is anchored to the candidate's real `file:line` and carries a one-hop trace naming the SAST rule.
-4. **plan** is still a fixed step list and **verify** is still a pass-through, so findings remain `verified=False` and at most rung 2. The deterministic verifier + self-correction loop is the next step.
+1. **preflight** — the Executor must answer `/health` (and see Docker), otherwise the scan fails *before* anything is cloned with `status: "failed"` and a message such as `executor unreachable at http://127.0.0.1:8081 (...); start it with \`make executor\``. There is no silent fallback to reading code on the host.
+2. **ingest** — `repo` / `practice-app` targets are shallow-cloned (`git clone --depth 1 --no-tags --single-branch`, timeout `CLONE_TIMEOUT_S`, cap `MAX_CLONE_MB`) into `WORKSPACE_DIR/<scan_id>/`; `.git` is deleted immediately. A `snippet` is written to `snippet.py` in the same workspace. The workspace is removed when the scan ends, success or failure.
+3. **sast_shortlist** — Semgrep over the workspace (regex fallback if Semgrep is unavailable), normalized to `Candidate{file, line, cwe_hint, rule, excerpt}`, ranked, deduplicated and capped at `MAX_CANDIDATES`.
+4. **plan** — deterministic: the candidate queue the orchestrator will walk (no model call).
+5. **analyze** — `DetectionOrchestrator.detect` (`ono/orchestrator.py`), a state machine, not an LLM:
+   * opens **one jailed sandbox for the scan** (`ExecutorClient.sandbox(scan_id, workspace)`), only if there is at least one candidate; it is destroyed by the context manager on success, error or budget exhaustion;
+   * per candidate — **WINDOW**: the orchestrator reads `CONTEXT_LINES` around the sink *through the jail* (this seeds the analyst's read ledger); **PLAN**: the **planner** agent makes one bounded call and returns a compact JSON investigation plan (hypothesis, source, sink, greps, reads, steps, decision rule), degrading to a default plan on unusable output; **ANALYZE**: the **analyst** agent runs a ReAct loop — reason → call one of `read_lines` / `read_file` / `grep` / `tree` (each dispatched to the sandbox, each result truncated to `AGENT_TOOL_OUTPUT_CHARS`) → see the result → repeat, at most `ANALYST_MAX_STEPS` model calls, ending with `confirm(...)` or `dismiss(reason)`; **COLLECT**: a confirmed verdict becomes a `Finding`, a dismissal becomes nothing;
+   * **anchoring**: the finding's file and line range, and every hop of its source→sink trace, are honoured only if the analyst actually read those lines through the sandbox (a `ReadLedger` of `file → lines seen`); anything else snaps to the SAST sink, and unread trace hops are dropped. The model cannot invent a location;
+   * **robustness**: a malformed reply, an unknown tool, bad arguments or a path the jail refuses are fed back as text and the loop continues (every retry counts against the step budget); the last step is announced and may only end with a verdict — a non-verdict there is `exhausted` (no finding). A dead model endpoint fails the scan; it never produces an empty "clean" result;
+   * **budgets**: `MAX_CANDIDATES` on the queue, `ANALYST_MAX_STEPS` per candidate, `AGENT_CANDIDATE_TIMEOUT_S` wall-clock per candidate, at most 3 tool executions per model turn, and one scan-wide model-call counter (`MAX_CANDIDATES × (ANALYST_MAX_STEPS + planner)`) that no agent can exceed. A large repo cannot fan out past these;
+   * **tool calling**: `AGENT_TOOL_PROTOCOL=auto` sends OpenAI-style `tools` first and falls back to a strict text protocol (`{"tool": "...", "args": {...}}`, one JSON object per reply) for the rest of the process if the endpoint rejects them; replies in either style are parsed by the same tolerant parser (fenced JSON, prose around JSON, `{"name","arguments"}` spellings, the step-2 `{"vulnerable": ...}` verdict shape, ...);
+   * **trajectories**: every model call, tool call, result and verdict is logged (`trajectory[...]` lines) and, with `AGENT_TRAJECTORY_DIR`, appended as JSON lines per scan — observability now, learning data later.
+6. **verify** is still a pass-through (`TODO(3b-2)`), so findings remain `verified=False`: rung 2 when the CWE comes with an evidence-anchored multi-hop trace, rung 1 otherwise. The `patch_diff` slot stays empty until the fixer agent (3b-2); `apply_patch` / `run` / `run_tests` are deliberately not exposed to the analyst in this step.
 
-With Ollama serving `qwen2.5-coder:7b` on the instance (`git` is on `PATH`; Semgrep arrives with `uv sync`):
+**End to end on the instance** (Ollama serving `qwen2.5-coder:7b` on `localhost:11434`, Docker installed, `git` on `PATH`; Semgrep arrives with `uv sync`):
 
 ```bash
-cp .env.example.service .env        # MODEL_BACKEND=service, MODEL_SERVICE_URL=http://localhost:11434/v1, MODEL_NAME=qwen2.5-coder:7b
-uv run ono
+cp .env.example.service .env
+echo "EXECUTOR_TOKEN=$(openssl rand -hex 32)" >> .env   # shared by the app and the Executor
 
-# A real repository, end to end. The first run clones PyGoat and lets Semgrep fetch its
-# rule packs, then makes up to MAX_CANDIDATES model calls - expect a minute or two.
-curl -s -X POST localhost:8080/scans -H 'content-type: application/json' \
-  -d '{"target_id":"pygoat"}' | jq '.pipeline, .findings[] | {cwe, file, line_range, rung, verified, title}'
+# terminal 1: the sandbox Executor (owns the Docker socket; pulls python:3.13-slim once)
+make executor                                           # http://127.0.0.1:8081/health -> {"docker": true}
 
-# The pasted-snippet path works the same way (snippet -> SAST -> model).
-curl -s -X POST localhost:8080/scans -H 'content-type: application/json' \
-  -d '{"target_id":"snippet","options":{"snippet":"import os\nos.system(\"ping \" + host)\n"}}' | jq .
+# terminal 2: the app
+uv run ono                                              # http://localhost:8080
+
+# terminal 3: scan the ingested OSS repo target. Expect: clone -> Semgrep -> one jail ->
+# up to MAX_CANDIDATES x (planner + analyst loop) model calls. Minutes, not seconds.
+curl -s -X POST localhost:8080/scans -H 'content-type: application/json' -d '{"target_id":"vulpy"}' \
+  | jq '.status, .message, .pipeline, (.findings[] | {cwe, file, line_range, rung, verified, title, trace})'
+
+# watch the agents work
+tail -f .ono-trajectories/scn_*.jsonl                   # if AGENT_TRAJECTORY_DIR=.ono-trajectories
 ```
 
-The `.pipeline` array in the response shows each stage's status and timing (`ingest` reports the workspace path, `sast` the candidate count). Clone or Semgrep problems surface as `status: "failed"` with the reason in the server log — never as a silent empty result.
+The `.pipeline` array shows each stage's status and timing; the `analyze` summary reads like `2 raw finding(s) from 9 candidate(s) (2 confirmed, 6 dismissed, 1 exhausted); 31/81 model call(s)`. If the Executor is down the response is `status: "failed"` with the reason in `.message`. Under Compose the same flow runs with `EXECUTOR_URL=http://executor:8081` (already set in `compose.yml`) and `MODEL_SERVICE_URL` pointing at the host's Ollama (`http://host.docker.internal:11434/v1` or the instance's internal address).
 
 ---
 
@@ -280,7 +315,7 @@ Rung 3/4 output ("the PoC reaches the sink", "the patch applies and the tests st
 echo "EXECUTOR_TOKEN=$(openssl rand -hex 32)" >> .env
 make executor                        # == uv run ono-executor  -> http://127.0.0.1:8081/docs
 
-# Drive it from Python (this is what the orchestrator in step 3b will do)
+# Drive it from Python (this is what the orchestrator's tools do in step 3b-1)
 uv run python -c '
 from pathlib import Path
 from ono.executor.client import ExecutorClient
