@@ -7,17 +7,18 @@ Team: Sazan Khalid · Kenedy Ducheine · Junyi Tang · Jeffrey Pinarchick
 
 | | |
 |---|---|
-| Live prototype (Jetstream2) | `http://<INSTANCE-FLOATING-IP>:8080` ← fill in after deploy |
-| API docs (OpenAPI) | `http://<INSTANCE-FLOATING-IP>:8080/docs` |
-| Repository | `https://github.com/<org>/operation-negative-one` ← fill in |
+| Live app (Jetstream2) | [http://149.165.154.219:8080/ui/](http://149.165.154.219:8080/ui/), running the `service` backend with `qwen2.5-coder:7b` |
+| API docs (OpenAPI) | [http://149.165.154.219:8080/docs](http://149.165.154.219:8080/docs) |
+| Repository | [`dt7860920/6700-team-project`](https://github.com/dt7860920/6700-team-project), in `final-project/` |
+| Design docs | [Project plan](docs/plan.md) · [Deliverable 2 write-up](docs/deliverable2.md) |
 
-> **Status.** The API, configuration, container, CI, and analyst UI are real and deployable. The default **analyzer is mocked** (`MODEL_BACKEND=mock`, what CI runs): it is shaped exactly like the production pipeline — `ingest → SAST shortlist → plan → analyze → verify` — but returns deterministic, representative findings instead of calling a model. `MODEL_BACKEND=service` runs the real pipeline up to and including **detection** (Deliverable 3, step 3b-1): real ingest, Semgrep shortlist, and a planner + analyst agent loop that reads the target only through the jailed sandbox Executor. See [Where the real pipeline slots in](#where-the-real-pipeline-slots-in).
+> **Status.** The API, configuration, container, and analyst UI are real and deployable. The default **analyzer is mocked** (`MODEL_BACKEND=mock`): it is shaped exactly like the production pipeline — `ingest → SAST shortlist → plan → analyze → verify` — but returns deterministic, representative findings instead of calling a model, so its `rung`, `verified`, and line-number values are illustrative. `MODEL_BACKEND=service` runs the real pipeline up to and including **detection** (Deliverable 3, step 3b-1): real ingest, Semgrep shortlist, and a planner + analyst agent loop that reads the target only through the jailed sandbox Executor. The verifier and fixer agent are not built yet, so real findings come back `verified=false` at rung 1 or 2 with no patch. `MODEL_BACKEND=local` is not implemented yet. See [Where the real pipeline slots in](#where-the-real-pipeline-slots-in).
 
 ---
 
 ## What it does
 
-ONO never scans "a website". Every request names a **`target_id`** from an exact allowlist of targets we host ourselves — intentionally-vulnerable practice apps (OWASP PyGoat, OWASP Juice Shop), ingested open-source repository snapshots, or a pasted code snippet. Anything else is rejected with **HTTP 403 before any analysis starts**.
+ONO never scans "a website". Every request names a **`target_id`** from an exact allowlist of targets we host ourselves — intentionally-vulnerable practice apps (OWASP PyGoat, OWASP Juice Shop), ingested open-source repository snapshots, or a pasted code snippet. An unknown id is rejected with **HTTP 403 before any analysis starts**, and a malformed one (such as a full URL) fails request validation with **HTTP 422**.
 
 Each **finding** is shaped by the *output-strength ladder*:
 
@@ -44,16 +45,17 @@ Each **finding** is shaped by the *output-strength ladder*:
 
 ## Run locally (uv)
 
-Requires Python 3.13 and [`uv`](https://docs.astral.sh/uv/).
+Requires Python 3.13 or newer and [`uv`](https://docs.astral.sh/uv/).
 
 ```bash
-git clone <REPO-URL> && cd operation-negative-one
+git clone https://github.com/dt7860920/6700-team-project.git
+cd 6700-team-project/final-project
 uv sync --extra dev
 cp .env.example.local .env
 uv run ono                      # http://localhost:8080  (UI at /ui, docs at /docs)
 ```
 
-Quality gates (the same ones CI runs):
+Quality gates (the same ones defined in the CI workflow):
 
 ```bash
 uv run ruff check && uv run ruff format --check
@@ -62,6 +64,8 @@ uv run pytest
 uv run scripts/golden_path.py --in-process     # golden-path heartbeat, no server needed
 # or simply:  make check smoke-ci
 ```
+
+Run these by hand for now. The workflow is at `final-project/.github/workflows/ci.yml`, but GitHub only runs workflows from `.github/workflows/` at the repository root, and the root CI does not cover `final-project/`.
 
 ## Run with Docker
 
@@ -78,7 +82,8 @@ The image is based on `ghcr.io/astral-sh/uv:python3.13-bookworm-slim`, installs 
 On the instance (Docker + Compose plugin installed; security group allows inbound 8080 only):
 
 ```bash
-git clone <REPO-URL> && cd operation-negative-one
+git clone https://github.com/dt7860920/6700-team-project.git
+cd 6700-team-project/final-project
 cp .env.example.production .env
 echo "EXECUTOR_TOKEN=$(openssl rand -hex 32)" >> .env   # the Executor refuses to start without one
 docker compose up -d --build
@@ -86,7 +91,7 @@ docker compose ps                              # wait for both services to be "h
 curl http://localhost:8080/health
 ```
 
-From your laptop: `uv run scripts/golden_path.py --base-url http://<FLOATING-IP>:8080`.
+From your laptop: `curl http://<FLOATING-IP>:8080/health`. For a deployment running `MODEL_BACKEND=mock`, you can also run `uv run scripts/golden_path.py --base-url http://<FLOATING-IP>:8080`. Don't use it against the `service` backend: it starts a real scan and requires a verified finding with a patch, which that backend can't produce until the verifier and fixer exist.
 
 `compose.yml` defines **two services** and publishes **one port** (8080): the app, and the sandbox **Executor** (see [The sandbox Executor](#the-sandbox-executor-step-3a)) on an `internal: true` network with no `ports:` block. There is deliberately no database in the skeleton — scan state is in-memory. When the findings DB, threat-intel cache, and vLLM join the stack they are added the same way, as internal services *without* `ports:`, so the published surface stays exactly `:8080`.
 
@@ -166,12 +171,12 @@ All configuration is read by `ono.config.Settings` (pydantic-settings) from envi
 | `APP_NAME` | `Operation: Negative One` | Display name |
 | `ENVIRONMENT` | `local` | `local` · `staging` · `production` (validated) |
 | `LOG_LEVEL` | `INFO` | Any Python logging level name (validated) |
-| `HOST` / `PORT` | `0.0.0.0` / `8080` | Bind address; 8080 is the one published port |
+| `HOST` / `PORT` | `0.0.0.0` / `8080` | Bind address for `uv run ono`. The Docker image always binds `0.0.0.0:8080`, the one published port |
 | `MODEL_BACKEND` | `mock` | `mock` · `local` · `service` (validated). **Deliverable 2 runs `mock`**; `service` calls a real model; `local` is not implemented yet. |
 | `MODEL_NAME` | `Qwen/Qwen2.5-Coder-7B-Instruct` | Informational for `mock`; sent as the `model` field by `service` (e.g. `qwen2.5-coder:7b` for Ollama) |
 | `MODEL_SERVICE_URL` | — | **Required when `MODEL_BACKEND=service`** (startup fails otherwise). OpenAI-compatible base URL, e.g. `http://localhost:11434/v1` |
 | `MODEL_SERVICE_API_KEY` | — | `SecretStr`: never logged, never returned by `/info` |
-| `MAX_VERIFIER_RETRIES` | `3` | 1–5. Hard cap on the verifier self-correction loop |
+| `MAX_VERIFIER_RETRIES` | `3` | 1–5. Reserved cap for the verifier self-correction loop, which is not built yet (3b-2) |
 | `MAX_ACTIVE_SCANS` | `2` | 1–16. Scans that run at the same time (background worker threads). Each holds a model session and, on `service`, one sandbox |
 | `MAX_QUEUED_SCANS` | `8` | 0–100. Scans allowed to wait for a worker; beyond this `POST /scans` answers 429 (busy) |
 | `UI_POLL_INTERVAL_S` | `1.0` | 0.2–10. How often the UI refreshes a running scan's status card |
@@ -211,7 +216,7 @@ The **target allowlist** lives in [`src/ono/targets.yaml`](src/ono/targets.yaml)
 ## Project layout
 
 ```
-operation-negative-one/
+final-project/
 ├── src/ono/
 │   ├── api.py          FastAPI app: documented endpoints + mounted Gradio UI
 │   ├── ui.py           Gradio analyst UI (target picker -> Analyze -> live progress -> finding cards)
@@ -241,7 +246,7 @@ operation-negative-one/
 │       ├── _guest.py       stdlib helper that runs INSIDE the jail: confined read/tree/grep, diff applier
 │       ├── archive.py      workspace <-> gzipped tar (ship in, validate, snapshot for reset)
 │       ├── app.py          the Executor FastAPI service (bearer-token auth on everything but /health)
-│       ├── client.py       ExecutorClient: typed HTTP client the orchestrator (3b) will use
+│       ├── client.py       ExecutorClient: typed HTTP client the orchestrator uses
 │       ├── models.py       request/response schemas shared by service and client
 │       └── __main__.py     `ono-executor` / `python -m ono.executor`
 ├── tests/              pytest: config, API (incl. 403 allowlist test), analyzers, ingest, SAST, executor, agents
@@ -252,9 +257,10 @@ operation-negative-one/
 │   ├── test_executor_docker.py      REAL-container stress tests (`-m docker`; auto-skipped in CI / without a daemon)
 │   └── test_orchestrator_docker.py  REAL-jail end-to-end run of the detection core, model scripted (`-m docker`)
 ├── scripts/golden_path.py   smoke heartbeat (live server or --in-process)
+├── docs/               project plan and Deliverable 2 write-up
 ├── Dockerfile · compose.yml · .dockerignore
-├── .env.example.local · .env.example.production
-├── .github/workflows/ci.yml   ruff + mypy + pytest + docker build/health on push & PR
+├── .env.example.local · .env.example.production · .env.example.service
+├── .github/workflows/ci.yml   ruff + mypy + pytest + docker build/health (not active from this subfolder)
 └── Makefile · .pre-commit-config.yaml
 ```
 
@@ -262,7 +268,7 @@ operation-negative-one/
 
 ## Where the real pipeline slots in
 
-`ono/analyzer.py` defines `BaseAnalyzer` with five stage methods. `MockAnalyzer` implements them with canned data; the Deliverable-3 backends implement the same five methods for real (every stage carries a `TODO(D3)` marker):
+`ono/analyzer.py` defines `BaseAnalyzer` with five stage methods. `MockAnalyzer` implements them with canned data; `ServiceAnalyzer` implements the same five methods for real, with `verify` still a pass-through:
 
 | Stage | Mock today | Real (Deliverable 3) |
 |---|---|---|
@@ -270,9 +276,9 @@ operation-negative-one/
 | `sast_shortlist` | canned candidates (regex SAST for snippets) | **done (step 2):** Semgrep JSON → normalized, ranked, deduplicated `Candidate` queue with a regex fallback (`ono/sast.py`). Still to come: CodeQL → SARIF |
 | `plan` | fixed step list | **done (step 3b-1):** the frozen Qwen **planner role** emits a compact per-candidate investigation plan (what to read, which taint to check, how to decide) that feeds the analyst (`ono/agents/planner.py`) |
 | `analyze` | canned findings | **done (step 3b-1):** the Qwen **analyst role** in a bounded ReAct loop over read-only sandbox tools (`read_lines` / `read_file` / `grep` / `tree`), driven by a deterministic orchestrator; findings are anchored to lines actually read through the jail (`ono/orchestrator.py`, `ono/agents/analyst.py`). Still to come (3b-2): the fixer agent and the execution tools |
-| `verify` | passes `verified=True` | **deterministic verifier** (plain code): line exists, PoC reaches sink, patch applies, PoC no longer fires, tests pass; failure reasons feed a bounded self-correction loop (`MAX_VERIFIER_RETRIES`) |
+| `verify` | passes `verified=True` | **not built yet (3b-2):** a deterministic verifier (plain code): line exists, PoC reaches sink, patch applies, PoC no longer fires, tests pass; failure reasons feed a bounded self-correction loop (`MAX_VERIFIER_RETRIES`) |
 
-Switching is a config change: `MODEL_BACKEND=local` (vLLM on the same box, never published) or `MODEL_BACKEND=service` (remote OpenAI-compatible endpoint). `build_analyzer()` is the only place that needs to know. The in-memory `ScanStore` is likewise the seam for the internal findings database.
+Switching is a config change: `MODEL_BACKEND=service` calls an OpenAI-compatible endpoint today. `MODEL_BACKEND=local` (vLLM on the same box, never published) is planned and raises `NotImplementedError` at startup until then. `build_analyzer()` is the only place that needs to know. The in-memory `ScanStore` is likewise the seam for the internal findings database.
 
 ### Service backend today: the agentic detection core (step 3b-1)
 
@@ -364,12 +370,12 @@ The stress tests live in `tests/test_executor_docker.py` and run automatically w
 
 ## Course concepts demonstrated
 
-- **Configuration through settings** — one `Settings` class (pydantic-settings) drives the app, the container, Compose, and CI; environment and backend values are validated; secrets are `SecretStr`. Two `.env.example.*` profiles.
-- **Containerized deployment** — multi-step `Dockerfile` (lockfile-first cached dependency layer, non-root user, `HEALTHCHECK`), `.dockerignore`, and a `compose.yml` where `docker compose up -d` is the whole start procedure.
-- **Documented API** — FastAPI with typed pydantic request/response models, generated OpenAPI at `/docs` and `/redoc`, explicit error schemas (403 / 404 / 422).
-- **Publish only the app port** — the single service publishes `8080` and nothing else; future DB / vLLM / sandbox services stay internal by construction.
-- **Testing and CI** — pytest (including the blocking allowlist security test), ruff, strict mypy, a golden-path smoke script, and a GitHub Actions workflow that also builds the image and probes `/health`.
+- **Configuration through settings** — one `Settings` class (pydantic-settings) drives the app, the container, Compose, and CI; environment and backend values are validated; secrets are `SecretStr`. Three `.env.example.*` profiles.
+- **Containerized deployment** — multi-step `Dockerfile` (lockfile-first cached dependency layer, non-root user, `HEALTHCHECK`), `.dockerignore`, and a `compose.yml` where `docker compose up -d` is the whole start procedure once `.env` sets `EXECUTOR_TOKEN`.
+- **Documented API** — FastAPI with typed pydantic request/response models, generated OpenAPI at `/docs` and `/redoc`, explicit error schemas (403 / 404 / 422 / 429).
+- **Publish only the app port** — of the two Compose services, only the app publishes a port (`8080`). The Executor has no `ports:` block, and future DB / vLLM services stay internal the same way.
+- **Testing and CI** — pytest (including the blocking allowlist security test), ruff, strict mypy, a golden-path smoke script, and a GitHub Actions workflow definition that also builds the image and probes `/health` (not active from this subfolder; see [Run locally](#run-locally-uv)).
 
 ## Guardrails
 
-ONO is defensive tooling that uses offensive techniques, so the boundary is enforced in code, not policy: scans are addressed by `target_id` only (never a URL), the registry is an exact allowlist, proofs-of-concept are read-only and run only inside an egress-blocked sandbox, and the model, sandbox, and data stores are never published. The full ethics and dual-use discussion is in the project plan.
+ONO is defensive tooling that uses offensive techniques, so the boundary is enforced in code, not policy: scans are addressed by `target_id` only (never a URL), the registry is an exact allowlist, the agents read target code only through a jailed container with no network, and the Executor is never published. Ingest and Semgrep still run outside the jail for now. Read-only proofs-of-concept are planned for step 3b-2 and will run only inside that sandbox. The full ethics and dual-use discussion is in [§10 of the project plan](docs/plan.md#10-ethics--dual-use-guardrails).
