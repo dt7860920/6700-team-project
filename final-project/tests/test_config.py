@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 from pydantic import SecretStr, ValidationError
 
@@ -56,3 +58,24 @@ def test_env_vars_are_read(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_invalid_log_level_rejected() -> None:
     with pytest.raises(ValidationError, match="log_level"):
         Settings(_env_file=None, log_level="loud")
+
+
+def test_ingest_and_sast_settings_have_safe_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    s = Settings(_env_file=None)
+    assert s.workspace_dir == Path(".ono-workspace")
+    assert s.sast_ruleset == "p/owasp-top-ten"
+    assert (s.max_candidates, s.context_lines) == (20, 25)
+    assert (s.clone_timeout_s, s.max_clone_mb) == (120.0, 200)
+
+    monkeypatch.setenv("WORKSPACE_DIR", "/tmp/ono-workspace")
+    monkeypatch.setenv("SAST_RULESET", "p/owasp-top-ten,rules/custom.yml")
+    monkeypatch.setenv("MAX_CANDIDATES", "5")
+    s = Settings(_env_file=None)
+    assert s.workspace_dir == Path("/tmp/ono-workspace")
+    assert s.sast_ruleset.split(",") == ["p/owasp-top-ten", "rules/custom.yml"]
+    assert s.max_candidates == 5
+
+    with pytest.raises(ValidationError, match="max_candidates"):
+        Settings(_env_file=None, max_candidates=0)
+    with pytest.raises(ValidationError, match="clone_timeout_s"):
+        Settings(_env_file=None, clone_timeout_s=1)

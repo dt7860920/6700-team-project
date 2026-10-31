@@ -30,6 +30,6 @@ services:
       retries: 3
     read_only: true
     tmpfs:
-      - /tmp
+      - /tmp                 # WORKSPACE_DIR=/tmp/ono-workspace (per-scan clones) lives here
     security_opt:
       - no-new-privileges:true

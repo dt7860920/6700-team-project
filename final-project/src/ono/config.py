@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 from functools import lru_cache
+from pathlib import Path
 from typing import Literal, Self
 
 from pydantic import Field, SecretStr, model_validator
@@ -75,6 +76,47 @@ class Settings(BaseSettings):
         ge=1,
         le=5,
         description="Hard cap on the verifier-in-the-loop self-correction cycle (prevents thrash).",
+    )
+
+    # -- Ingest + SAST (service / local backends; the mock backend ignores these) ----
+    workspace_dir: Path = Field(
+        default=Path(".ono-workspace"),
+        description=(
+            "Directory holding per-scan workspaces (<workspace_dir>/<scan_id>/). Each clone "
+            "is removed when its scan ends. Must be writable (the container uses /tmp)."
+        ),
+    )
+    sast_ruleset: str = Field(
+        default="p/owasp-top-ten",
+        description=(
+            "Comma-separated Semgrep --config values (registry packs or local rule files). "
+            "A language pack (p/python, p/javascript, ...) is appended per target language. "
+            "Empty string = skip Semgrep and use the built-in regex scanner."
+        ),
+    )
+    max_candidates: int = Field(
+        default=20,
+        ge=1,
+        le=200,
+        description="Cap on SAST candidates kept per scan - and therefore on model calls.",
+    )
+    context_lines: int = Field(
+        default=25,
+        ge=5,
+        le=200,
+        description="Lines of code shown to the model on each side of a candidate sink.",
+    )
+    clone_timeout_s: float = Field(
+        default=120.0,
+        ge=5.0,
+        le=1800.0,
+        description="Hard timeout for the shallow git clone during ingest.",
+    )
+    max_clone_mb: int = Field(
+        default=200,
+        ge=1,
+        le=5000,
+        description="Snapshots larger than this (after .git is stripped) abort the scan.",
     )
 
     @model_validator(mode="after")

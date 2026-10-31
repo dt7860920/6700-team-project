@@ -18,6 +18,12 @@ ENV UV_COMPILE_BYTECODE=1 \
 
 WORKDIR /app
 
+# 0. git for the ingest stage (shallow clone of allowlisted targets). Semgrep itself
+#    ships as a Python wheel and arrives with the dependencies below.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
 # 1. Install dependencies first (cached layer; invalidated only by lockfile changes).
 COPY pyproject.toml uv.lock ./
 RUN --mount=type=cache,target=/root/.cache/uv \
@@ -34,10 +40,16 @@ RUN groupadd --system ono && useradd --system --gid ono --home-dir /app --shell 
     && chown -R ono:ono /app
 USER ono
 
+# The root filesystem is read-only under Compose; per-scan clones and Semgrep's own
+# state go to /tmp (a tmpfs). Semgrep never phones home or checks for updates.
 ENV PATH="/app/.venv/bin:$PATH" \
     HOST=0.0.0.0 \
     PORT=8080 \
-    GRADIO_ANALYTICS_ENABLED=False
+    GRADIO_ANALYTICS_ENABLED=False \
+    WORKSPACE_DIR=/tmp/ono-workspace \
+    SEMGREP_SETTINGS_FILE=/tmp/semgrep-settings.yml \
+    SEMGREP_SEND_METRICS=off \
+    SEMGREP_ENABLE_VERSION_CHECK=0
 
 EXPOSE 8080
 

@@ -20,8 +20,10 @@ Where the real system slots in (Deliverable 3):
 Both ``local`` (in-box vLLM) and ``service`` (remote OpenAI-compatible endpoint)
 backends reuse the same stages; only the model client differs.
 
-Today :class:`ServiceAnalyzer` is the *stock-Qwen baseline* (Deliverable 3, step 1):
-only ``analyze`` calls the model, with no scaffold around it yet.
+:class:`ServiceAnalyzer` is at Deliverable 3, step 2: real ``ingest`` (shallow clone
+into a per-scan workspace, :mod:`ono.ingest`) and a real Semgrep ``sast_shortlist``
+(:mod:`ono.sast`) feed the model real file context per candidate. ``plan`` is still
+a fixed step list and ``verify`` is still a pass-through.
 """
 
 from __future__ import annotations
@@ -36,12 +38,17 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import httpx
 
+from ono import ingest, sast
 from ono.config import Settings
 from ono.models import Finding, ScanOptions, Severity, StageName, StageResult, TraceStep
+from ono.sast import PATTERN_RULES, Candidate, scan_text
 from ono.targets import Target
+
+__all__ = ["AnalysisResult", "BaseAnalyzer", "Candidate", "Plan", "build_analyzer"]
 
 log = logging.getLogger(__name__)
 
@@ -49,17 +56,6 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Pipeline plumbing
 # ---------------------------------------------------------------------------
-
-
-@dataclass(slots=True)
-class Candidate:
-    """A SAST-style shortlist entry handed to the agent. ``line`` is the suspected sink."""
-
-    file: str
-    line: int
-    cwe_hint: str
-    rule: str
-    excerpt: str = ""
 
 
 @dataclass(slots=True)
@@ -232,29 +228,22 @@ rules:
             - pattern: req.query.$X
 """
 
-_FLASK_TRAVERSAL_PATCH = """\
---- a/app/files.py
-+++ b/app/files.py
-@@ -1,12 +1,16 @@
--import os
-+from pathlib import Path
- from flask import Blueprint, abort, request, send_file
+_VULPY_SQLI_PATCH = """\
+--- a/bad/libuser.py
++++ b/bad/libuser.py
+@@ -9,7 +9,10 @@ def login(username, password):
+     conn.row_factory = sqlite3.Row
+     c = conn.cursor()
 
- bp = Blueprint("files", __name__)
--UPLOAD_DIR = "/srv/notes/uploads"
-+UPLOAD_DIR = Path("/srv/notes/uploads").resolve()
+-    user = c.execute("SELECT * FROM users WHERE username = '{}' and password = '{}'".format(username, password)).fetchone()
++    user = c.execute(
++        "SELECT * FROM users WHERE username = ? and password = ?",
++        (username, password),
++    ).fetchone()
 
-
- @bp.get("/files")
- def download():
-     name = request.args.get("name", "")
--    path = os.path.join(UPLOAD_DIR, name)
--    return send_file(path)
-+    path = (UPLOAD_DIR / name).resolve()
-+    if not path.is_relative_to(UPLOAD_DIR) or not path.is_file():
-+        abort(404)
-+    return send_file(path)
-"""
+     if user:
+         return user['username']
+"""  # noqa: E501 - verbatim diff hunk
 
 
 class MockAnalyzer(BaseAnalyzer):
@@ -468,42 +457,43 @@ def _canned_findings(target_id: str, scan_id: str) -> list[Finding]:
             ),
         ]
 
-    if target_id == "flask-notes-repo":
+    if target_id == "vulpy":
         return [
             make(
-                title="Path traversal in the file download endpoint",
-                cwe="CWE-22",
-                severity="high",
-                file="app/files.py",
-                line_range=(11, 12),
+                title="SQL injection in the login helper (str.format into SQL)",
+                cwe="CWE-89",
+                severity="critical",
+                file="bad/libuser.py",
+                line_range=(12, 12),
                 trace=[
                     TraceStep(
-                        file="app/files.py",
-                        line=10,
-                        symbol='request.args.get("name")',
+                        file="bad/mod_user.py",
+                        line=16,
+                        symbol="request.form.get('username')",
                         note="attacker-controlled source",
                     ),
                     TraceStep(
-                        file="app/files.py",
-                        line=11,
-                        symbol="os.path.join(UPLOAD_DIR, name)",
-                        note="no canonicalization; '../' escapes the upload root",
+                        file="bad/mod_user.py",
+                        line=20,
+                        symbol="libuser.login(username, password)",
+                        note="tainted values passed through unchanged",
                     ),
                     TraceStep(
-                        file="app/files.py",
+                        file="bad/libuser.py",
                         line=12,
-                        symbol="send_file(path)",
-                        note="sink: arbitrary file read",
+                        symbol="c.execute(\"SELECT ... '{}'\".format(username, password))",
+                        note="sink: SQL text built with str.format and executed",
                     ),
                 ],
-                confidence=0.91,
+                confidence=0.93,
                 rung=4,
                 verified=True,
                 description=(
-                    "`?name=../../etc/passwd` reaches send_file. The patch resolves the path "
-                    "and rejects anything outside the upload directory."
+                    "The login form's username and password are formatted straight into a "
+                    "sqlite query. PoC `' OR '1'='1` authenticates as the first user; after "
+                    "the patch (bound parameters) the PoC no longer logs in."
                 ),
-                patch_diff=_FLASK_TRAVERSAL_PATCH,
+                patch_diff=_VULPY_SQLI_PATCH,
             ),
         ]
 
@@ -514,32 +504,9 @@ def _canned_findings(target_id: str, scan_id: str) -> list[Finding]:
 # Snippet pseudo-target: a tiny deterministic "SAST" so the demo reacts to input
 # ---------------------------------------------------------------------------
 
-_SNIPPET_RULES: tuple[tuple[str, re.Pattern[str], str, Severity], ...] = (
-    (
-        "CWE-89",
-        re.compile(r"\.(execute|executemany|raw)\(\s*(f[\"']|[\"'].*%|.*\+\s*\w)"),
-        "sql-string-built-from-input",
-        "high",
-    ),
-    (
-        "CWE-78",
-        re.compile(r"(os\.system\(|subprocess\.\w+\(.*shell\s*=\s*True|os\.popen\()"),
-        "shell-command-from-string",
-        "high",
-    ),
-    (
-        "CWE-95",
-        re.compile(r"\b(eval|exec)\(\s*[^\"')]"),
-        "eval-of-dynamic-input",
-        "critical",
-    ),
-    (
-        "CWE-502",
-        re.compile(r"(pickle\.loads?\(|yaml\.load\((?!.*Loader=yaml\.SafeLoader))"),
-        "unsafe-deserialization",
-        "high",
-    ),
-)
+# The pattern table lives in ono.sast so the service backend's regex fallback and
+# the mock's snippet scanner stay one and the same.
+_SNIPPET_RULES = PATTERN_RULES
 
 _SNIPPET_TITLES = {
     "CWE-89": "SQL built from a dynamic string",
@@ -557,15 +524,7 @@ _SNIPPET_FIXES = {
 
 
 def _scan_snippet(code: str) -> list[Candidate]:
-    candidates: list[Candidate] = []
-    for lineno, line in enumerate(code.splitlines(), start=1):
-        for cwe, pattern, rule, _sev in _SNIPPET_RULES:
-            if pattern.search(line):
-                candidates.append(
-                    Candidate(file="snippet.py", line=lineno, cwe_hint=cwe, rule=rule, excerpt=line)
-                )
-                break  # one candidate per line
-    return candidates
+    return scan_text(code, "snippet.py")
 
 
 def _finding_from_snippet_candidate(scan_id: str, target_id: str, c: Candidate) -> Finding:
@@ -606,14 +565,21 @@ def _indent_of(line: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Service backend (Deliverable 3, step 1: the stock-Qwen baseline)
+# Service backend (Deliverable 3, step 2: real ingest + Semgrep shortlist)
 # ---------------------------------------------------------------------------
 #
 # The model is called through an OpenAI-compatible ``/chat/completions`` endpoint
 # (the team runs Ollama at http://localhost:11434/v1 with ``qwen2.5-coder:7b``).
-# Only the ``analyze`` stage talks to the model; there is deliberately NO scaffold
-# yet - no SAST shortlist, no planner, no verifier - so this backend measures what
-# the bare model can do. Those stages are stubs with TODO(D3) markers.
+# Shape of a run:
+#
+#   ingest  - clone / copy / write the target into <workspace_dir>/<scan_id>/
+#   sast    - Semgrep (regex fallback) over that directory -> bounded Candidate queue
+#   analyze - ONE model call per candidate, over the real code around the sink;
+#             the model confirms or dismisses and the Finding is anchored to the
+#             candidate's real file:line
+#   verify  - pass-through (the deterministic verifier is the next step)
+#
+# The workspace is removed when the run ends, success or failure.
 
 _MODEL_TIMEOUT_S = 120.0
 
@@ -623,31 +589,37 @@ _SYSTEM_PROMPT = (
     "markdown fences, no comments."
 )
 
-_USER_PROMPT = """\
-Review the following code for security vulnerabilities (injection, command execution,
-unsafe deserialization, path traversal, hard-coded secrets, broken authentication,
-SSRF, etc.). Report only genuine issues; do not pad the list.
+_CANDIDATE_PROMPT = """\
+A static-analysis tool flagged a possible vulnerability. Decide whether it is a GENUINE,
+exploitable issue by reading the surrounding code. Do not pad: if the flagged code is
+safe (input is validated, constant, or unreachable), dismiss it.
 
-Respond with a JSON array. Each element must have exactly these keys:
-  "cwe": string such as "CWE-89"
+Flag:
+  file: {file}
+  line: {line}
+  suspected CWE: {cwe_hint}
+  rule: {rule}
+
+Respond with ONE JSON object with exactly these keys:
+  "vulnerable": true or false
+  "cwe": string such as "CWE-89" (your best classification; may differ from the hint)
   "title": short string
   "severity": one of "low", "medium", "high", "critical"
-  "file": string (use "{file}" for this input)
-  "line_start": integer, 1-based line of the vulnerable sink
+  "file": "{file}"
+  "line_start": integer, 1-based line of the vulnerable sink as numbered below
   "line_end": integer >= line_start
-  "description": why this is exploitable and how
-  "suggested_patch": a unified diff (or minimal corrected code) that fixes it
+  "description": why this is exploitable and how (or why it is safe if dismissed)
+  "suggested_patch": a unified diff (or minimal corrected code) that fixes it; "" if dismissed
   "confidence": number between 0 and 1
 
-If there are no vulnerabilities, respond with [].
-
-File: {file} (each line is shown as "N | code"; the "N |" prefix is not part of the code)
+File: {file}, lines {first}-{last} (each line is shown as "N | code"; the "N |" prefix is
+not part of the code; the flagged line is marked with ">>")
 ```
 {numbered_code}
 ```
 """
 
-_SNIPPET_FILE = "snippet.py"
+_SNIPPET_FILE = ingest.SNIPPET_FILE
 _JSON_FENCE = re.compile(r"```(?:json|JSON)?\s*(.*?)```", re.DOTALL)
 _CWE_NUMBER = re.compile(r"(\d+)")
 _SEVERITY_ALIASES: dict[str, Severity] = {
@@ -662,9 +634,9 @@ _SEVERITY_ALIASES: dict[str, Severity] = {
 
 
 class ServiceAnalyzer(BaseAnalyzer):
-    """Calls a remote OpenAI-compatible endpoint; the model analyzes the code directly.
+    """Calls a remote OpenAI-compatible endpoint over real, SAST-shortlisted code.
 
-    Step 1 of Deliverable 3. Findings are model-asserted (``verified=False``) and
+    Step 2 of Deliverable 3. Findings are model-asserted (``verified=False``) and
     capped at rung 2 because nothing has proven them yet.
     """
 
@@ -678,76 +650,119 @@ class ServiceAnalyzer(BaseAnalyzer):
         self.base_url = settings.model_service_url.rstrip("/")
         # One long-lived client (connection reuse). Tests swap in httpx.MockTransport.
         self._http = httpx.Client(timeout=_MODEL_TIMEOUT_S)
-        # ``run`` executes all stages on one thread, so the ingested code can travel
+        # ``run`` executes all stages on one thread, so the workspace path can travel
         # from ``ingest`` to ``analyze`` in a thread-local without cross-scan leakage.
-        # TODO(D3): replace with the sandbox workspace the analyst reads via tools.
         self._local = threading.local()
+
+    # -- Orchestration ----------------------------------------------------
+    def run(self, scan_id: str, target: Target, options: ScanOptions) -> AnalysisResult:
+        self._local.workspace = ingest.workspace_path(self.settings.workspace_dir, scan_id)
+        try:
+            return super().run(scan_id, target, options)
+        finally:
+            # The clone is a copy we never keep: remove it whether or not the run succeeded.
+            ingest.cleanup_workspace(self._local.workspace)
+            self._local.workspace = None
+
+    @property
+    def _workspace(self) -> Path:
+        workspace: Path | None = getattr(self._local, "workspace", None)
+        if workspace is None:  # a stage was called outside ``run``
+            msg = "ServiceAnalyzer stages must run via run(); no workspace is set"
+            raise RuntimeError(msg)
+        return workspace
 
     # -- Stage 1 ------------------------------------------------------------
     def ingest(self, target: Target, options: ScanOptions) -> str:
-        # TODO(D3): clone the pinned snapshot into the egress-blocked sandbox,
-        # strip .git / CVE strings, parse with tree-sitter, build the call graph.
-        if target.kind == "snippet":
-            code = options.snippet or ""
-            self._local.code = code
-            return f"inline snippet ({len(code)} chars)"
-        self._local.code = None
-        return target.snapshot
+        # TODO(D3): run the clone inside the egress-blocked sandbox container and strip
+        # CVE strings; tree-sitter parse + call graph. For now: shallow clone into the
+        # local workspace, .git removed, nothing executed.
+        root = ingest.ingest_target(
+            target,
+            options,
+            workspace=self._workspace,
+            clone_timeout_s=self.settings.clone_timeout_s,
+            max_clone_mb=self.settings.max_clone_mb,
+        )
+        return str(root)
 
     # -- Stage 2 ------------------------------------------------------------
     def sast_shortlist(self, target: Target, options: ScanOptions) -> list[Candidate]:
-        # TODO(D3): Semgrep + CodeQL -> SARIF -> normalized Candidate queue.
-        # The stock-Qwen baseline has no SAST scaffold: the model sees the whole input.
-        return []
+        # TODO(D3): add CodeQL -> SARIF alongside Semgrep; union with entry points.
+        result = sast.shortlist(
+            self._workspace,
+            rulesets=self.settings.sast_ruleset.split(","),
+            languages=target.languages,
+            max_candidates=self.settings.max_candidates,
+        )
+        log.info(
+            "service backend: sast engine=%s (%s) -> %d candidate(s) for %s",
+            result.engine,
+            result.note,
+            len(result.candidates),
+            target.target_id,
+        )
+        return result.candidates
 
     # -- Stage 3 ------------------------------------------------------------
     def plan(self, target: Target, candidates: list[Candidate]) -> Plan:
         # TODO(D3): prompt the frozen Qwen planner role to emit the scaffold.
-        return Plan(steps=["ANALYZE whole input"])
+        if not candidates:
+            return Plan(steps=["REPORT none (no SAST candidates)"])
+        return Plan(steps=[f"CONFIRM {c.file}:{c.line} ({c.cwe_hint})" for c in candidates])
 
     # -- Stage 4 ------------------------------------------------------------
     def analyze(
         self, scan_id: str, target: Target, candidates: list[Candidate], plan: Plan
     ) -> list[Finding]:
         # TODO(D3): LangGraph ReAct loop over the Qwen analyst role with a hard
-        # tool-call budget. Step 1 is a single direct call over the pasted code.
-        if target.kind != "snippet":
-            log.info(
-                "service backend: target %r (%s) has no ingested code yet - real ingest is a "
-                "later step; returning no findings",
-                target.target_id,
-                target.kind,
-            )
-            return []
-        code: str = getattr(self._local, "code", None) or ""
-        if not code.strip():
-            log.info("service backend: empty snippet, skipping model call")
-            return []
-
-        numbered = "\n".join(
-            f"{i:4d} | {line}" for i, line in enumerate(code.splitlines(), start=1)
-        )
-        messages = [
-            {"role": "system", "content": _SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": _USER_PROMPT.format(file=_SNIPPET_FILE, numbered_code=numbered),
-            },
-        ]
-        content = self.chat(messages)
-        items = _parse_model_findings(content)
+        # tool-call budget. Step 2 is one direct call per candidate over the real
+        # code around the sink; findings are anchored to the candidate's file:line.
+        root = self._workspace
         findings: list[Finding] = []
-        for item in items:
-            finding = _finding_from_model_item(scan_id, target.target_id, item)
-            if finding is not None:
-                findings.append(finding)
+        seen_ids: set[str] = set()
+        for c in candidates[: self.settings.max_candidates]:  # hard bound on model calls
+            window = _read_context(root, c, self.settings.context_lines)
+            if window is None:
+                log.warning("service backend: cannot read %s:%d; skipping", c.file, c.line)
+                continue
+            first, numbered = window
+            messages = [
+                {"role": "system", "content": _SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": _CANDIDATE_PROMPT.format(
+                        file=c.file,
+                        line=c.line,
+                        cwe_hint=c.cwe_hint or "unknown",
+                        rule=c.rule,
+                        first=first,
+                        last=first + numbered.count("\n"),
+                        numbered_code=numbered,
+                    ),
+                },
+            ]
+            content = self.chat(messages)
+            items = _parse_model_findings(content)
+            if not items:
+                log.info("service backend: unparseable reply for %s:%d; skipped", c.file, c.line)
+            for item in items:
+                if _is_dismissed(item):
+                    log.info("service backend: model dismissed %s:%d (%s)", c.file, c.line, c.rule)
+                    continue
+                finding = _finding_from_model_item(
+                    scan_id, target.target_id, item, anchor=c, window=(first, numbered)
+                )
+                if finding is not None and finding.finding_id not in seen_ids:
+                    seen_ids.add(finding.finding_id)
+                    findings.append(finding)
         return findings
 
     # -- Stage 5 ------------------------------------------------------------
     def verify(self, target: Target, findings: list[Finding]) -> list[Finding]:
-        # TODO(D3): deterministic verifier (line/symbol exists, PoC reaches the sink,
-        # patch applies, PoC no longer fires, tests pass) with a bounded
-        # self-correction loop. Step 1 is a pass-through: findings stay verified=False.
+        # TODO(D3, NEXT STEP): deterministic verifier (line/symbol exists, PoC reaches
+        # the sink, patch applies, PoC no longer fires, tests pass) with a bounded
+        # self-correction loop. Until then this is a pass-through: verified=False.
         return findings
 
     # -- Model client -------------------------------------------------------
@@ -825,10 +840,52 @@ def _coerce_to_item_list(data: object) -> list[dict[str, object]] | None:
     return None
 
 
+def _read_context(root: Path, c: Candidate, context_lines: int) -> tuple[int, str] | None:
+    """Numbered code around the candidate sink: ``(first_line_number, numbered_text)``.
+
+    Lines are rendered as ``"N | code"`` with the flagged line marked ``">>"``. Returns
+    ``None`` when the file cannot be read (gone, binary, or outside the workspace).
+    """
+    path = (root / c.file).resolve()
+    try:
+        if not path.is_relative_to(root.resolve()):  # a crafted path must never escape
+            return None
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+    if not lines:
+        return None
+    first = max(1, c.line - context_lines)
+    last = min(len(lines), c.line + context_lines)
+    numbered = "\n".join(
+        f"{'>>' if i == c.line else '  '}{i:5d} | {lines[i - 1]}" for i in range(first, last + 1)
+    )
+    return first, numbered
+
+
+def _is_dismissed(item: dict[str, object]) -> bool:
+    """``{"vulnerable": false}`` (or string equivalents) means the model rejected the flag."""
+    value = item.get("vulnerable", True)
+    if isinstance(value, bool):
+        return not value
+    return str(value).strip().lower() in {"false", "no", "0", "none"}
+
+
 def _finding_from_model_item(
-    scan_id: str, target_id: str, item: dict[str, object]
+    scan_id: str,
+    target_id: str,
+    item: dict[str, object],
+    *,
+    anchor: Candidate | None = None,
+    window: tuple[int, str] | None = None,
 ) -> Finding | None:
-    """Map one model-emitted dict onto :class:`Finding`; ``None`` if unusable."""
+    """Map one model-emitted dict onto :class:`Finding`; ``None`` if unusable.
+
+    With an ``anchor`` candidate, the finding is pinned to the candidate's real file and
+    the model's line numbers are honoured only if they fall inside the code ``window`` it
+    was shown; otherwise the sink line is the candidate's. A one-hop trace records the
+    SAST rule that surfaced the sink.
+    """
     cwe_match = _CWE_NUMBER.search(str(item.get("cwe", "")))
     if cwe_match is None:
         log.warning("service backend: dropping finding without a CWE: %r", item.get("title"))
@@ -836,9 +893,28 @@ def _finding_from_model_item(
     cwe = f"CWE-{cwe_match.group(1)}"
 
     severity = _SEVERITY_ALIASES.get(str(item.get("severity", "")).strip().lower(), "medium")
-    file = str(item.get("file") or _SNIPPET_FILE)
-    line_start = max(1, _as_int(item.get("line_start", item.get("line")), default=1))
+    reported_start = _as_int(item.get("line_start", item.get("line")), default=0)
+    line_start = max(1, reported_start) if reported_start else 1
     line_end = max(line_start, _as_int(item.get("line_end"), default=line_start))
+    trace: list[TraceStep] = []
+    if anchor is not None:
+        file = anchor.file
+        if window is not None and (first := window[0]) <= reported_start <= (
+            last := first + window[1].count("\n")
+        ):
+            line_end = min(line_end, last)  # the model's lines, as long as it saw them
+        else:
+            line_start, line_end = anchor.line, anchor.line
+        trace.append(
+            TraceStep(
+                file=anchor.file,
+                line=anchor.line,
+                symbol=anchor.excerpt.strip() or f"line {anchor.line}",
+                note=f"sink flagged by SAST rule {anchor.rule}",
+            )
+        )
+    else:
+        file = str(item.get("file") or _SNIPPET_FILE)
     confidence = min(1.0, max(0.0, _as_float(item.get("confidence"), default=0.5)))
     patch = str(item.get("suggested_patch") or "")
     title = str(item.get("title") or f"{cwe} reported by {target_id} model analysis")
@@ -852,7 +928,7 @@ def _finding_from_model_item(
         severity=severity,
         file=file,
         line_range=(line_start, line_end),
-        trace=[],  # the baseline model emits no source->sink trace
+        trace=trace,  # no source->sink flow yet: just the SAST-flagged sink
         confidence=confidence,
         # Rung 2 = finding + CWE + suggested patch, model-asserted. Without a patch the
         # ladder only supports rung 1 (bare flag). Nothing is proven until the verifier.
