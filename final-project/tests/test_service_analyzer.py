@@ -309,10 +309,36 @@ def test_scan_service_reports_the_executor_failure_in_the_scan_message(
     analyzer = _analyzer(settings, ScriptedModel(), FakeExecutor(unreachable=True))
     registry = TargetRegistry({"fixture-repo": repo})
     service = ScanService(settings, registry, analyzer, InMemoryScanStore())
-    response = service.start_scan(ScanRequest(target_id="fixture-repo"))
+    response = service.run_scan(ScanRequest(target_id="fixture-repo"))
     assert response.status == "failed" and response.findings == []
     assert "executor unreachable at http://127.0.0.1:8081" in response.message
     assert "make executor" in response.message
+    assert response.progress == "" and response.completed_at is not None
+    # the same failure is visible on the live record the API and UI poll
+    live = service.get_scan(response.scan_id)
+    assert live is not None and live.status == "failed" and live.message == response.message
+    service.close()
+
+
+def test_service_backend_reports_candidate_progress_live(repo: Target, workspace: Path) -> None:
+    """The orchestrator's per-candidate loop shows up in the scan record's progress log."""
+    model = ScriptedModel(default=action("dismiss", reason="not reachable"))
+    settings = _settings(workspace, planner_enabled=False)
+    analyzer = _analyzer(settings, model)
+    service = ScanService(
+        settings, TargetRegistry({"fixture-repo": repo}), analyzer, store := InMemoryScanStore()
+    )
+    response = service.run_scan(ScanRequest(target_id="fixture-repo"))
+    assert response.status == "done"
+    messages = [e.message for e in response.events]
+    assert "Checking the sandbox Executor and the model endpoint" in messages
+    assert any(m.startswith("Analyzing candidate 1 of 3 - app/util.py:5") for m in messages)
+    assert any(
+        m.startswith("Candidate 3 of 3 dismissed:") and "not reachable" in m for m in messages
+    )
+    assert [s.stage for s in response.pipeline] == ["ingest", "sast", "plan", "analyze", "verify"]
+    assert store.get_findings(response.scan_id) == []
+    service.close()
 
 
 def test_model_endpoint_failure_fails_the_scan_and_cleans_up(repo: Target, workspace: Path) -> None:

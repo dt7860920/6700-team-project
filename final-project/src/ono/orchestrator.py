@@ -40,6 +40,7 @@ from ono.errors import PipelineError
 from ono.executor.client import ExecutorAuthError, ExecutorError, ExecutorUnavailableError
 from ono.executor.models import ExecutorHealth
 from ono.models import Finding
+from ono.progress import ProgressCallback
 from ono.sast import Candidate
 
 __all__ = ["CandidateOutcome", "DetectionOrchestrator", "DetectionReport", "ExecutorProvider"]
@@ -145,8 +146,16 @@ class DetectionOrchestrator:
 
     # -- the state machine ------------------------------------------------------------
     def detect(
-        self, scan_id: str, target_id: str, workspace: Path, candidates: Sequence[Candidate]
+        self,
+        scan_id: str,
+        target_id: str,
+        workspace: Path,
+        candidates: Sequence[Candidate],
+        *,
+        progress: ProgressCallback | None = None,
     ) -> DetectionReport:
+        """Walk the candidate queue. ``progress`` (optional) only *reports* where the loop is."""
+        report_progress: ProgressCallback = progress if progress is not None else _no_progress
         queue = list(candidates[: self.settings.max_candidates])
         per_candidate = self.analyst.max_steps + (1 if self.settings.planner_enabled else 0)
         budget = CallBudget(limit=len(queue) * per_candidate)
@@ -164,6 +173,8 @@ class DetectionOrchestrator:
             "on" if self.settings.planner_enabled else "off",
         )
         seen: set[str] = set()
+        total = len(queue)
+        report_progress(f"Opening the jailed sandbox for {total} candidate(s)")
         try:
             with self.executor.sandbox(scan_id, workspace) as sandbox:
                 report.sandbox_id = str(getattr(sandbox, "sandbox_id", ""))
@@ -171,6 +182,10 @@ class DetectionOrchestrator:
                     if budget.remaining == 0:
                         report.stopped_early = f"model-call budget spent before candidate {index}"
                         break
+                    report_progress(
+                        f"Analyzing candidate {index} of {total} - "
+                        f"{candidate.file}:{candidate.line} ({candidate.cwe_hint})"
+                    )
                     try:
                         outcome = self._investigate(sandbox, scan_id, target_id, candidate, budget)
                     except BudgetExhaustedError as exc:
@@ -178,6 +193,11 @@ class DetectionOrchestrator:
                         break
                     report.outcomes.append(outcome)
                     report.model_calls = budget.used
+                    report_progress(
+                        f"Candidate {index} of {total} {outcome.state}: "
+                        f"{candidate.file}:{candidate.line}"
+                        + (f" - {outcome.reason[:120]}" if outcome.reason else "")
+                    )
                     if outcome.finding is not None and outcome.finding.finding_id not in seen:
                         seen.add(outcome.finding.finding_id)
                         report.findings.append(outcome.finding)
@@ -263,6 +283,10 @@ class DetectionOrchestrator:
             "orchestrator[%s]: %s -> %s (%s)", scan_id, label, outcome.state, result.reason[:120]
         )
         return outcome
+
+
+def _no_progress(message: str) -> None:
+    return None
 
 
 _STATE_FOR_VERDICT: dict[str, CandidateState] = {

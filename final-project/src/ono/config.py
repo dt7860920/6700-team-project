@@ -81,6 +81,39 @@ class Settings(BaseSettings):
         description="Hard cap on the verifier-in-the-loop self-correction cycle (prevents thrash).",
     )
 
+    # -- Scan workers + the polling UI -----------------------------------------------
+    # ``POST /scans`` is asynchronous: the scan runs on a background worker thread and the
+    # client polls ``GET /scans/{id}``. Each active scan holds a model session and (on the
+    # service backend) one jailed sandbox, so concurrency is capped and the overflow is a
+    # bounded queue; beyond that the API answers 429 "busy".
+    max_active_scans: int = Field(
+        default=2,
+        ge=1,
+        le=16,
+        description="Scans that may run at the same time (worker threads).",
+    )
+    max_queued_scans: int = Field(
+        default=8,
+        ge=0,
+        le=100,
+        description="Scans that may wait for a worker before POST /scans answers 429 (busy).",
+    )
+    ui_poll_interval_s: float = Field(
+        default=1.0,
+        ge=0.2,
+        le=10.0,
+        description="How often the Gradio UI refreshes a running scan's status.",
+    )
+    ui_poll_timeout_s: float = Field(
+        default=3600.0,
+        ge=30.0,
+        le=86400.0,
+        description=(
+            "How long the UI keeps watching one scan before it stops polling (the scan itself "
+            "continues; the page offers a 'look up scan id' box to pick it up again)."
+        ),
+    )
+
     # -- Ingest + SAST (service / local backends; the mock backend ignores these) ----
     workspace_dir: Path = Field(
         default=Path(".ono-workspace"),

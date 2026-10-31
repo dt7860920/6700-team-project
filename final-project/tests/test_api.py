@@ -1,12 +1,40 @@
-"""HTTP API smoke tests, including the blocking allowlist security test."""
+"""HTTP API smoke tests, including the blocking allowlist security test.
+
+``POST /scans`` is asynchronous (202 + ``scan_id``); the helpers below poll
+``GET /scans/{id}`` to completion. The mock backend finishes in milliseconds.
+"""
 
 from __future__ import annotations
+
+import time
+from typing import Any
 
 import httpx
 from fastapi.testclient import TestClient
 
 from ono.api import create_app
 from ono.config import Settings
+
+TERMINAL = {"done", "failed"}
+
+
+def wait_for_scan(client: TestClient, scan_id: str, timeout: float = 10.0) -> dict[str, Any]:
+    """Poll ``GET /scans/{scan_id}`` until the scan has ended; return the final record."""
+    deadline = time.monotonic() + timeout
+    while True:
+        r = client.get(f"/scans/{scan_id}")
+        assert r.status_code == 200, r.text
+        scan: dict[str, Any] = r.json()
+        if scan["status"] in TERMINAL:
+            return scan
+        assert time.monotonic() < deadline, f"scan {scan_id} still {scan['status']}"
+        time.sleep(0.01)
+
+
+def start_and_wait(client: TestClient, body: dict[str, Any]) -> dict[str, Any]:
+    accepted = client.post("/scans", json=body)
+    assert accepted.status_code == 202, accepted.text
+    return wait_for_scan(client, accepted.json()["scan_id"])
 
 
 def test_health(client: TestClient) -> None:
@@ -33,16 +61,25 @@ def test_targets_returns_allowlist(client: TestClient) -> None:
     assert all(t["authorized"] is True for t in r.json()["targets"])
 
 
-def test_scan_valid_target_returns_findings(client: TestClient) -> None:
+def test_scan_is_accepted_then_completes_with_findings(client: TestClient) -> None:
     r = client.post("/scans", json={"target_id": "pygoat"})
-    assert r.status_code == 201, r.text
-    scan = r.json()
-    assert scan["status"] == "done"
-    assert scan["target_id"] == "pygoat"
-    assert scan["findings_count"] == len(scan["findings"]) >= 1
-    assert [s["stage"] for s in scan["pipeline"]] == ["ingest", "sast", "plan", "analyze", "verify"]
+    assert r.status_code == 202, r.text
+    accepted = r.json()
+    assert accepted["status"] in ("queued", "running")
+    assert accepted["scan_id"].startswith("scn_")
+    assert accepted["target_id"] == "pygoat"
+    assert "findings" not in accepted  # 202: the record, not the result
 
-    f = scan["findings"][0]
+    scan = wait_for_scan(client, accepted["scan_id"])
+    assert scan["status"] == "done", scan
+    assert scan["findings_count"] >= 1
+    assert scan["progress"] == "" and scan["completed_at"] and scan["started_at"]
+    assert [s["stage"] for s in scan["pipeline"]] == ["ingest", "sast", "plan", "analyze", "verify"]
+    assert any("Static analysis" in e["message"] for e in scan["events"])
+
+    findings = client.get(f"/scans/{scan['scan_id']}/findings").json()
+    assert len(findings) == scan["findings_count"]
+    f = findings[0]
     for key in (
         "finding_id",
         "cwe",
@@ -75,8 +112,8 @@ def test_scan_url_like_target_is_rejected(client: TestClient) -> None:
 
 
 def test_scan_roundtrip_via_get_endpoints(client: TestClient) -> None:
-    created = client.post("/scans", json={"target_id": "juice-shop"}).json()
-    scan_id = created["scan_id"]
+    done = start_and_wait(client, {"target_id": "juice-shop"})
+    scan_id = done["scan_id"]
 
     scan = client.get(f"/scans/{scan_id}")
     assert scan.status_code == 200
@@ -101,9 +138,8 @@ def test_unknown_scan_and_finding_are_404(client: TestClient) -> None:
 
 def test_snippet_target_reacts_to_input(client: TestClient) -> None:
     code = 'cur.execute(f"SELECT * FROM t WHERE id = {uid}")\nprint("safe line")\n'
-    r = client.post("/scans", json={"target_id": "snippet", "options": {"snippet": code}})
-    assert r.status_code == 201
-    findings = r.json()["findings"]
+    done = start_and_wait(client, {"target_id": "snippet", "options": {"snippet": code}})
+    findings = client.get(f"/scans/{done['scan_id']}/findings").json()
     assert len(findings) == 1
     assert findings[0]["cwe"] == "CWE-89"
     assert findings[0]["line_range"] == [1, 1]

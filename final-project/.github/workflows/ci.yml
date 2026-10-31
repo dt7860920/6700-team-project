@@ -60,6 +60,15 @@ jobs:
             sleep 1
           done
           curl -fsS http://localhost:8080/health | grep -q '"ok"'
-          curl -fsS -X POST http://localhost:8080/scans -H 'content-type: application/json' \
-            -d '{"target_id":"pygoat"}' | grep -q '"CWE-89"'
+          # POST /scans is asynchronous: 202 + scan_id, then poll GET /scans/{id} to "done".
+          scan_id=$(curl -fsS -X POST http://localhost:8080/scans -H 'content-type: application/json' \
+            -d '{"target_id":"pygoat"}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["scan_id"])')
+          for i in $(seq 1 30); do
+            status=$(curl -fsS "http://localhost:8080/scans/$scan_id" | python3 -c 'import json,sys; print(json.load(sys.stdin)["status"])')
+            [ "$status" = "done" ] && break
+            [ "$status" = "failed" ] && { echo "scan failed"; exit 1; }
+            sleep 1
+          done
+          [ "$status" = "done" ]
+          curl -fsS "http://localhost:8080/scans/$scan_id/findings" | grep -q '"CWE-89"'
           docker rm -f ono-ci

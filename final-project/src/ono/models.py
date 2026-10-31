@@ -136,22 +136,48 @@ class StageResult(BaseModel):
     summary: str = ""
 
 
+class ProgressEvent(BaseModel):
+    """One line of the scan's live activity log (what the pipeline is doing right now)."""
+
+    at: datetime
+    message: str
+
+
 class Scan(BaseModel):
-    """Scan metadata as returned by ``GET /scans/{scan_id}``."""
+    """Scan metadata as returned by ``GET /scans/{scan_id}`` - a *live* record.
+
+    ``POST /scans`` returns it with ``status="queued"`` (202 Accepted); the background
+    worker then moves it through ``running`` to ``done`` or ``failed``, updating
+    ``progress`` / ``events`` / ``pipeline`` as the stages complete. Poll this resource.
+    """
 
     scan_id: str = Field(examples=["scn_6f1d9c0a2b4e"])
     target_id: str
     status: ScanStatus
     model_backend: str
     created_at: datetime
+    started_at: datetime | None = Field(
+        default=None, description="When a worker picked the scan up (None while queued)."
+    )
     completed_at: datetime | None = None
     findings_count: int = Field(ge=0, default=0)
     pipeline: list[StageResult] = Field(default_factory=list)
+    progress: str = Field(
+        default="",
+        description=(
+            "What the pipeline is doing right now, e.g. 'Cloning the target repository' or "
+            "'Analyzing candidate 2 of 3 - app/views.py:16'. Empty once the scan has ended."
+        ),
+    )
+    events: list[ProgressEvent] = Field(
+        default_factory=list,
+        description="Bounded activity log (most recent last): every progress step so far.",
+    )
     message: str = Field(default="", description="Human-readable status / failure detail.")
 
 
 class ScanResponse(Scan):
-    """``POST /scans`` response: the scan plus its findings inline."""
+    """A scan plus its findings inline (the synchronous ``ScanService.run_scan`` result)."""
 
     findings: list[Finding] = Field(default_factory=list)
 
