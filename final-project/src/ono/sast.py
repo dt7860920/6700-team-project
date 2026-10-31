@@ -35,6 +35,10 @@ SastEngine = Literal["semgrep", "regex"]
 
 # Overall wall-clock budget for one Semgrep run (the CLI's --timeout is per rule+file).
 _SEMGREP_RUN_TIMEOUT_S = 600.0
+# Per-rule/per-file memory cap (MB) + bounded jobs: without these semgrep-core
+# can be OOM-killed on real repos and silently return zero results.
+_SEMGREP_MAX_MEMORY_MB = 2000
+_SEMGREP_JOBS = 2
 _SEMGREP_RULE_TIMEOUT_S = 30
 
 # Semgrep registry language packs appended per target language (unknown languages are skipped).
@@ -189,6 +193,8 @@ def semgrep_command(root: Path, rulesets: Iterable[str], executable: str = "semg
         "--disable-version-check",
         "--no-git-ignore",  # .git was stripped at ingest; scan what is on disk
         f"--timeout={_SEMGREP_RULE_TIMEOUT_S}",
+        f"--max-memory={_SEMGREP_MAX_MEMORY_MB}",
+        f"--jobs={_SEMGREP_JOBS}",
     ]
     for ruleset in rulesets:
         cmd.extend(["--config", ruleset])
