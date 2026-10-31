@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
+import platform
 import re
 import shutil
 import subprocess
@@ -35,6 +36,10 @@ SastEngine = Literal["semgrep", "regex"]
 
 # Overall wall-clock budget for one Semgrep run (the CLI's --timeout is per rule+file).
 _SEMGREP_RUN_TIMEOUT_S = 600.0
+# Per-rule/per-file memory cap (MB) + bounded jobs: without these semgrep-core
+# can be OOM-killed on real repos and silently return zero results.
+_SEMGREP_MAX_MEMORY_MB = 2000
+_SEMGREP_JOBS = 2
 _SEMGREP_RULE_TIMEOUT_S = 30
 
 # Semgrep registry language packs appended per target language (unknown languages are skipped).
@@ -189,11 +194,25 @@ def semgrep_command(root: Path, rulesets: Iterable[str], executable: str = "semg
         "--disable-version-check",
         "--no-git-ignore",  # .git was stripped at ingest; scan what is on disk
         f"--timeout={_SEMGREP_RULE_TIMEOUT_S}",
+        f"--max-memory={_SEMGREP_MAX_MEMORY_MB}",
+        f"--jobs={_SEMGREP_JOBS}",
     ]
     for ruleset in rulesets:
         cmd.extend(["--config", ruleset])
     cmd.append(".")  # relative target + cwd=root => paths relative to the clone root
     return cmd
+
+
+def _aslr_safe_prefix() -> list[str]:
+    """On Linux, run semgrep-core with ASLR disabled (``setarch -R``).
+
+    semgrep-core (an OCaml binary) can segfault on some newer kernels due to
+    address-space-layout randomization; ``setarch -R`` avoids it. A no-op where
+    ``setarch`` is unavailable (e.g. macOS / CI), so behaviour there is unchanged.
+    """
+    if sys.platform.startswith("linux") and shutil.which("setarch"):
+        return ["setarch", platform.machine(), "-R"]
+    return []
 
 
 def run_semgrep(root: Path, rulesets: Iterable[str]) -> dict[str, object]:
@@ -205,7 +224,7 @@ def run_semgrep(root: Path, rulesets: Iterable[str]) -> dict[str, object]:
     executable = semgrep_executable()
     if executable is None:
         raise SemgrepUnavailableError("semgrep is not installed")
-    cmd = semgrep_command(root, rulesets, executable)
+    cmd = _aslr_safe_prefix() + semgrep_command(root, rulesets, executable)
     try:
         proc = subprocess.run(  # fixed argv, no shell, cwd is our own workspace
             cmd,
@@ -234,6 +253,17 @@ def run_semgrep(root: Path, rulesets: Iterable[str]) -> dict[str, object]:
     errors = data.get("errors")
     if isinstance(errors, list) and errors:
         log.warning("sast(semgrep): %d non-fatal error(s), e.g. %r", len(errors), errors[0])
+        results = data.get("results")
+        crash_markers = ("exited with", "engine was killed", "Fatal error", "out of memory")
+        crashed = any(
+            isinstance(e, dict) and any(m in str(e.get("message", "")) for m in crash_markers)
+            for e in errors
+        )
+        if crashed and isinstance(results, list) and not results:
+            # A crash (e.g. semgrep-core segfault) that yields no results must not be
+            # reported as a clean target; raise so the caller uses the regex fallback.
+            tail = str(errors[0])[:200]
+            raise SemgrepUnavailableError(f"semgrep crashed with no results: {tail}")
     return data
 
 
