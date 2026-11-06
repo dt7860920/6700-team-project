@@ -195,7 +195,8 @@ def test_repo_scan_end_to_end(repo: Target, workspace: Path) -> None:
     assert result.stages[3].summary == "2 raw finding(s)"
     # issue #64: the pass-through verifier must not claim anything passed
     assert result.stages[4].summary == "verifier not enabled yet; 2 finding(s) left unverified"
-    assert result.summary == "2 findings (0 verified)"
+    assert result.summary.startswith("2 findings (0 verified)")
+    assert "only the built-in patterns ran" in result.summary  # Semgrep is off in the suite
     # one jail for the whole scan, opened after SAST with the ingested workspace, torn down after
     assert executor.events == ["create scn_repo", "destroy scn_repo"]
     assert executor.sandboxes[0].root == workspace / "scn_repo"
@@ -247,7 +248,9 @@ def test_semgrep_results_feed_the_orchestrator_when_available(
     model = ScriptedModel(default=action("dismiss", reason="no"))
     analyzer = _analyzer(_settings(workspace, planner_enabled=False), model)
     analyzer.run("s", repo, ScanOptions())
-    assert model.n_calls == 4  # 5 Semgrep results -> 4 unique sinks (one no-CWE rule dropped)
+    # 5 Semgrep results -> 4 unique sinks (one no-CWE rule dropped), plus the 2 sinks only
+    # the built-in patterns see (util.py:5 pickle, views.py:16 as CWE-89)
+    assert model.n_calls == 6
     assert (
         "python.flask.security.injection.tainted-sql-string"
         in model.calls[0]["messages"][1]["content"]
@@ -475,4 +478,4 @@ def test_min_rung_filter_says_what_it_hid(repo: Target, workspace: Path) -> None
         "scn_rung", repo, ScanOptions(min_rung=3)
     )
     assert result.findings == []
-    assert result.summary == "0 findings at rung >= 3; 2 below min_rung=3 hidden"
+    assert result.summary.startswith("0 findings at rung >= 3; 2 below min_rung=3 hidden")
