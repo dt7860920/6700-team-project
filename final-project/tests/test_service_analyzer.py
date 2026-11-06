@@ -18,7 +18,7 @@ from pydantic import SecretStr, ValidationError
 from agentfakes import FakeExecutor, ScriptedModel, action, confirm_args
 from ono import sast
 from ono.agents.definitions import PLANNER
-from ono.agents.model import ModelClient, ModelError
+from ono.agents.model import ModelClient
 from ono.analyzer import ServiceAnalyzer, build_analyzer
 from ono.config import Settings
 from ono.errors import PipelineError
@@ -341,14 +341,43 @@ def test_service_backend_reports_candidate_progress_live(repo: Target, workspace
     service.close()
 
 
-def test_model_endpoint_failure_fails_the_scan_and_cleans_up(repo: Target, workspace: Path) -> None:
+def _model_server(models: list[str], chat_status: int = 200) -> httpx.MockTransport:
+    def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/models"):
+            return httpx.Response(200, json={"data": [{"id": m} for m in models]})
+        return httpx.Response(chat_status, text="loading")
+
+    return httpx.MockTransport(handle)
+
+
+def test_dead_model_endpoint_fails_before_anything_is_cloned(repo: Target, workspace: Path) -> None:
+    """Issues #48-#50 / #53: a down model fails the scan in preflight, not after SAST."""
     settings = _settings(workspace)
     model = ModelClient(
         settings, transport=httpx.MockTransport(lambda r: httpx.Response(503, text="loading"))
     )
     executor = FakeExecutor()
     analyzer = ServiceAnalyzer(settings, model=model, executor=executor)
-    with pytest.raises(ModelError, match="503"):
+    with pytest.raises(PipelineError, match=r"model service is not available .*503"):
+        analyzer.run("scn_fail", repo, ScanOptions())
+    assert executor.events == []  # no jail opened
+    assert not (workspace / "scn_fail").exists()  # nothing cloned
+
+
+def test_unserved_model_name_fails_preflight(repo: Target, workspace: Path) -> None:
+    settings = _settings(workspace)
+    model = ModelClient(settings, transport=_model_server(["llama3:8b"]))
+    analyzer = ServiceAnalyzer(settings, model=model, executor=FakeExecutor())
+    with pytest.raises(PipelineError, match=r"'qwen2.5-coder:7b' is not served .*llama3:8b"):
+        analyzer.run("scn_name", repo, ScanOptions())
+
+
+def test_model_failure_mid_scan_fails_the_scan_and_cleans_up(repo: Target, workspace: Path) -> None:
+    settings = _settings(workspace)
+    model = ModelClient(settings, transport=_model_server(["qwen2.5-coder:7b"], chat_status=503))
+    executor = FakeExecutor()
+    analyzer = ServiceAnalyzer(settings, model=model, executor=executor)
+    with pytest.raises(PipelineError, match=r"model service failed mid-scan .*503"):
         analyzer.run("scn_fail", repo, ScanOptions())
     assert executor.events == ["create scn_fail", "destroy scn_fail"]  # jail torn down on error
     assert not (workspace / "scn_fail").exists()
