@@ -5,10 +5,15 @@ Runs Semgrep over an ingested workspace and normalizes its JSON ``results`` into
 rule id, matched excerpt). The shortlist is what bounds the model stage: the
 analyst only ever reasons about *candidates*, never the whole repository.
 
+The built-in pattern rules (the same ones the mock backend uses for pasted snippets)
+always run alongside Semgrep: Semgrep's registry rules are taint-based and miss sinks
+whose input is a plain function parameter (``os.system("ping " + host)`` in a helper),
+hard-coded secrets and some path-traversal shapes, which the patterns catch. Pattern
+hits rank just below Semgrep hits of the same severity.
+
 Graceful degradation is required, not optional: if Semgrep is missing, crashes,
-times out, or emits something unparseable, :func:`shortlist` falls back to a
-lightweight built-in regex scanner (the same patterns the mock backend uses for
-pasted snippets) so the SAST stage always yields candidates and never fails a scan.
+times out, or emits something unparseable, :func:`shortlist` uses the patterns alone
+so the SAST stage always yields candidates and never fails a scan.
 
 Deliberately NOT here yet (later steps): CodeQL / SARIF ingestion, call-graph
 enrichment of candidates, entry-point union.
@@ -78,6 +83,7 @@ class Shortlist:
     engine: SastEngine
     note: str = ""
     dropped: list[str] = field(default_factory=list)
+    trimmed: int = 0  # deduplicated candidates cut by max_candidates (never analyzed)
 
 
 class SemgrepUnavailableError(RuntimeError):
@@ -115,20 +121,74 @@ PATTERN_RULES: tuple[tuple[str, re.Pattern[str], str, Severity], ...] = (
         "unsafe-deserialization",
         "high",
     ),
+    (
+        "CWE-22",
+        re.compile(
+            r"\b(?:send_file|send_from_directory|open)\(\s*"
+            r"(?:os\.path\.join\(|f[\"'][^\"']*\{|(?:\"[^\"]*\"|'[^']*')\s*\+)"
+        ),
+        "path-built-from-input",
+        "high",
+    ),
+    (
+        "CWE-798",
+        re.compile(
+            r"(?i)^\s*\w*(?:api_?key|secret|passw(?:or)?d|token)\w*\s*=\s*[\"'][^\"'\s]{8,}[\"']"
+        ),
+        "hard-coded-secret",
+        "high",
+    ),
+    (
+        "CWE-327",
+        re.compile(r"\bhashlib\.(?:md5|sha1)\(|\bhashlib\.new\(\s*[\"'](?:md5|sha1)[\"']"),
+        "weak-hash",
+        "medium",
+    ),
 )
 
-_REGEX_EXTENSIONS = frozenset({".py"})
+# JavaScript / TypeScript: only the injection sinks the testers hit (#65) and the classic
+# Node shapes; Semgrep's p/javascript pack does the real work when it runs.
+JS_PATTERN_RULES: tuple[tuple[str, re.Pattern[str], str, Severity], ...] = (
+    (
+        "CWE-89",
+        re.compile(r"\.(?:query|raw|execute)\(\s*(?:`[^`]*\$\{|(?:\"[^\"]*\"|'[^']*')\s*\+)"),
+        "js-sql-string-built-from-input",
+        "high",
+    ),
+    (
+        "CWE-78",
+        re.compile(r"\b(?:exec|execSync)\(\s*(?:`[^`]*\$\{|(?:\"[^\"]*\"|'[^']*')\s*\+)"),
+        "js-shell-command-from-string",
+        "high",
+    ),
+    (
+        "CWE-95",
+        re.compile(r"\beval\(\s*[^\"'`)]|\bnew\s+Function\("),
+        "js-eval-of-dynamic-input",
+        "critical",
+    ),
+)
+
+_JS_EXTENSIONS = frozenset({".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"})
+_REGEX_EXTENSIONS = frozenset({".py"}) | _JS_EXTENSIONS
+_PATTERN_RULE_IDS = frozenset(r for _c, _p, r, _s in (*PATTERN_RULES, *JS_PATTERN_RULES))
 _SKIP_DIRS = frozenset(
     {".git", "node_modules", ".venv", "venv", "__pycache__", "site-packages", ".tox", "dist"}
 )
 _MAX_FILE_BYTES = 1_000_000
 
 
+def rules_for(file: str) -> tuple[tuple[str, re.Pattern[str], str, Severity], ...]:
+    """The pattern table for a file's language (by extension; anything else is Python)."""
+    return JS_PATTERN_RULES if Path(file).suffix in _JS_EXTENSIONS else PATTERN_RULES
+
+
 def scan_text(code: str, file: str) -> list[Candidate]:
-    """Apply :data:`PATTERN_RULES` line by line (at most one candidate per line)."""
+    """Apply the pattern rules for ``file``'s language line by line (one hit per line)."""
     candidates: list[Candidate] = []
+    rules = rules_for(file)
     for lineno, line in enumerate(code.splitlines(), start=1):
-        for cwe, pattern, rule, sev in PATTERN_RULES:
+        for cwe, pattern, rule, sev in rules:
             if pattern.search(line):
                 candidates.append(
                     Candidate(
@@ -359,13 +419,18 @@ def _relative_path(path: str, root: Path) -> str:
 # ---------------------------------------------------------------------------
 
 
-def rank(c: Candidate) -> tuple[int, int]:
-    """Lower sorts first: Semgrep ERROR before WARNING/INFO, hard rules before ``.audit.`` ones.
+def rank(c: Candidate) -> tuple[int, int, int]:
+    """Lower sorts first: ERROR before WARNING/INFO, hard rules before ``.audit.`` ones, and
+    Semgrep hits before built-in pattern hits of the same severity.
 
     This is what decides which candidates survive the ``max_candidates`` cut, so an
     audit-class hit (plain-http request, debug=True) never crowds out an injection sink.
     """
-    return (_SEVERITY_RANK.get(c.severity, 1), 1 if ".audit." in c.rule else 0)
+    return (
+        _SEVERITY_RANK.get(c.severity, 1),
+        1 if ".audit." in c.rule else 0,
+        1 if c.rule in _PATTERN_RULE_IDS else 0,
+    )
 
 
 def dedupe(candidates: Iterable[Candidate]) -> list[Candidate]:
@@ -402,12 +467,13 @@ def shortlist(
         data = run_semgrep(root, configs)
         candidates, dropped = parse_semgrep_results(data, root)
         engine = "semgrep"
-        note = f"semgrep ({', '.join(configs)})"
+        note = f"semgrep ({', '.join(configs)}) + built-in patterns"
         log.info(
             "sast: semgrep produced %d result(s) with a CWE (%d dropped without one)",
             len(candidates),
             len(dropped),
         )
+        candidates += regex_scan(root)  # Semgrep first, so it wins dedupe ties
     except SemgrepUnavailableError as exc:
         candidates = regex_scan(root)
         engine = "regex"
@@ -417,7 +483,8 @@ def shortlist(
         )
 
     unique = dedupe(candidates)
-    if len(unique) > max_candidates:
+    trimmed = max(0, len(unique) - max_candidates)
+    if trimmed:
         log.info("sast: trimming %d candidate(s) to max_candidates=%d", len(unique), max_candidates)
         unique = unique[:max_candidates]
-    return Shortlist(candidates=unique, engine=engine, note=note, dropped=dropped)
+    return Shortlist(candidates=unique, engine=engine, note=note, dropped=dropped, trimmed=trimmed)

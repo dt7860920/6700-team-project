@@ -694,6 +694,9 @@ _SNIPPET_TITLES = {
     "CWE-78": "Shell command built from a string",
     "CWE-95": "Dynamic code evaluation",
     "CWE-502": "Unsafe deserialization",
+    "CWE-22": "File path built from input",
+    "CWE-798": "Hard-coded secret",
+    "CWE-327": "Weak hash algorithm",
 }
 
 _SNIPPET_FIXES = {
@@ -701,6 +704,9 @@ _SNIPPET_FIXES = {
     "CWE-78": "pass an argument list and drop shell=True",
     "CWE-95": "replace eval/exec with ast.literal_eval or an explicit dispatch table",
     "CWE-502": "use json / yaml.safe_load instead of pickle or yaml.load",
+    "CWE-22": "resolve the path and check it stays inside the base directory (or use safe_join)",
+    "CWE-798": "load the secret from the environment or a secrets manager",
+    "CWE-327": "use hashlib.sha256 for integrity, or bcrypt / argon2 for passwords",
 }
 
 
@@ -889,6 +895,15 @@ class ServiceAnalyzer(BaseAnalyzer):
             len(result.candidates),
             target.target_id,
         )
+        if result.engine == "regex" and self.settings.sast_ruleset.strip():
+            self.add_note(
+                "Semgrep was unavailable, so only the built-in patterns ran (reduced coverage)"
+            )
+        if result.trimmed:
+            self.add_note(
+                f"{result.trimmed} more SAST candidate(s) beyond "
+                f"max_candidates={self.settings.max_candidates} were not analyzed"
+            )
         return result.candidates
 
     # -- Stage 3 ------------------------------------------------------------
