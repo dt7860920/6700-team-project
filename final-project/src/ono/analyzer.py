@@ -426,14 +426,14 @@ class MockAnalyzer(BaseAnalyzer):
         # strip .git / CVE strings, parse with tree-sitter, build the call graph.
         if target.kind == "snippet":
             size = len(options.snippet or "")
-            return f"inline snippet ({size} chars)"
+            return f"inline {ingest.snippet_language(options)} snippet ({size} chars)"
         return target.snapshot
 
     # -- Stage 2 ------------------------------------------------------------
     def sast_shortlist(self, target: Target, options: ScanOptions) -> list[Candidate]:
         # TODO(D3): Semgrep + CodeQL -> SARIF -> normalized Candidate queue.
         if target.kind == "snippet":
-            return _scan_snippet(options.snippet or "")
+            return _scan_snippet(options.snippet or "", ingest.snippet_filename(options))
         return [
             Candidate(file=f.file, line=f.line_range[0], cwe_hint=f.cwe, rule="mock")
             for f in _canned_findings(target.target_id, scan_id="")
@@ -693,8 +693,8 @@ _SNIPPET_FIXES = {
 }
 
 
-def _scan_snippet(code: str) -> list[Candidate]:
-    return scan_text(code, "snippet.py")
+def _scan_snippet(code: str, filename: str = "snippet.py") -> list[Candidate]:
+    return scan_text(code, filename)
 
 
 def _finding_from_snippet_candidate(scan_id: str, target_id: str, c: Candidate) -> Finding:
@@ -853,10 +853,14 @@ class ServiceAnalyzer(BaseAnalyzer):
     # -- Stage 2 ------------------------------------------------------------
     def sast_shortlist(self, target: Target, options: ScanOptions) -> list[Candidate]:
         # TODO(D3): add CodeQL -> SARIF alongside Semgrep; union with entry points.
+        # A snippet is one language: run that language's Semgrep pack, not every listed one.
+        languages = (
+            [ingest.snippet_language(options)] if target.kind == "snippet" else target.languages
+        )
         result = sast.shortlist(
             self._workspace,
             rulesets=self.settings.sast_ruleset.split(","),
-            languages=target.languages,
+            languages=languages,
             max_candidates=self.settings.max_candidates,
         )
         log.info(

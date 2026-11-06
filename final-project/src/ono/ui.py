@@ -563,7 +563,10 @@ def build_ui(service: ScanService) -> gr.Blocks:
                 snippet = gr.Code(
                     value=EXAMPLE_SNIPPET,
                     language="python",
-                    label="Code to analyze (Paste code target only)",
+                    label=(
+                        "Code to analyze: Python or JavaScript/TypeScript (auto-detected), "
+                        "up to 20,000 characters"
+                    ),
                     lines=10,
                     visible=default_target == "snippet",
                 )

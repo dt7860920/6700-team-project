@@ -15,6 +15,7 @@ from typing import Annotated, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 Severity = Literal["low", "medium", "high", "critical"]
+SnippetLanguage = Literal["auto", "python", "javascript"]
 ScanStatus = Literal["queued", "running", "done", "failed"]
 StageName = Literal["ingest", "sast", "plan", "analyze", "verify"]
 
@@ -97,6 +98,13 @@ class ScanOptions(BaseModel):
         default=None,
         max_length=20_000,
         description="Source code to analyze when target_id == 'snippet'. Ignored otherwise.",
+    )
+    snippet_language: SnippetLanguage = Field(
+        default="auto",
+        description=(
+            "Language of `snippet`. 'auto' detects Python vs JavaScript/TypeScript from the "
+            "code; other languages are not supported and would be scanned as Python."
+        ),
     )
     max_findings: int = Field(default=10, ge=1, le=50, description="Cap on findings returned.")
     min_rung: Rung = Field(default=1, description="Drop findings below this output rung.")

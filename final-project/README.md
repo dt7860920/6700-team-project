@@ -385,6 +385,17 @@ The stress tests live in `tests/test_executor_docker.py` and run automatically w
 - **Publish only the app port** — of the two Compose services, only the app publishes a port (`8080`). The Executor has no `ports:` block, and future DB / vLLM services stay internal the same way.
 - **Testing and CI** — pytest (including the blocking allowlist security test), ruff, strict mypy, a golden-path smoke script, and a GitHub Actions workflow definition that also builds the image and probes `/health` (not active from this subfolder; see [Run locally](#run-locally-uv)).
 
+## Adding a target
+
+The allowlist is `src/ono/targets.yaml`, shipped inside the image, so adding a target is a reviewed code change rather than a runtime action: that is what keeps "authorized targets only" enforceable.
+
+1. Get written authorization to analyze the code (your own repository, or one whose owner agreed).
+2. Add an entry to `targets.yaml` (`name`, `kind: repo`, `languages`, `description`, `source` as an `https://` git URL or a local directory, and a `snapshot` reference).
+3. Open a pull request. Another team member reviews and approves it; that approval *is* the authorization step.
+4. After the merge, redeploy (`docker compose up -d --build`); the new `target_id` then appears in `GET /targets` and the UI.
+
+Short pieces of code (Python or JavaScript/TypeScript, up to 20,000 characters) can be checked without any of this through the **Paste code** target.
+
 ## Guardrails
 
 ONO is defensive tooling that uses offensive techniques, so the boundary is enforced in code, not policy: scans are addressed by `target_id` only (never a URL), the registry is an exact allowlist, the agents read target code only through a jailed container with no network, and the Executor is never published. Ingest and Semgrep still run outside the jail for now. Read-only proofs-of-concept are planned for step 3b-2 and will run only inside that sandbox. The full ethics and dual-use discussion is in [§10 of the project plan](docs/plan.md#10-ethics--dual-use-guardrails).
