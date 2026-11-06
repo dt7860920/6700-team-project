@@ -49,15 +49,15 @@ UiView = tuple[str, str, dict[str, Any]]
 
 RUNG_LABELS: dict[int, str] = {
     1: "flagged line",
-    2: "CWE + patch",
+    2: "CWE + evidence",
     3: "reachability proven",
     4: "fix proven",
     5: "detection rule",
 }
 
 RUNG_HELP: dict[int, str] = {
-    1: "A line looks vulnerable. No CWE, no fix yet.",
-    2: "Plus the weakness class (CWE) and a proposed patch.",
+    1: "A line looks vulnerable; the CWE is the suspected weakness class. No trace or fix yet.",
+    2: "Plus evidence: a source-to-sink trace read from the code and/or a proposed patch.",
     3: "Plus a read-only proof that attacker input really reaches the sink.",
     4: "Plus proof the fix works: patch applies, the proof no longer fires, tests pass.",
     5: "Plus a detection rule to catch exploitation until the patch ships.",
@@ -498,8 +498,10 @@ Every finding carries a **rung** on the output-strength ladder and a **verified*
 
 | Rung | Meaning |
 |---|---|
-| 1 · flagged line | A line looks vulnerable. No CWE, no fix yet. |
-| 2 · CWE + patch | Plus the weakness class ([CWE](https://cwe.mitre.org/)) and a proposed patch. |
+| 1 · flagged line | A line looks vulnerable; the [CWE](https://cwe.mitre.org/) is the suspected \
+weakness class. No trace or fix yet. |
+| 2 · CWE + evidence | Plus evidence: a source-to-sink trace read from the code and/or a proposed \
+patch (patches arrive when the fixer agent is enabled). |
 | 3 · reachability proven | Plus a read-only proof that attacker input really reaches the sink. |
 | 4 · fix proven | Plus proof the fix works: patch applies, the proof no longer fires, tests pass. |
 | 5 · detection rule | Plus a rule to catch exploitation until the patch ships. |

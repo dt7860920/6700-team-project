@@ -24,7 +24,8 @@ Rung = Annotated[
         ge=1,
         le=5,
         description=(
-            "Output-strength rung. 1=bare flag, 2=+CWE+patch, 3=+proof it is reachable, "
+            "Output-strength rung. 1=flagged line (suspected CWE), 2=+evidence (a source->sink "
+            "trace read from the code and/or a proposed patch), 3=+proof it is reachable, "
             "4=+proof the fix works (target floor), 5=+detection rule (stretch)."
         ),
     ),

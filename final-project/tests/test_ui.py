@@ -280,7 +280,7 @@ def test_finding_card_marks_unverified_and_escapes_html() -> None:
     card = ui.render_finding_card(1, f)
     assert "<script>" not in card and "&lt;script&gt;" in card
     assert "⚠ not verified" in card and "✔ verified" not in card
-    assert "rung 2/5" in card and "CWE + patch" in card
+    assert "rung 2/5" in card and "CWE + evidence" in card
     assert "No patch proposed yet" in card
     assert "No source-to-sink trace" in card
     assert 'class="ono-badge sev high"' in card
