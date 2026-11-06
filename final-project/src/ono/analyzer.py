@@ -34,10 +34,11 @@ import logging
 import threading
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal, Protocol
 
 from ono import ingest, sast
 from ono.agents.model import ChatModel, ModelClient
@@ -83,20 +84,62 @@ class Plan:
     steps: list[str]
 
 
+_SEVERITY_RANK: dict[str, int] = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+
+
+def strongest_first(findings: list[Finding]) -> list[Finding]:
+    """Highest rung first, then most severe; ties keep pipeline order."""
+    return sorted(findings, key=lambda f: (-f.rung, _SEVERITY_RANK.get(f.severity, 9)))
+
+
 @dataclass(slots=True)
 class AnalysisResult:
-    """What a pipeline run produces: verified findings plus per-stage telemetry."""
+    """What a pipeline run produces: the findings shown, plus what was left out and why.
+
+    ``summary`` becomes the scan's ``message``, so an empty result always says *why* it is
+    empty (no candidates, none confirmed, or all filtered out) instead of reading as clean.
+    """
 
     findings: list[Finding]
     stages: list[StageResult] = field(default_factory=list)
+    candidates: int = 0
+    below_min_rung: int = 0
+    over_max_findings: int = 0
+    min_rung: int = 1
+    max_findings: int = 0
+    notes: list[str] = field(default_factory=list)
 
     @property
     def summary(self) -> str:
         n = len(self.findings)
-        return f"{n} verified finding{'s' if n != 1 else ''}"
+        if n:
+            verified = sum(1 for f in self.findings if f.verified)
+            text = f"{n} finding{'s' if n != 1 else ''} ({verified} verified)"
+        elif self.below_min_rung:
+            text = f"0 findings at rung >= {self.min_rung}"
+        elif self.candidates == 0:
+            text = "0 findings: static analysis flagged no candidates for the agents to review"
+        else:
+            text = f"0 findings: none of the {self.candidates} candidate(s) was confirmed"
+        extras: list[str] = []
+        if self.below_min_rung:
+            extras.append(f"{self.below_min_rung} below min_rung={self.min_rung} hidden")
+        if self.over_max_findings:
+            extras.append(
+                f"{self.over_max_findings} more over max_findings={self.max_findings} not shown"
+            )
+        extras.extend(self.notes)
+        return text + "".join(f"; {e}" for e in extras)
 
 
 _NULL_PROGRESS = NullProgress()
+_NO_CANDIDATES = "no candidates from static analysis"
+
+StageStatus = Literal["ok", "skipped"]
+
+
+class _Note(Protocol):
+    def __call__(self, text: str, status: StageStatus = "ok") -> None: ...
 
 
 class BaseAnalyzer(ABC):
@@ -134,6 +177,18 @@ class BaseAnalyzer(ABC):
         """Tell whoever is watching what the pipeline is doing right now."""
         self._progress.step(message)
 
+    @property
+    def _options(self) -> ScanOptions:
+        """The options of the scan running on this thread (defaults outside ``run``)."""
+        options: ScanOptions | None = getattr(self._progress_local, "options", None)
+        return options if options is not None else ScanOptions()
+
+    def add_note(self, text: str) -> None:
+        """Append a remark to this scan's summary (e.g. why analysis stopped early)."""
+        notes: list[str] | None = getattr(self._progress_local, "notes", None)
+        if notes is not None:
+            notes.append(text)
+
     # -- Orchestration ----------------------------------------------------
     def run(
         self,
@@ -144,7 +199,16 @@ class BaseAnalyzer(ABC):
         progress: ProgressSink | None = None,
     ) -> AnalysisResult:
         with self._bound_progress(progress):
-            return self._run_stages(scan_id, target, options)
+            outer = getattr(self._progress_local, "options", None)
+            self._progress_local.options = options
+            if outer is None:  # a nested run (ServiceAnalyzer -> BaseAnalyzer) shares the notes
+                self._progress_local.notes = []
+            try:
+                return self._run_stages(scan_id, target, options)
+            finally:
+                if outer is None:
+                    self._progress_local.options = None
+                    self._progress_local.notes = None
 
     def _run_stages(self, scan_id: str, target: Target, options: ScanOptions) -> AnalysisResult:
         stages: list[StageResult] = []
@@ -164,30 +228,50 @@ class BaseAnalyzer(ABC):
             note(f"{len(candidates)} candidate(s)")
 
         with self._timed("plan", stages) as note:
-            self.report(f"Planning the investigation of {len(candidates)} candidate(s)")
-            plan = self.plan(target, candidates)
-            note(" -> ".join(plan.steps) if plan.steps else "no steps")
+            if candidates:
+                self.report(f"Planning the investigation of {len(candidates)} candidate(s)")
+                plan = self.plan(target, candidates)
+                note(" -> ".join(plan.steps) if plan.steps else "no steps")
+            else:
+                plan = Plan(steps=[])
+                note(_NO_CANDIDATES, status="skipped")
 
         with self._timed("analyze", stages) as note:
-            self.report(f"Analyzing {len(candidates)} candidate(s)")
-            raw = self.analyze(scan_id, target, candidates, plan)
-            note(f"{len(raw)} raw finding(s)")
+            if candidates:
+                self.report(f"Analyzing {len(candidates)} candidate(s)")
+                raw = self.analyze(scan_id, target, candidates, plan)
+                note(f"{len(raw)} raw finding(s)")
+            else:
+                raw = []
+                note(_NO_CANDIDATES, status="skipped")
 
         with self._timed("verify", stages) as note:
             self.report(f"Verifying {len(raw)} raw finding(s)")
             verified = self.verify(target, raw)
             note(f"{len(verified)} passed the verifier")
 
-        findings = [f for f in verified if f.rung >= options.min_rung][: options.max_findings]
-        return AnalysisResult(findings=findings, stages=stages)
+        # Filter, then keep the strongest - never just the first - under the cap.
+        eligible = strongest_first([f for f in verified if f.rung >= options.min_rung])
+        findings = eligible[: options.max_findings]
+        return AnalysisResult(
+            findings=findings,
+            stages=stages,
+            candidates=len(candidates),
+            below_min_rung=len(verified) - len(eligible),
+            over_max_findings=len(eligible) - len(findings),
+            min_rung=options.min_rung,
+            max_findings=options.max_findings,
+            notes=list(getattr(self._progress_local, "notes", None) or []),
+        )
 
     @contextmanager
-    def _timed(self, stage: StageName, sink: list[StageResult]) -> Iterator[Callable[[str], None]]:
+    def _timed(self, stage: StageName, sink: list[StageResult]) -> Iterator[_Note]:
         summary = ""
+        outcome: StageStatus = "ok"
 
-        def note(text: str) -> None:
-            nonlocal summary
-            summary = text
+        def note(text: str, status: StageStatus = "ok") -> None:
+            nonlocal summary, outcome
+            summary, outcome = text, status
 
         start = time.perf_counter()
         try:
@@ -201,7 +285,7 @@ class BaseAnalyzer(ABC):
             self._progress.stage(failed)
             raise
         elapsed = (time.perf_counter() - start) * 1000
-        result = StageResult(stage=stage, duration_ms=elapsed, summary=summary)
+        result = StageResult(stage=stage, status=outcome, duration_ms=elapsed, summary=summary)
         sink.append(result)
         self._progress.stage(result)
 
@@ -779,10 +863,22 @@ class ServiceAnalyzer(BaseAnalyzer):
     def analyze(
         self, scan_id: str, target: Target, candidates: list[Candidate], plan: Plan
     ) -> list[Finding]:
+        options = self._options
         report = self.orchestrator.detect(
-            scan_id, target.target_id, self._workspace, candidates, progress=self.report
+            scan_id,
+            target.target_id,
+            self._workspace,
+            candidates,
+            progress=self.report,
+            stop_after=options.max_findings,
+            min_rung=options.min_rung,
         )
         self.last_report = report
+        if report.not_reviewed:
+            self.add_note(
+                f"stopped after max_findings={options.max_findings}; "
+                f"{report.not_reviewed} candidate(s) not reviewed"
+            )
         log.info("service backend: %s", report.summary)
         return report.findings
 

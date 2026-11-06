@@ -155,7 +155,8 @@ def _stage_rows(scan: Scan) -> str:
             if result.status == "failed":
                 icon, cls, detail = "✖", "failed", f"failed - {_e(result.summary)}"
             elif result.status == "skipped":
-                icon, cls, detail = "-", "skipped", "skipped"
+                icon, cls = "-", "skipped"
+                detail = f"skipped - {_e(result.summary)}" if result.summary else "skipped"
             else:
                 icon, cls = "✔", "ok"
                 detail = f"{_fmt_ms(result.duration_ms)} · {_e(result.summary)}"
@@ -346,9 +347,13 @@ def render_findings(scan: Scan | None, findings: list[Finding]) -> str:
         )
     if not findings:
         return (
-            '<div class="ono-empty"><div class="ono-empty-title">✅ No vulnerabilities found'
-            "</div><div>The pipeline ran to completion and nothing passed the analysis for "
-            f"this target.</div>{verdict_line}</div>"
+            '<div class="ono-empty"><div class="ono-empty-title">No findings to show</div>'
+            f"<div>{_e(scan.message or 'The scan finished without findings.')}</div>"
+            f"{verdict_line}"
+            '<div class="ono-hint">An empty result is not proof the code is safe: static '
+            "analysis only shortlists patterns it knows, and the agents can miss or wrongly "
+            "dismiss a real flaw. Treat it as &quot;nothing confirmed&quot;, not &quot;clean&quot;."
+            "</div></div>"
         )
 
     by_sev = {s: sum(1 for f in findings if f.severity == s) for s in SEVERITY_ORDER}

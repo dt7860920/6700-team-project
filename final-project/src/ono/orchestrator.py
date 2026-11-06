@@ -85,6 +85,7 @@ class DetectionReport:
     model_calls: int = 0
     sandbox_id: str = ""
     stopped_early: str = ""  # why the queue was not finished ("" = it was)
+    not_reviewed: int = 0  # candidates skipped because max_findings was already met
 
     @property
     def summary(self) -> str:
@@ -153,8 +154,15 @@ class DetectionOrchestrator:
         candidates: Sequence[Candidate],
         *,
         progress: ProgressCallback | None = None,
+        stop_after: int | None = None,
+        min_rung: int = 1,
     ) -> DetectionReport:
-        """Walk the candidate queue. ``progress`` (optional) only *reports* where the loop is."""
+        """Walk the candidate queue. ``progress`` (optional) only *reports* where the loop is.
+
+        ``stop_after``: end the walk once that many findings at rung >= ``min_rung`` are
+        confirmed (the scan's ``max_findings``), so a capped scan also finishes sooner. The
+        queue is SAST-ranked, so the candidates reviewed first are the most promising ones.
+        """
         report_progress: ProgressCallback = progress if progress is not None else _no_progress
         queue = list(candidates[: self.settings.max_candidates])
         per_candidate = self.analyst.max_steps + (1 if self.settings.planner_enabled else 0)
@@ -201,6 +209,14 @@ class DetectionOrchestrator:
                     if outcome.finding is not None and outcome.finding.finding_id not in seen:
                         seen.add(outcome.finding.finding_id)
                         report.findings.append(outcome.finding)
+                    qualifying = sum(1 for f in report.findings if f.rung >= min_rung)
+                    if stop_after is not None and qualifying >= stop_after and index < total:
+                        report.not_reviewed = total - index
+                        report.stopped_early = (
+                            f"max_findings={stop_after} reached; "
+                            f"{report.not_reviewed} candidate(s) not reviewed"
+                        )
+                        break
         except ExecutorAuthError as exc:
             raise PipelineError(f"executor rejected EXECUTOR_TOKEN: {exc}") from exc
         except ExecutorUnavailableError as exc:

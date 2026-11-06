@@ -137,7 +137,9 @@ def test_analyze_clean_snippet_shows_the_empty_state(settings: Settings) -> None
         )
     finally:
         service.close()
-    assert "No vulnerabilities found" in findings
+    assert "No findings to show" in findings
+    assert "flagged no candidates" in findings  # says *why* it is empty
+    assert "not proof the code is safe" in findings
 
 
 def test_analyze_rejects_unknown_and_busy_and_invalid_without_raising(
@@ -190,7 +192,7 @@ def test_watch_yields_each_state_until_terminal() -> None:
             status="done",
             completed_at=T0 + timedelta(seconds=95),
             findings_count=0,
-            message="0 verified findings",
+            message="0 findings: none of the 3 candidate(s) was confirmed",
             events=[
                 ProgressEvent(at=T0, message="Candidate 1 of 3 dismissed: a.py:1 - x"),
                 ProgressEvent(at=T0, message="Candidate 2 of 3 confirmed: b.py:2"),
@@ -215,7 +217,7 @@ def test_watch_yields_each_state_until_terminal() -> None:
     assert 'class="ono-stage active"' in third and third.count('class="ono-stage ok"') == 3
     last_status, last_findings, raw = views[3]
     assert "Done" in last_status and "1m 35s" in last_status
-    assert "No vulnerabilities found" in last_findings
+    assert "none of the 3 candidate(s) was confirmed" in last_findings
     assert "1 confirmed, 2 dismissed" in last_findings  # dismissed-vs-confirmed is legible
     assert raw["scan"]["status"] == "done"
 
