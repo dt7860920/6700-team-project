@@ -44,6 +44,7 @@ __all__ = [
 log = logging.getLogger(__name__)
 
 MODEL_TIMEOUT_S = 120.0
+HEALTH_TIMEOUT_S = 5.0
 MAX_REPLY_CHARS = 20_000  # anything longer is not a tool call or a verdict; cut it
 
 
@@ -137,6 +138,36 @@ class ModelClient:
 
     def close(self) -> None:
         self._http.close()
+
+    def health(self) -> None:
+        """Raise :class:`ModelError` unless the endpoint answers and serves ``model_name``.
+
+        One cheap ``GET /models`` (OpenAI-compatible; Ollama and vLLM both serve it), so a
+        dead model server fails the scan in seconds, before anything is cloned.
+        """
+        headers: dict[str, str] = {}
+        if self._api_key is not None:
+            headers["Authorization"] = f"Bearer {self._api_key.get_secret_value()}"
+        try:
+            response = self._http.get(
+                f"{self.base_url}/models", headers=headers, timeout=HEALTH_TIMEOUT_S
+            )
+        except httpx.HTTPError as exc:
+            raise ModelError(f"model endpoint unreachable at {self.base_url}: {exc}") from exc
+        if not response.is_success:
+            raise ModelError(
+                f"model endpoint at {self.base_url} returned {response.status_code} for /models"
+            )
+        try:
+            listed = response.json().get("data", [])
+            ids = {str(m.get("id")) for m in listed if isinstance(m, dict)}
+        except (AttributeError, ValueError):
+            return  # answered, but not with a model list: let the first real call decide
+        if ids and self.model_name not in ids:
+            names = ", ".join(sorted(ids)[:5])
+            raise ModelError(
+                f"model {self.model_name!r} is not served at {self.base_url} (it has: {names})"
+            )
 
     # -- one round-trip -----------------------------------------------------------
     def chat(
