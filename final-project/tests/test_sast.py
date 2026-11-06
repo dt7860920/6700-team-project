@@ -121,13 +121,19 @@ def test_shortlist_uses_semgrep_when_it_works(
     )
     assert result.engine == "semgrep"
     assert seen == [["p/owasp-top-ten", "p/python"]]  # language pack appended, unknown skipped
-    # Ranked: the three ERROR-severity sinks first, the WARNING one last; 23 deduped to one.
+    # Ranked: Semgrep's ERROR sinks, then the built-in pattern hits it missed (same
+    # severity, ranked after Semgrep), then the WARNING one. Line 23 is found by both and
+    # kept once, as the Semgrep hit.
     assert [(c.file, c.line, c.cwe_hint, c.severity) for c in result.candidates] == [
         ("app/views.py", 16, "CWE-704", "ERROR"),
         ("app/views.py", 22, "CWE-78", "ERROR"),
         ("app/views.py", 23, "CWE-78", "ERROR"),
+        ("app/util.py", 5, "CWE-502", "ERROR"),
+        ("app/views.py", 16, "CWE-89", "ERROR"),
         ("app/views.py", 13, "CWE-89", "WARNING"),
     ]
+    assert "+ built-in patterns" in result.note
+    assert next(c for c in result.candidates if c.line == 23).rule.startswith("python.")
 
 
 def test_shortlist_falls_back_to_regex_when_semgrep_is_unavailable(no_semgrep: None) -> None:
@@ -213,3 +219,61 @@ def test_run_semgrep_failure_modes_raise_unavailable(
     monkeypatch.setattr(sast.subprocess, "run", fake_run)
     with pytest.raises(sast.SemgrepUnavailableError):
         sast.run_semgrep(tmp_path, ["p/x"])
+
+
+# -- Testers' snippets (issues #27, #38, #65) -----------------------------------------
+
+
+def test_patterns_catch_function_parameter_command_injection() -> None:
+    """#27: Semgrep's taint rules miss os.system on a plain parameter; the patterns do not."""
+    code = 'import os\ndef run(u):\n    os.system("ping " + u)\n'
+    assert [(c.line, c.cwe_hint) for c in sast.scan_text(code, "snippet.py")] == [(3, "CWE-78")]
+
+
+def test_patterns_cover_the_multi_flaw_snippet() -> None:
+    """#38: path traversal, shell=True, a hard-coded key and MD5 now reach the shortlist."""
+    code = "\n".join(
+        [
+            'API_KEY = "sk_live_51HxQ2eFakeSecretKey123456"',
+            'eval(request.args["expr"])',
+            "pickle.loads(request.data)",
+            "yaml.load(request.data, Loader=yaml.Loader)",
+            'send_file(os.path.join("/srv/uploads", name))',
+            'subprocess.check_output("ls " + cmd, shell=True)',
+            "hashlib.md5(pw.encode()).hexdigest()",
+        ]
+    )
+    cwes = [c.cwe_hint for c in sast.scan_text(code, "snippet.py")]
+    assert cwes == ["CWE-798", "CWE-95", "CWE-502", "CWE-502", "CWE-22", "CWE-78", "CWE-327"]
+
+
+def test_safe_lookalikes_are_not_flagged() -> None:
+    code = "\n".join(
+        [
+            'API_KEY = os.environ["API_KEY"]',
+            'password = ""',
+            "hashlib.sha256(data).hexdigest()",
+            'open("config.yaml")',
+            "yaml.load(f, Loader=yaml.SafeLoader)",
+        ]
+    )
+    assert sast.scan_text(code, "snippet.py") == []
+
+
+def test_javascript_files_get_javascript_patterns(tmp_path: Path) -> None:
+    """#65: pasted JS SQL concatenation is a candidate, not an empty result."""
+    code = (
+        "const name = req.query.name;\n"
+        'db.query("SELECT * FROM users WHERE name = \'" + name + "\'");\n'
+    )
+    (tmp_path / "snippet.js").write_text(code)
+    assert [(c.file, c.line, c.cwe_hint) for c in sast.regex_scan(tmp_path)] == [
+        ("snippet.js", 2, "CWE-89")
+    ]
+    assert sast.scan_text(code, "snippet.py") == []  # the Python table does not apply
+
+
+def test_shortlist_reports_how_many_candidates_were_trimmed(no_semgrep: None) -> None:
+    """#46: the cut is counted so the scan can say how much was never analyzed."""
+    result = sast.shortlist(FIXTURE_REPO, rulesets=["x"], max_candidates=1)
+    assert len(result.candidates) == 1 and result.trimmed == 2
