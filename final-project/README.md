@@ -106,9 +106,9 @@ Interactive documentation is generated from the code at **`/docs`** (Swagger UI)
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/health` | Liveness → `{"status":"ok"}` |
-| `GET` | `/info` | App name, version, environment, model backend (no secrets) |
+| `GET` | `/info` | App name, version, environment, model backend, scan limits (`max_active_scans`, `max_queued_scans`); no secrets |
 | `GET` | `/targets` | The authorized-target allowlist |
-| `POST` | `/scans` | Start a scan **in the background**. **202** with the scan record (`status: "queued"`, `scan_id`). **403** if `target_id` is not allowlisted; **429** if the worker pool and queue are full. |
+| `POST` | `/scans` | Start a scan **in the background**. **202** with the scan record (`status: "queued"`, `scan_id`). **403** if `target_id` is not allowlisted (including URLs and other malformed ids); **422** for invalid options - `snippet` is required for, and only accepted with, `target_id: "snippet"`, at most 20,000 characters (errors never echo the submitted code); **429** if the worker pool and queue are full. |
 | `GET` | `/scans/{scan_id}` | The **live** scan record: `status` (`queued → running → done \| failed`), `progress` (what it is doing now), `events` (activity log), `pipeline` (stage results so far), `findings_count`, `message` |
 | `GET` | `/scans/{scan_id}/findings` | Findings for a scan (empty until it is `done`) |
 | `GET` | `/findings/{finding_id}` | One finding. `finding_id` is unique per scan; the `fingerprint` field is the same for the same sink across scans, so use it to compare scans |
@@ -149,6 +149,10 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST $BASE/scans \
 **How a scan runs.** `POST /scans` only checks the allowlist and creates the record; the pipeline runs on a small **background worker pool** (`MAX_ACTIVE_SCANS` threads — a scan does blocking work: `git clone`, Semgrep, Docker, model HTTP calls — so it never touches the event loop). The worker writes into the record as it goes: `status`, a one-line `progress` (`Fetching the target snapshot` → `Static analysis` → `Analyzing candidate 2 of 3 - app/views.py:16` → `Candidate 2 of 3 dismissed: …`), the `events` log, and each `pipeline` stage result as it completes. On failure `status` is `failed` and `message` carries the reason (`analysis pipeline failed: executor unreachable at …`). Up to `MAX_QUEUED_SCANS` scans wait for a worker (`status: "queued"`); beyond that `POST /scans` answers **429** with a `Retry-After` header instead of growing an unbounded backlog of model sessions. `scripts/golden_path.py` shows the submit-then-poll loop in ten lines.
 
 ---
+
+**Limits and options.** `MAX_ACTIVE_SCANS` scans run at once (default 2) and up to `MAX_QUEUED_SCANS` more wait with `status: "queued"` (default 8); a scan that is accepted always answers 202, and only beyond both limits does `POST /scans` return 429 with `Retry-After`. `GET /info` reports the live limits. `options.max_findings` and `options.min_rung` are API-only (the UI always uses the defaults); the scan `message` says when either one hid findings.
+
+**Who can read a scan.** There are no accounts yet: anyone who knows a `scan_id` (or `finding_id`) can read it. Ids are random and unguessable, so treat them like share links.
 
 ### Data handling and retention
 

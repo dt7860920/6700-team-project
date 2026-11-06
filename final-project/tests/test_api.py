@@ -10,6 +10,7 @@ import time
 from typing import Any
 
 import httpx
+import pytest
 from fastapi.testclient import TestClient
 
 from ono.api import create_app
@@ -51,6 +52,7 @@ def test_info_has_no_secrets(client: TestClient) -> None:
     assert body["environment"] == "local"
     assert "model_service_api_key" not in body
     assert body["targets_registered"] >= 3
+    assert body["max_active_scans"] >= 1 and body["max_queued_scans"] >= 0  # #34
 
 
 def test_targets_returns_allowlist(client: TestClient) -> None:
@@ -106,9 +108,35 @@ def test_scan_unknown_target_is_403_and_does_not_start(client: TestClient) -> No
 
 
 def test_scan_url_like_target_is_rejected(client: TestClient) -> None:
-    """URLs are never valid target ids (pattern validation -> 422 before the allowlist)."""
+    """#29: a URL is not on the allowlist either - same 403 and pointer as an unknown id."""
     r = client.post("/scans", json={"target_id": "https://example.com"})
-    assert r.status_code in (403, 422)
+    assert r.status_code == 403
+    assert "GET /targets" in r.json()["detail"]
+    assert client.post("/scans", json={}).status_code == 422  # missing is still a 422
+
+
+def test_oversized_snippet_422_does_not_echo_the_code(client: TestClient) -> None:
+    """#41: the error names the size and the limit, never the pasted code."""
+    code = "x = 1  # " + "a" * 20_000
+    r = client.post("/scans", json={"target_id": "snippet", "options": {"snippet": code}})
+    assert r.status_code == 422
+    assert "aaaaaaaaaa" not in r.text
+    (err,) = r.json()["detail"]
+    assert err["msg"] == f"snippet is {len(code):,} characters; the limit is 20,000"
+
+
+@pytest.mark.parametrize(
+    ("body", "needle"),
+    [
+        ({"target_id": "snippet"}, "needs code to scan"),  # #28
+        ({"target_id": "snippet", "options": {"snippet": "  \n"}}, "needs code to scan"),
+        ({"target_id": "pygoat", "options": {"snippet": "eval(input())"}}, "would be ignored"),
+    ],
+)
+def test_snippet_must_match_the_target(client: TestClient, body: Any, needle: str) -> None:
+    """#28 / #45: no code for 'snippet', or code that would be silently ignored, is a 422."""
+    r = client.post("/scans", json=body)
+    assert r.status_code == 422 and needle in r.text
 
 
 def test_scan_roundtrip_via_get_endpoints(client: TestClient) -> None:

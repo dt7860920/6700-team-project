@@ -5,6 +5,7 @@ status card and the finding cards. No browser, no server, no network.
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import gradio as gr
@@ -154,7 +155,11 @@ def test_analyze_rejects_unknown_and_busy_and_invalid_without_raising(
         too_long = "x" * 20_001
         views = list(ui.analyze(service, "snippet", too_long, poll_interval=0, timeout=1))
         assert len(views) == 1 and "Invalid request:" in views[0][0]
-        assert "snippet: String should have at most 20000" in views[0][0]
+        assert "snippet is 20,001 characters; the limit is 20,000" in views[0][0]
+        assert too_long not in str(views[0])  # the pasted code is never echoed back
+
+        views = list(ui.analyze(service, "snippet", "   ", poll_interval=0, timeout=1))
+        assert "needs code to scan" in views[0][0]
 
         views = list(ui.analyze(service, "", "", poll_interval=0, timeout=1))
         assert "Invalid request:" in views[0][0]
@@ -331,3 +336,29 @@ def test_build_ui_constructs_blocks(settings: Settings) -> None:
     buttons = {b.value for b in blocks.blocks.values() if isinstance(b, gr.Button)}
     assert {"Analyze", "Show scan"} <= buttons
     assert "cwe.mitre.org" in ui._LEGEND and "pick a target" in ui._HEADER
+
+
+def test_finished_scan_can_be_downloaded_as_report_and_json(settings: Settings) -> None:
+    """#60: an analyst can keep the cards - a Markdown report and the raw JSON."""
+    service = _service(settings)
+    try:
+        *_, (_, _, raw) = ui.analyze(
+            service, "vulpy", "", poll_interval=0.01, timeout=10, sleep=lambda s: None
+        )
+        files = ui.export_files(service, raw)
+    finally:
+        service.close()
+    assert files is not None
+    md, js = (Path(f).read_text(encoding="utf-8") for f in files)
+    assert md.startswith(f"# ONO scan {raw['scan']['scan_id']}") and "CWE-89" in md
+    assert '"findings"' in js and "bad/libuser.py" in js
+
+
+def test_export_trusts_only_a_well_formed_scan_id(settings: Settings) -> None:
+    service = _service(settings)
+    try:
+        for scan_id in ("../../etc/passwd", "scn_nope", ""):
+            assert ui.export_files(service, {"scan": {"scan_id": scan_id}}) is None
+        assert ui.export_files(service, None) is None
+    finally:
+        service.close()

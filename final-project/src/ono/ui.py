@@ -16,10 +16,13 @@ its first argument, so the handlers are unit-tested without a browser or a serve
 from __future__ import annotations
 
 import html
+import json
 import re
+import tempfile
 import time
 from collections.abc import Callable, Iterator
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 import gradio as gr
@@ -27,7 +30,15 @@ from pydantic import ValidationError
 
 from ono import __version__
 from ono.errors import ScanBusyError
-from ono.models import Finding, Scan, ScanOptions, ScanRequest, StageName, utcnow
+from ono.models import (
+    Finding,
+    Scan,
+    ScanOptions,
+    ScanRequest,
+    StageName,
+    friendly_errors,
+    utcnow,
+)
 from ono.service import ScanService
 from ono.targets import UnauthorizedTargetError
 
@@ -496,13 +507,13 @@ def analyze(
         yield render_error("Busy:", str(exc)), "", {"detail": str(exc)}
         return
     except ValidationError as exc:
-        errors = exc.errors()
-        where = ".".join(str(p) for p in errors[0]["loc"]) if errors else "request"
-        reason = errors[0]["msg"] if errors else str(exc)
+        errors = friendly_errors(exc.errors())  # never echoes the pasted code back
+        where = ".".join(errors[0]["loc"]) if errors and errors[0]["loc"] else "request"
+        reason = errors[0]["msg"].removeprefix("Value error, ") if errors else "invalid"
         yield (
             render_error("Invalid request:", f"{where}: {reason}"),
             "",
-            {"detail": [{"loc": list(e["loc"]), "msg": e["msg"]} for e in errors]},
+            {"detail": errors},
         )
         return
     yield from watch(
@@ -522,9 +533,11 @@ def analyze(
 _HEADER = """\
 # Operation: Negative One
 
-**ONO finds security vulnerabilities in code you are authorized to test, shows how an \
-attacker's input reaches the dangerous line, and proposes a fix.** It only scans targets \
-on its allowlist - never an arbitrary website or URL.
+**ONO finds security vulnerabilities in code you are authorized to test and shows how an \
+attacker's input reaches the dangerous line.** Proving each finding and proposing a fix are \
+the next steps on the roadmap: today's findings from the real model are leads, marked \
+*not verified*, without a patch. It only scans targets on its allowlist - never an \
+arbitrary website or URL.
 
 **How to use it:** pick a target below (or choose *Paste code* and paste a snippet), \
 click **Analyze**, and watch the progress card. A real scan clones the code, runs static \
@@ -558,6 +571,69 @@ listed in the activity log so you can see what was ruled out.
 """
 
 
+_DATA_NOTE = """\
+**Your code and results.** Pasted code is analyzed on this server, sent only to the model \
+configured here, and deleted when the scan ends. Scan results stay in memory until the \
+server restarts - download them below if you need to keep them.\
+"""
+
+_SCAN_ID = re.compile(r"scn_[0-9a-f]{12}")
+
+
+def report_markdown(scan: Scan, findings: list[Finding]) -> str:
+    """A scan and its findings as a Markdown report an analyst can keep or paste."""
+    lines = [
+        f"# ONO scan {scan.scan_id}",
+        "",
+        f"- Target: `{scan.target_id}`  ",
+        f"- Status: {scan.status} - {scan.message}  ",
+        f"- Backend: {scan.model_backend}  ",
+        f"- Started: {scan.created_at.isoformat(timespec='seconds')}",
+        "",
+    ]
+    for i, f in enumerate(findings, start=1):
+        lines += [
+            f"## {i}. {f.title}",
+            "",
+            f"- {f.cwe}, severity {f.severity}, rung {f.rung} ({RUNG_LABELS[f.rung]}), "
+            f"{'verified' if f.verified else 'not verified'}, confidence {f.confidence:.0%}  ",
+            f"- Location: `{f.location}`",
+            "",
+            f.description or "(no description)",
+            "",
+        ]
+        if f.trace:
+            lines += ["Trace:", ""]
+            lines += [f"1. `{t.file}:{t.line}` `{t.symbol}` {t.note}".rstrip() for t in f.trace]
+            lines.append("")
+        if f.patch_diff.strip():
+            lines += ["```diff", f.patch_diff.rstrip(), "```", ""]
+    if not findings:
+        lines.append("No findings.")
+    return "\n".join(lines) + "\n"
+
+
+def export_files(service: ScanService, raw: dict[str, Any] | None) -> tuple[str, str] | None:
+    """Write the finished scan's report and JSON to temp files; None while it runs.
+
+    Only the scan id is taken from the browser (and checked against the id format); the
+    content always comes from the service, so a client cannot write arbitrary files.
+    """
+    scan_id = str(((raw or {}).get("scan") or {}).get("scan_id", ""))
+    if not _SCAN_ID.fullmatch(scan_id):
+        return None
+    scan = service.get_scan(scan_id)
+    if scan is None or scan.status not in ("done", "failed"):
+        return None
+    findings = service.get_findings(scan_id) or []
+    out = Path(tempfile.gettempdir()) / "ono-exports"
+    out.mkdir(exist_ok=True)
+    md, js = out / f"ono-{scan_id}.md", out / f"ono-{scan_id}.json"
+    md.write_text(report_markdown(scan, findings), encoding="utf-8")
+    js.write_text(json.dumps(_raw(scan, findings), indent=2), encoding="utf-8")
+    return str(md), str(js)
+
+
 def build_ui(service: ScanService) -> gr.Blocks:
     """Create the Gradio Blocks app bound to a :class:`ScanService`."""
     settings = service.settings
@@ -582,6 +658,13 @@ def build_ui(service: ScanService) -> gr.Blocks:
 
     def toggle_snippet(target_id: str) -> Any:
         return gr.update(visible=target_id == "snippet")
+
+    def on_result(raw_view: dict[str, Any] | None) -> tuple[Any, Any]:
+        files = export_files(service, raw_view)
+        if files is None:
+            return gr.update(visible=False), gr.update(visible=False)
+        md, js = files
+        return gr.update(value=md, visible=True), gr.update(value=js, visible=True)
 
     backend_note = (
         "Backend: **mock** - instant, canned findings (for demos and CI)."
@@ -612,7 +695,13 @@ def build_ui(service: ScanService) -> gr.Blocks:
                 )
                 run = gr.Button("Analyze", variant="primary", size="lg")
                 gr.Markdown(backend_note, elem_classes=["ono-note"])
+                gr.Markdown(_DATA_NOTE, elem_classes=["ono-note"])
                 with gr.Accordion("Look up a scan by id", open=False):
+                    gr.Markdown(
+                        "There are no accounts yet: **anyone who has a scan id can open that "
+                        "scan**, so share an id only with people who may see its findings.",
+                        elem_classes=["ono-note"],
+                    )
                     scan_id_box = gr.Textbox(label="Scan id", placeholder="scn_…", max_lines=1)
                     lookup = gr.Button("Show scan")
             with gr.Column(scale=3):
@@ -622,12 +711,16 @@ def build_ui(service: ScanService) -> gr.Blocks:
                     label="Progress",
                 )
         findings = gr.HTML()
+        with gr.Row():
+            download_md = gr.DownloadButton("Download report (Markdown)", visible=False)
+            download_json = gr.DownloadButton("Download raw JSON", visible=False)
         with gr.Accordion("How to read a finding (rungs, verified, severity)", open=False):
             gr.Markdown(_LEGEND)
         with gr.Accordion("Raw JSON (what the API returns)", open=False):
             raw = gr.JSON()
 
         target.change(toggle_snippet, inputs=target, outputs=snippet)
+        raw.change(on_result, inputs=raw, outputs=[download_md, download_json])
         run.click(
             on_analyze,
             inputs=[target, snippet],
