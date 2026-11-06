@@ -109,7 +109,7 @@ Interactive documentation is generated from the code at **`/docs`** (Swagger UI)
 | `POST` | `/scans` | Start a scan **in the background**. **202** with the scan record (`status: "queued"`, `scan_id`). **403** if `target_id` is not allowlisted; **429** if the worker pool and queue are full. |
 | `GET` | `/scans/{scan_id}` | The **live** scan record: `status` (`queued → running → done \| failed`), `progress` (what it is doing now), `events` (activity log), `pipeline` (stage results so far), `findings_count`, `message` |
 | `GET` | `/scans/{scan_id}/findings` | Findings for a scan (empty until it is `done`) |
-| `GET` | `/findings/{finding_id}` | One finding |
+| `GET` | `/findings/{finding_id}` | One finding. `finding_id` is unique per scan; the `fingerprint` field is the same for the same sink across scans, so use it to compare scans |
 | `GET` | `/ui` | Gradio analyst UI (`/` redirects here) — see [The analyst UI](#the-analyst-ui-handoff-surface) |
 
 ```bash
@@ -147,6 +147,13 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST $BASE/scans \
 **How a scan runs.** `POST /scans` only checks the allowlist and creates the record; the pipeline runs on a small **background worker pool** (`MAX_ACTIVE_SCANS` threads — a scan does blocking work: `git clone`, Semgrep, Docker, model HTTP calls — so it never touches the event loop). The worker writes into the record as it goes: `status`, a one-line `progress` (`Fetching the target snapshot` → `Static analysis` → `Analyzing candidate 2 of 3 - app/views.py:16` → `Candidate 2 of 3 dismissed: …`), the `events` log, and each `pipeline` stage result as it completes. On failure `status` is `failed` and `message` carries the reason (`analysis pipeline failed: executor unreachable at …`). Up to `MAX_QUEUED_SCANS` scans wait for a worker (`status: "queued"`); beyond that `POST /scans` answers **429** with a `Retry-After` header instead of growing an unbounded backlog of model sessions. `scripts/golden_path.py` shows the submit-then-poll loop in ten lines.
 
 ---
+
+### Data handling and retention
+
+* **Scans and findings live in process memory only.** They stay readable by `scan_id` / `finding_id` until the app restarts or is redeployed, and are then gone; there is no database yet. Save anything you need (the Raw JSON panel in the UI, or the API responses).
+* **Code is never kept on disk.** Each scan gets a workspace (`WORKSPACE_DIR/<scan_id>/`) holding the clone or the pasted snippet; it is deleted when the scan ends, whether it succeeded or failed.
+* **Where code goes.** The analysis agents read the workspace only through the sandbox Executor, and send excerpts of it to the model endpoint in `MODEL_SERVICE_URL`. With the Ollama setup in `.env.example.service` that model runs on the same machine as the app, so code does not leave it. With the `mock` backend no model is called.
+* **What is logged.** Logs record scan ids, targets, file:line locations and candidate verdicts; ingest logs the snippet's *length*, not its text. Each agent step is logged at `INFO` with a short preview of the model reply or tool result, which can contain a few lines of code. Full agent transcripts are written only if `AGENT_TRAJECTORY_DIR` is set.
 
 ## The analyst UI (handoff surface)
 

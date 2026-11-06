@@ -30,7 +30,7 @@ from ono.agents.planner import InvestigationPlan
 from ono.agents.protocol import ParseFailure, parse_reply, render_action_format
 from ono.agents.tools import ReadLedger, ToolBox, ToolResult, openai_tool_schemas
 from ono.agents.trajectory import Trajectory
-from ono.models import Finding, Severity, TraceStep, finding_id_for
+from ono.models import Finding, Severity, TraceStep, finding_id_for, fingerprint_for
 from ono.sast import Candidate
 
 __all__ = ["MAX_CALLS_PER_TURN", "AnalystOutcome", "finding_from_verdict", "run_analyst"]
@@ -316,7 +316,8 @@ def finding_from_verdict(
     rung = 2 if len(distinct) >= 2 else 1
     return (
         Finding(
-            finding_id=finding_id_for(target_id, file, line_start, cwe),
+            finding_id=finding_id_for(scan_id, target_id, file, line_start, cwe),
+            fingerprint=fingerprint_for(target_id, file, line_start, cwe),
             scan_id=scan_id,
             target_id=target_id,
             title=title,
