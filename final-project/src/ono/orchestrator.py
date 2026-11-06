@@ -31,7 +31,7 @@ from typing import Literal, Protocol
 
 from ono.agents.analyst import AnalystOutcome, context_note, run_analyst
 from ono.agents.definitions import ANALYST, PLANNER, AgentDefinition
-from ono.agents.model import BudgetExhaustedError, CallBudget, ChatModel, ToolCall
+from ono.agents.model import BudgetExhaustedError, CallBudget, ChatModel, ModelError, ToolCall
 from ono.agents.planner import InvestigationPlan, default_plan, run_planner
 from ono.agents.tools import SandboxReader, ToolBox
 from ono.agents.trajectory import Trajectory, TrajectoryWriter
@@ -226,6 +226,8 @@ class DetectionOrchestrator:
             raise PipelineError(f"executor became unreachable mid-scan: {exc}") from exc
         except ExecutorError as exc:
             raise PipelineError(f"sandbox failure: {exc}") from exc
+        except ModelError as exc:  # budget exhaustion is handled inside the loop
+            raise PipelineError(f"the model service failed mid-scan ({exc})") from exc
         report.model_calls = budget.used
         if report.stopped_early:
             log.warning("orchestrator[%s]: %s", scan_id, report.stopped_early)

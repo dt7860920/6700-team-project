@@ -25,6 +25,7 @@ from typing import Any
 import gradio as gr
 from pydantic import ValidationError
 
+from ono import __version__
 from ono.errors import ScanBusyError
 from ono.models import Finding, Scan, ScanOptions, ScanRequest, StageName, utcnow
 from ono.service import ScanService
@@ -93,6 +94,8 @@ def ping(host):
 """
 
 _CANDIDATE_VERDICT = re.compile(r"^Candidate \d+ of \d+ (\w+):")
+
+FEEDBACK_URL = "https://github.com/dt7860920/6700-team-project/issues/new/choose"
 
 # ---------------------------------------------------------------------------
 # Small helpers
@@ -188,12 +191,49 @@ def _activity_log(scan: Scan) -> str:
     )
 
 
+def failure_report(scan: Scan) -> str:
+    """Plain-text facts about a failed scan, ready to paste into a bug report."""
+    failed = next((s for s in scan.pipeline if s.status == "failed"), None)
+    lines = [
+        f"ONO version: {__version__}",
+        f"Scan id: {scan.scan_id}",
+        f"Target: {scan.target_id}",
+        f"Backend: {scan.model_backend}",
+        f"Status: {scan.status}",
+        f"Failed stage: {failed.stage + ' - ' + failed.summary if failed else 'before any stage'}",
+        f"Message: {scan.message}",
+        f"Created: {scan.created_at.isoformat(timespec='seconds')}",
+        f"Ended: {scan.completed_at.isoformat(timespec='seconds') if scan.completed_at else '-'}",
+    ]
+    return "\n".join(lines)
+
+
 def _failure_hint(scan: Scan) -> str:
     if scan.model_backend == "mock":
-        return "The mock backend should not fail; see the server logs."
+        return "The mock backend should not fail; please report it with the details below."
     return (
-        "Check that the model endpoint (MODEL_SERVICE_URL) and the sandbox Executor "
-        "(EXECUTOR_URL, started with <code>make executor</code>) are running, then try again."
+        "<strong>What you can do:</strong> this usually means a backend service (the model "
+        "or the sandbox) is temporarily unavailable. Wait a few minutes and click "
+        "<strong>Analyze</strong> again: that starts a <em>new</em> scan with a new id and "
+        "re-runs every stage (a failed scan is not resumed). If it keeps failing, "
+        f'<a href="{FEEDBACK_URL}" target="_blank" rel="noopener">report it</a> with the '
+        "failure report below."
+    )
+
+
+def _failure_details(scan: Scan) -> str:
+    report = _e(failure_report(scan))
+    maintainer = (
+        ""
+        if scan.model_backend == "mock"
+        else '<div class="ono-hint">For maintainers: check that the model endpoint '
+        "(<code>MODEL_SERVICE_URL</code>) and the sandbox Executor (<code>EXECUTOR_URL</code>, "
+        "started with <code>make executor</code>) are running; details are in the server "
+        "logs.</div>"
+    )
+    return (
+        '<details class="ono-report"><summary>Failure report (select and copy)</summary>'
+        f"<pre>{report}</pre>{maintainer}</details>"
     )
 
 
@@ -225,7 +265,7 @@ def render_status(scan: Scan, *, now: datetime | None = None) -> str:
     elif status == "failed":
         progress = (
             f'<div class="ono-error"><strong>Scan failed:</strong> {_e(scan.message)}'
-            f'<div class="ono-hint">{_failure_hint(scan)}</div></div>'
+            f'<div class="ono-hint">{_failure_hint(scan)}</div>{_failure_details(scan)}</div>'
         )
     return (
         f'<div class="ono-status {status}">'
@@ -634,6 +674,10 @@ UI_CSS = """
 .ono-error { padding: 10px 12px; border-radius: 8px; margin: 6px 0 10px;
   background: rgba(220, 38, 38, 0.10); border: 1px solid rgba(220, 38, 38, 0.35); }
 .ono-hint { opacity: 0.8; font-size: 0.9em; margin-top: 4px; }
+.ono-report { margin-top: 8px; font-size: 0.88em; }
+.ono-report summary { cursor: pointer; font-weight: 600; }
+.ono-report pre { margin: 6px 0; padding: 8px 10px; border-radius: 6px; white-space: pre-wrap;
+  user-select: all; background: var(--background-fill-secondary); }
 .ono-stages { list-style: none; margin: 0; padding: 0; display: grid;
   grid-template-columns: 1.4em minmax(8em, max-content) 1fr; row-gap: 3px; column-gap: 8px; }
 .ono-stage { display: contents; font-size: 0.92em; }

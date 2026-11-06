@@ -34,6 +34,8 @@ services:
     environment:
       # How the harness reaches the Executor (step 3b wires the orchestrator to it).
       EXECUTOR_URL: http://executor:8081
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # reach a model server (Ollama) on the host
     ports:
       - "8080:8080"          # the ONLY published port in the whole stack
     networks:

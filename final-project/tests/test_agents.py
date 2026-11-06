@@ -880,8 +880,10 @@ def test_model_transport_errors_propagate_out_of_detect() -> None:
             raise ModelError("model endpoint unreachable")
 
     executor = FakeExecutor()
-    with pytest.raises(ModelError):
+    # surfaced as a PipelineError so the scan message names the model, not "see server logs"
+    with pytest.raises(PipelineError, match="model service failed mid-scan") as info:
         DetectionOrchestrator(_settings(), model=Dead(), executor=executor).detect(
             "s", "t", FIXTURE_REPO, CANDIDATES
         )
+    assert isinstance(info.value.__cause__, ModelError)
     assert executor.events == ["create s", "destroy s"]

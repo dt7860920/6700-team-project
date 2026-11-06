@@ -237,7 +237,13 @@ def test_watch_failed_scan_shows_message_and_hint() -> None:
     )
     assert 'class="ono-pill failed"' in status
     assert "Scan failed:" in status and "executor unreachable" in status
-    assert "MODEL_SERVICE_URL" in status and "make executor" in status
+    assert "MODEL_SERVICE_URL" in status and "make executor" in status  # maintainer note
+    # issues #52 / #56 / #57: what a tester can do, what a retry does, a copyable report
+    assert "Wait a few minutes" in status and "new</em> scan with a new id" in status
+    assert "is not resumed" in status and ui.FEEDBACK_URL in status
+    report = ui.failure_report(failed)
+    assert "Scan id: scn_abc" in report and "Failed stage: ingest - boom" in report
+    assert "Message: analysis pipeline failed: executor unreachable" in report
     assert "not reached" in status  # the stages after the failure
     assert "did not complete" in findings
     assert "Traceback" not in status

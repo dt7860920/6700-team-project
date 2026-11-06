@@ -41,8 +41,9 @@ from pathlib import Path
 from typing import Literal, Protocol
 
 from ono import ingest, sast
-from ono.agents.model import ChatModel, ModelClient
+from ono.agents.model import ChatModel, ModelClient, ModelError
 from ono.config import Settings
+from ono.errors import PipelineError
 from ono.executor.client import ExecutorClient
 from ono.models import (
     Finding,
@@ -816,6 +817,7 @@ class ServiceAnalyzer(BaseAnalyzer):
                 # host reads.
                 self.report("Checking the sandbox Executor and the model endpoint")
                 health = self.orchestrator.preflight()
+                self._check_model()
                 log.info(
                     "service backend: executor ok (%d active sandbox(es)); model %s via %s",
                     health.active_sandboxes,
@@ -827,6 +829,17 @@ class ServiceAnalyzer(BaseAnalyzer):
             # The clone is a copy we never keep: remove it whether or not the run succeeded.
             ingest.cleanup_workspace(self._local.workspace)
             self._local.workspace = None
+
+    def _check_model(self) -> None:
+        """Fail before cloning if the model endpoint is down (it used to fail mid-analysis)."""
+        probe = getattr(self.model, "health", None)  # test doubles may not implement it
+        if not callable(probe):
+            return
+        try:
+            probe()
+        except ModelError as exc:
+            msg = f"the model service is not available ({exc}); no stage was run"
+            raise PipelineError(msg) from exc
 
     @property
     def _workspace(self) -> Path:
