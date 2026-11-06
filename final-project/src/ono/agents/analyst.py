@@ -30,15 +30,68 @@ from ono.agents.planner import InvestigationPlan
 from ono.agents.protocol import ParseFailure, parse_reply, render_action_format
 from ono.agents.tools import ReadLedger, ToolBox, ToolResult, openai_tool_schemas
 from ono.agents.trajectory import Trajectory
-from ono.models import Finding, Severity, TraceStep, finding_id_for, fingerprint_for
+from ono.models import (
+    Finding,
+    Severity,
+    TraceStep,
+    finding_id_for,
+    fingerprint_for,
+    severity_for,
+)
 from ono.sast import Candidate
 
-__all__ = ["MAX_CALLS_PER_TURN", "AnalystOutcome", "finding_from_verdict", "run_analyst"]
+__all__ = [
+    "CONFIDENCE_CAP",
+    "MAX_CALLS_PER_TURN",
+    "AnalystOutcome",
+    "context_note",
+    "dismissal_contradicts_itself",
+    "finding_from_verdict",
+    "run_analyst",
+]
 
 log = logging.getLogger(__name__)
 
 MAX_CALLS_PER_TURN = 3
 MAX_TRACE_HOPS = 12
+
+# Nothing is verified yet, so the model's self-reported confidence (a 7B model says 1.0
+# almost every time) is capped by how much evidence the finding carries.
+CONFIDENCE_CAP: dict[int, float] = {1: 0.5, 2: 0.8}
+UNANCHORED_CONFIDENCE_CAP = 0.4  # the model cited lines it never read
+
+_SNIPPET_CONTEXT = (
+    "Context: this is a PASTED SNIPPET, not a whole application. There are no request "
+    "handlers, routes or callers to find, and their absence is NOT a reason to dismiss. "
+    "Treat the parameters of the function containing the flagged line (and any module-level "
+    "input such as input(), sys.argv or request.*) as attacker-controlled unless the snippet "
+    "itself validates, escapes or parameterizes them before the sink."
+)
+
+_VULNERABLE_CLAIM = re.compile(
+    r"\b(?:is|are|remains?|looks|appears|seems)\s+(?:still\s+|potentially\s+|clearly\s+)?"
+    r"(?:vulnerable|exploitable|injectable)\b"
+    r"|\bvulnerable\s+to\b"
+    r"|\b(?:allows?|enables?|leads?\s+to|results?\s+in)\s+(?:an?\s+)?"
+    r"(?:sql|command|code|os\s+command|shell)?\s*injection\b",
+    re.IGNORECASE,
+)
+_NEGATED_CLAIM = re.compile(
+    r"\b(?:not|n't|never|no\s+longer)\s+(?:be\s+|really\s+)?(?:vulnerable|exploitable|injectable)\b"
+    r"|\bnot\s+(?:lead|result|allow)\w*\s+(?:to|in)?",
+    re.IGNORECASE,
+)
+
+
+def context_note(target_kind: str) -> str:
+    """Extra framing for the agents that depends on what kind of target this is."""
+    return _SNIPPET_CONTEXT if target_kind == "snippet" else ""
+
+
+def dismissal_contradicts_itself(reason: str) -> bool:
+    """True when a *dismiss* reason argues the code IS vulnerable (issue #67)."""
+    return bool(_VULNERABLE_CLAIM.search(reason)) and not _NEGATED_CLAIM.search(reason)
+
 
 Verdict = Literal["confirm", "dismiss", "exhausted", "timeout"]
 
@@ -76,15 +129,17 @@ def run_analyst(
     budget: CallBudget,
     deadline: float,
     trajectory: Trajectory,
+    context: str = "",
 ) -> AnalystOutcome:
     """Run the loop for one candidate. Only model transport / budget errors propagate."""
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": definition.system_prompt},
         {
             "role": "user",
-            "content": _task_prompt(candidate, plan, window_text, definition.max_steps),
+            "content": _task_prompt(candidate, plan, window_text, definition.max_steps, context),
         },
     ]
+    challenged = False  # a self-contradicting dismissal is sent back once, not forever
     schemas = openai_tool_schemas(definition.tools)
     allowed = set(definition.tool_names)
 
@@ -132,6 +187,20 @@ def run_analyst(
                 reason = (
                     str(terminal.args.get("reason") or "").strip() or "dismissed without a reason"
                 )
+                if dismissal_contradicts_itself(reason) and not challenged and not last:
+                    challenged = True
+                    trajectory.record(
+                        "parse_error", f"dismiss contradicts itself: {reason}", ok=False
+                    )
+                    _feedback(
+                        messages,
+                        reply,
+                        terminal,
+                        "ERROR: your dismiss reason says the code IS vulnerable. If it is, "
+                        "answer with confirm(...) and a trace of lines you read; if it is "
+                        "safe, dismiss with the specific reason it is safe.",
+                    )
+                    continue
                 trajectory.record(
                     "verdict", f"dismiss: {reason}", tool="dismiss", args=terminal.args
                 )
@@ -189,14 +258,17 @@ def run_analyst(
 # ---------------------------------------------------------------------------
 
 
-def _task_prompt(c: Candidate, plan: InvestigationPlan, window_text: str, max_steps: int) -> str:
+def _task_prompt(
+    c: Candidate, plan: InvestigationPlan, window_text: str, max_steps: int, context: str = ""
+) -> str:
     return (
         "Flag from static analysis:\n"
         f"  file: {c.file}\n"
         f"  line: {c.line}\n"
         f"  suspected CWE: {c.cwe_hint or 'unknown'}\n"
         f"  rule: {c.rule}\n\n"
-        f"Investigation plan ({plan.origin}):\n{plan.render()}\n\n"
+        + (f"{context}\n\n" if context else "")
+        + f"Investigation plan ({plan.origin}):\n{plan.render()}\n\n"
         f"You have already read this window of {c.file} (each line is 'N | code'; "
         f"the flagged line is {c.line}):\n{window_text}\n\n"
         f"You have at most {max_steps} steps. {render_action_format()}"
@@ -306,14 +378,16 @@ def finding_from_verdict(
             )
         )
 
-    severity = _SEVERITY_ALIASES.get(str(args.get("severity", "")).strip().lower(), "medium")
-    confidence = min(1.0, max(0.0, _as_float(args.get("confidence"), default=0.5)))
+    model_severity = _SEVERITY_ALIASES.get(str(args.get("severity", "")).strip().lower(), "medium")
+    severity = severity_for(cwe, fallback=model_severity)
     title = str(args.get("title") or f"{cwe} in {file}")[:200]
     description = (str(args.get("description") or "") + anchored_note)[:4000]
     # Rung 2 = CWE + an evidence-backed source->sink trace (distinct read lines). The patch
     # slot stays empty until the fixer (3b-2); rung 3+ needs the graded verifier.
     distinct = {(t.file, t.line) for t in trace}
     rung = 2 if len(distinct) >= 2 else 1
+    cap = UNANCHORED_CONFIDENCE_CAP if anchored_note else CONFIDENCE_CAP[rung]
+    confidence = min(cap, max(0.0, _as_float(args.get("confidence"), default=0.5)))
     return (
         Finding(
             finding_id=finding_id_for(scan_id, target_id, file, line_start, cwe),

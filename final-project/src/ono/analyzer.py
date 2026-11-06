@@ -886,6 +886,7 @@ class ServiceAnalyzer(BaseAnalyzer):
             progress=self.report,
             stop_after=options.max_findings,
             min_rung=options.min_rung,
+            target_kind=target.kind,
         )
         self.last_report = report
         if report.not_reviewed:

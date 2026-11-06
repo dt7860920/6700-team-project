@@ -508,8 +508,10 @@ patch (patches arrive when the fixer agent is enabled). |
 
 * **✔ verified** - a deterministic checker (plain code, no model) confirmed the claim.
 * **⚠ not verified** - asserted by the analysis agents; treat it as a strong lead, not a proof.
-* **Severity** (critical / high / medium / low) is the impact if the flaw is real; \
-**confidence** is how sure the analysis is that it *is* real.
+* **Severity** (critical / high / medium / low) is the impact if the flaw is real. It comes \
+from a fixed table per CWE (so SQL injection is always critical), or from the model for CWEs \
+not in the table. **Confidence** is the model's own estimate that the flaw is real, capped \
+while nothing is verified: at most 50% at rung 1 and 80% at rung 2.
 * **Candidates** are the suspicious lines static analysis flags; the agents **confirm** or \
 **dismiss** each one. Only confirmed candidates become findings - dismissed ones are \
 listed in the activity log so you can see what was ruled out.
