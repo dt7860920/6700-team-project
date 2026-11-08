@@ -91,6 +91,8 @@ docker compose ps                              # wait for both services to be "h
 curl http://localhost:8080/health
 ```
 
+For the real model (`MODEL_BACKEND=service`), start from `.env.example.service` instead. It points the app at Ollama through `http://host.docker.internal:11434/v1` (`compose.yml` maps that name to the host): inside the container `localhost` is the container itself, which is why scans failed with "connection refused". Ollama must listen beyond loopback for this, e.g. `sudo systemctl edit ollama` → `Environment="OLLAMA_HOST=0.0.0.0"`, then `sudo systemctl restart ollama`; keep port 11434 closed in the security group. Each scan now checks the model endpoint first (`GET /models`, and that `MODEL_NAME` is served) and fails in seconds, before cloning, if it is down.
+
 From your laptop: `curl http://<FLOATING-IP>:8080/health`. For a deployment running `MODEL_BACKEND=mock`, you can also run `uv run scripts/golden_path.py --base-url http://<FLOATING-IP>:8080`. Don't use it against the `service` backend: it starts a real scan and requires a verified finding with a patch, which that backend can't produce until the verifier and fixer exist.
 
 `compose.yml` defines **two services** and publishes **one port** (8080): the app, and the sandbox **Executor** (see [The sandbox Executor](#the-sandbox-executor-step-3a)) on an `internal: true` network with no `ports:` block. There is deliberately no database in the skeleton — scan state is in-memory. When the findings DB, threat-intel cache, and vLLM join the stack they are added the same way, as internal services *without* `ports:`, so the published surface stays exactly `:8080`.
