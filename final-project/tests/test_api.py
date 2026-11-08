@@ -130,6 +130,19 @@ def test_scan_roundtrip_via_get_endpoints(client: TestClient) -> None:
     assert one.json()["cwe"] == "CWE-89"
 
 
+def test_rescanning_a_target_keeps_each_scans_findings_addressable(client: TestClient) -> None:
+    """Issue #37: a second scan of the same target must not overwrite the first's findings."""
+    first = start_and_wait(client, {"target_id": "vulpy"})["scan_id"]
+    second = start_and_wait(client, {"target_id": "vulpy"})["scan_id"]
+    (f1,) = client.get(f"/scans/{first}/findings").json()
+    (f2,) = client.get(f"/scans/{second}/findings").json()
+
+    assert f1["finding_id"] != f2["finding_id"]
+    assert f1["fingerprint"] == f2["fingerprint"] != ""  # same sink, matchable across scans
+    assert client.get(f"/findings/{f1['finding_id']}").json()["scan_id"] == first
+    assert client.get(f"/findings/{f2['finding_id']}").json()["scan_id"] == second
+
+
 def test_unknown_scan_and_finding_are_404(client: TestClient) -> None:
     assert client.get("/scans/scn_nope").status_code == 404
     assert client.get("/scans/scn_nope/findings").status_code == 404

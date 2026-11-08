@@ -49,10 +49,15 @@ def test_pygoat_golden_path(analyzer: MockAnalyzer, registry: TargetRegistry) ->
     assert "+++ b/introduction/views.py" in sqli.patch_diff
 
 
-def test_finding_ids_are_deterministic(analyzer: MockAnalyzer, registry: TargetRegistry) -> None:
+def test_finding_ids_are_unique_per_scan_fingerprints_stable(
+    analyzer: MockAnalyzer, registry: TargetRegistry
+) -> None:
     a = analyzer.run("scn_a", registry["pygoat"], ScanOptions()).findings
     b = analyzer.run("scn_b", registry["pygoat"], ScanOptions()).findings
-    assert [f.finding_id for f in a] == [f.finding_id for f in b]
+    again = analyzer.run("scn_a", registry["pygoat"], ScanOptions()).findings
+    assert [f.fingerprint for f in a] == [f.fingerprint for f in b]
+    assert not {f.finding_id for f in a} & {f.finding_id for f in b}
+    assert [f.finding_id for f in a] == [f.finding_id for f in again]  # deterministic per scan
 
 
 def test_options_filter_findings(analyzer: MockAnalyzer, registry: TargetRegistry) -> None:

@@ -52,6 +52,7 @@ from ono.models import (
     StageResult,
     TraceStep,
     finding_id_for,
+    fingerprint_for,
 )
 from ono.orchestrator import DetectionOrchestrator, DetectionReport, ExecutorProvider
 from ono.progress import NullProgress, ProgressSink
@@ -395,7 +396,8 @@ def _canned_findings(target_id: str, scan_id: str) -> list[Finding]:
         detection_rule: str | None = None,
     ) -> Finding:
         return Finding(
-            finding_id=finding_id_for(target_id, file, line_range[0], cwe),
+            finding_id=finding_id_for(scan_id, target_id, file, line_range[0], cwe),
+            fingerprint=fingerprint_for(target_id, file, line_range[0], cwe),
             scan_id=scan_id,
             target_id=target_id,
             title=title,
@@ -602,7 +604,8 @@ def _finding_from_snippet_candidate(scan_id: str, target_id: str, c: Candidate) 
         f"+{_indent_of(c.excerpt)}# TODO: {_SNIPPET_FIXES[c.cwe_hint]}\n"
     )
     return Finding(
-        finding_id=finding_id_for(target_id, c.file, c.line, c.cwe_hint),
+        finding_id=finding_id_for(scan_id, target_id, c.file, c.line, c.cwe_hint),
+        fingerprint=fingerprint_for(target_id, c.file, c.line, c.cwe_hint),
         scan_id=scan_id,
         target_id=target_id,
         title=_SNIPPET_TITLES[c.cwe_hint],

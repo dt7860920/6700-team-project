@@ -35,10 +35,21 @@ def utcnow() -> datetime:
     return datetime.now(tz=UTC)
 
 
-def finding_id_for(target_id: str, file: str, line: int, cwe: str) -> str:
-    """Stable id so the same (target, sink) yields the same finding across runs."""
-    digest = hashlib.sha1(f"{target_id}|{file}|{line}|{cwe}".encode()).hexdigest()
-    return f"fnd_{digest[:10]}"
+def fingerprint_for(target_id: str, file: str, line: int, cwe: str) -> str:
+    """Stable across runs: the same (target, sink, CWE) always gets the same fingerprint.
+
+    Use it to match one weakness between scans (e.g. "was this fixed since last week?").
+    It is *not* an address - two scans of one target share it - so lookups use
+    :func:`finding_id_for`.
+    """
+    return hashlib.sha1(f"{target_id}|{file}|{line}|{cwe}".encode()).hexdigest()[:16]
+
+
+def finding_id_for(scan_id: str, target_id: str, file: str, line: int, cwe: str) -> str:
+    """Unique per scan, so re-scanning a target never overwrites an earlier scan's finding."""
+    fingerprint = fingerprint_for(target_id, file, line, cwe)
+    digest = hashlib.sha1(f"{scan_id}|{fingerprint}".encode()).hexdigest()
+    return f"fnd_{digest[:12]}"
 
 
 # ---------------------------------------------------------------------------
@@ -94,7 +105,18 @@ class TraceStep(BaseModel):
 class Finding(BaseModel):
     """A single vulnerability finding, shaped by the output-strength ladder."""
 
-    finding_id: str = Field(examples=["fnd_3a9f1c2b7e"])
+    finding_id: str = Field(
+        examples=["fnd_3a9f1c2b7e04"],
+        description="Unique per scan; the key for GET /findings/{finding_id}.",
+    )
+    fingerprint: str = Field(
+        default="",
+        examples=["5d2c0a9e1f3b7c44"],
+        description=(
+            "Same value for the same (target, file, line, CWE) in every scan: use it to "
+            "match a finding across scans. Not unique - do not use it to look findings up."
+        ),
+    )
     scan_id: str
     target_id: str
     title: str
