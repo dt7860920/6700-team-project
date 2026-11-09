@@ -44,6 +44,7 @@ from ono.agents.model import ChatModel, ModelClient, ModelError
 from ono.config import Settings
 from ono.errors import PipelineError
 from ono.executor.client import ExecutorClient
+from ono.metrics import Metrics
 from ono.models import (
     Finding,
     ScanOptions,
@@ -90,6 +91,11 @@ class AnalysisResult:
 
     findings: list[Finding]
     stages: list[StageResult] = field(default_factory=list)
+    # What the verify stage did with the raw findings (feeds ono_verifier_results_total):
+    # a verdict of true, dropped, or passed through without a verdict (see metrics.py).
+    verifier_passed: int = 0
+    verifier_failed: int = 0
+    verifier_skipped: int = 0
 
     @property
     def summary(self) -> str:
@@ -180,7 +186,14 @@ class BaseAnalyzer(ABC):
             note(f"{len(verified)} passed the verifier")
 
         findings = [f for f in verified if f.rung >= options.min_rung][: options.max_findings]
-        return AnalysisResult(findings=findings, stages=stages)
+        passed = sum(1 for f in verified if f.verified)
+        return AnalysisResult(
+            findings=findings,
+            stages=stages,
+            verifier_passed=passed,
+            verifier_failed=max(0, len(raw) - len(verified)),
+            verifier_skipped=len(verified) - passed,
+        )
 
     @contextmanager
     def _timed(self, stage: StageName, sink: list[StageResult]) -> Iterator[Callable[[str], None]]:
@@ -670,13 +683,18 @@ class ServiceAnalyzer(BaseAnalyzer):
         *,
         model: ChatModel | None = None,
         executor: ExecutorProvider | None = None,
+        metrics: Metrics | None = None,
     ) -> None:
         super().__init__(settings)
         if not settings.model_service_url:  # Settings already validates this; be explicit.
             msg = "ServiceAnalyzer requires settings.model_service_url"
             raise ValueError(msg)
         self.base_url = settings.model_service_url.rstrip("/")
-        self.model: ChatModel = model if model is not None else ModelClient(settings)
+        # Only the real client reports model latency/tokens; an injected ChatModel (tests,
+        # a future in-box vLLM client) is left as given.
+        self.model: ChatModel = (
+            model if model is not None else ModelClient(settings, metrics=metrics)
+        )
         if executor is None:
             if settings.executor_token is None or not settings.executor_token.get_secret_value():
                 msg = (
@@ -812,12 +830,16 @@ class ServiceAnalyzer(BaseAnalyzer):
 # ---------------------------------------------------------------------------
 
 
-def build_analyzer(settings: Settings) -> BaseAnalyzer:
-    """Select the analyzer backend from settings."""
+def build_analyzer(settings: Settings, *, metrics: Metrics | None = None) -> BaseAnalyzer:
+    """Select the analyzer backend from settings.
+
+    ``metrics`` (when collection is enabled) reaches the shared model client so it can
+    report request latency and token counts; the mock backend makes no model calls.
+    """
     if settings.model_backend == "mock":
         return MockAnalyzer(settings)
     if settings.model_backend == "service":
-        return ServiceAnalyzer(settings)
+        return ServiceAnalyzer(settings, metrics=metrics)
     # TODO(D3): LocalAnalyzer - the same pipeline against an in-box vLLM.
     msg = (
         f"model_backend={settings.model_backend!r} is not implemented yet; "

@@ -30,6 +30,7 @@ from datetime import datetime
 from ono.analyzer import BaseAnalyzer
 from ono.config import Settings
 from ono.errors import PipelineError, ScanBusyError
+from ono.metrics import Metrics
 from ono.models import (
     Finding,
     ProgressEvent,
@@ -79,6 +80,7 @@ class ScanService:
         registry: TargetRegistry,
         analyzer: BaseAnalyzer,
         store: ScanStore,
+        metrics: Metrics | None = None,
     ) -> None:
         self.settings = settings
         self.registry = registry
@@ -94,6 +96,10 @@ class ScanService:
         self._queued: set[str] = set()
         self._futures: dict[str, Future[None]] = {}
         self._closed = False
+        # Prometheus collectors (None = metrics disabled). Every hook is a counter
+        # increment or a gauge set - never I/O - so they are safe under the lock and on
+        # the event loop, and they change nothing about how a scan runs.
+        self._metrics = metrics
 
     # -- Public API ---------------------------------------------------------------
     @property
@@ -128,6 +134,7 @@ class ScanService:
             self._futures[scan.scan_id] = self._pool.submit(
                 self._worker, scan.scan_id, target, request
             )
+            self._publish_inflight()
         log.info(
             "scan %s queued for target %s (backend=%s; %d running, %d queued)",
             scan.scan_id,
@@ -192,10 +199,16 @@ class ScanService:
         self.store.put_scan(scan, [])
         return scan
 
+    def _publish_inflight(self) -> None:
+        """Refresh the active/queued gauges. Call with ``self._lock`` held."""
+        if self._metrics is not None:
+            self._metrics.set_inflight(active=len(self._running), queued=len(self._queued))
+
     def _worker(self, scan_id: str, target: Target, request: ScanRequest) -> None:
         with self._lock:
             self._queued.discard(scan_id)
             self._running.add(scan_id)
+            self._publish_inflight()
         try:
             self._execute(scan_id, target, request)
         except Exception:  # _execute reports every failure into the record; belt and braces
@@ -204,6 +217,7 @@ class ScanService:
             with self._lock:
                 self._running.discard(scan_id)
                 self._futures.pop(scan_id, None)
+                self._publish_inflight()
 
     def _execute(
         self, scan_id: str, target: Target, request: ScanRequest
@@ -237,6 +251,12 @@ class ScanService:
             scan = self._finish(scan_id, status="failed", message=message)
             return scan, []
 
+        if self._metrics is not None:
+            self._metrics.verifier_results(
+                passed=result.verifier_passed,
+                failed=result.verifier_failed,
+                skipped=result.verifier_skipped,
+            )
         findings = result.findings
         scan = self._finish(
             scan_id,
@@ -281,4 +301,6 @@ class ScanService:
             msg = f"scan {scan_id!r} disappeared from the store"
             raise RuntimeError(msg)
         self.store.put_scan(updated, findings)
+        if self._metrics is not None:
+            self._metrics.scan_finished(updated, findings)
         return updated

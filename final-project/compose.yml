@@ -21,6 +21,16 @@
 # internal network, validates every input, and runs nothing untrusted itself - all
 # untrusted code runs inside the jails it creates. The findings DB / threat-intel
 # cache / vLLM (later steps) join as further internal services without `ports:`.
+#
+# Optional profile `observability` (plan §8.6 layer 2): Prometheus scrapes the app's
+# /metrics from inside the network and Grafana shows the provisioned dashboard. Both
+# are OFF by default and, when on, bind to the host's loopback only - they are for
+# in-box / SSH-tunnel use and do not widen the published surface (still just :8080).
+#
+#   docker compose --profile observability up -d --build
+#   open http://127.0.0.1:3000     # Grafana (admin / $GRAFANA_ADMIN_PASSWORD, default "admin")
+#
+# See observability/README.md for what each metric means.
 
 services:
   app:
@@ -101,6 +111,59 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
+
+  # -- Optional observability profile (off unless --profile observability) ------------
+  prometheus:
+    image: prom/prometheus:v3.4.1
+    container_name: ono-prometheus
+    profiles: ["observability"]
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=15d
+      - --web.enable-lifecycle
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "127.0.0.1:9090:9090"   # loopback only: in-box / SSH tunnel, never public
+    networks:
+      - default                 # reaches app:8080; nothing on the internal network
+    depends_on:
+      - app
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+
+  grafana:
+    image: grafana/grafana-oss:12.0.2
+    container_name: ono-grafana
+    profiles: ["observability"]
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/ono.json
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "127.0.0.1:3000:3000"   # loopback only: in-box / SSH tunnel, never public
+    networks:
+      - default
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  prometheus-data:
+  grafana-data:
 
 networks:
   default:

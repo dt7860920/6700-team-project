@@ -113,6 +113,7 @@ Interactive documentation is generated from the code at **`/docs`** (Swagger UI)
 | `GET` | `/scans/{scan_id}/findings` | Findings for a scan (empty until it is `done`) |
 | `GET` | `/findings/{finding_id}` | One finding. `finding_id` is unique per scan; the `fingerprint` field is the same for the same sink across scans, so use it to compare scans |
 | `GET` | `/ui` | Gradio analyst UI (`/` redirects here) — see [The analyst UI](#the-analyst-ui-handoff-surface) |
+| `GET` | `/metrics` | Prometheus text exposition (scan counts/durations, findings by severity/rung/verdict, verifier results, worker-pool gauges, model latency/tokens). Internal: not in the OpenAPI schema, unauthenticated, 404 when `METRICS_ENABLED=false` — see [Observability](#observability-prometheus--grafana-opt-in) |
 
 ```bash
 BASE=http://localhost:8080
@@ -171,6 +172,19 @@ The UI works unchanged on both backends: `mock` finishes in milliseconds (good f
 
 ---
 
+## Observability: Prometheus + Grafana (opt-in)
+
+The app always exposes `GET /metrics` (unless `METRICS_ENABLED=false`): `ono_scans_total{target,status}`, `ono_scan_duration_seconds`, `ono_findings_total{severity,rung,verified}`, `ono_verifier_results_total{result}`, `ono_active_scans` / `ono_queued_scans`, and from the shared model client `ono_model_requests_total{outcome}`, `ono_model_latency_seconds`, `ono_model_tokens_total{kind}` — counts and timings only, never scan ids, paths, code or prompts. An optional Compose **profile** brings up Prometheus (scraping the app every 15 s over the internal network) and Grafana with a provisioned dashboard:
+
+```bash
+docker compose --profile observability up -d --build      # or: make observability-up
+open http://127.0.0.1:3000                                 # Grafana, admin / $GRAFANA_ADMIN_PASSWORD (default admin)
+```
+
+Both UIs bind to the host's **loopback only** — reach them in-box or over an SSH tunnel; port 8080 stays the only published port. Metric definitions, the dashboard's panels and the TTFT caveat are in [`observability/README.md`](observability/README.md).
+
+---
+
 ## Configuration
 
 All configuration is read by `ono.config.Settings` (pydantic-settings) from environment variables or a `.env` file. Three profiles ship: `.env.example.local`, `.env.example.production`, and `.env.example.service` (real model via Ollama, see below). Invalid values fail fast at startup.
@@ -188,6 +202,7 @@ All configuration is read by `ono.config.Settings` (pydantic-settings) from envi
 | `MAX_VERIFIER_RETRIES` | `3` | 1–5. Reserved cap for the verifier self-correction loop, which is not built yet (3b-2) |
 | `MAX_ACTIVE_SCANS` | `2` | 1–16. Scans that run at the same time (background worker threads). Each holds a model session and, on `service`, one sandbox |
 | `MAX_QUEUED_SCANS` | `8` | 0–100. Scans allowed to wait for a worker; beyond this `POST /scans` answers 429 (busy) |
+| `METRICS_ENABLED` | `true` | Expose Prometheus metrics at `GET /metrics` (unauthenticated, meant to be scraped in-box). `false` = no route (404) and nothing is collected |
 | `UI_POLL_INTERVAL_S` | `1.0` | 0.2–10. How often the UI refreshes a running scan's status card |
 | `UI_POLL_TIMEOUT_S` | `3600` | 30–86400. How long the UI keeps watching one scan (the scan itself continues; "Look up a scan by id" picks it up again) |
 | `WORKSPACE_DIR` | `.ono-workspace` | Per-scan clone workspaces (`<dir>/<scan_id>/`), removed when each scan ends. Must be writable; the image sets `/tmp/ono-workspace` |
@@ -248,6 +263,7 @@ final-project/
 │   ├── models.py       Pydantic schemas: ScanRequest, Finding, Scan, ScanResponse, ...
 │   ├── targets.py      TargetRegistry (exact allowlist) + targets.yaml
 │   ├── store.py        ScanStore protocol + in-memory implementation
+│   ├── metrics.py      Prometheus collectors (one registry per app) + the helpers that move them
 │   ├── config.py       Settings (pydantic-settings)
 │   ├── __main__.py     `ono` / `python -m ono` entrypoint (uvicorn)
 │   └── executor/       step 3a: the sandboxed "hands" (separate, internal-only service)
@@ -267,6 +283,7 @@ final-project/
 │   └── test_orchestrator_docker.py  REAL-jail end-to-end run of the detection core, model scripted (`-m docker`)
 ├── scripts/golden_path.py   smoke heartbeat (live server or --in-process)
 ├── docs/               project plan and Deliverable 2 write-up
+├── observability/      opt-in Prometheus scrape config + Grafana provisioning/dashboard (compose profile)
 ├── Dockerfile · compose.yml · .dockerignore
 ├── .env.example.local · .env.example.production · .env.example.service
 ├── .github/workflows/ci.yml   ruff + mypy + pytest + docker build/health (not active from this subfolder)
