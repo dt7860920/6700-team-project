@@ -21,26 +21,29 @@ const SEV_ACCENT: Record<Finding["severity"], string> = {
 export function FindingCard({ finding }: { finding: Finding }) {
   const [showPatch, setShowPatch] = useState(false);
   const [showRule, setShowRule] = useState(false);
+  const critical = finding.severity === "critical";
 
   return (
     <article
-      className={`card relative overflow-hidden pl-6 before:absolute before:inset-y-0 before:left-0 before:w-1 ${SEV_ACCENT[finding.severity]}`}
+      className={`card relative overflow-hidden pl-6 transition hover:shadow-lift before:absolute before:inset-y-0 before:left-0 before:w-1 ${SEV_ACCENT[finding.severity]} ${
+        critical ? "ring-1 ring-sev-critical/15" : ""
+      }`}
     >
       <div className="flex flex-wrap items-center gap-2">
-        <CweBadge cwe={finding.cwe} />
         <SeverityBadge severity={finding.severity} />
+        <CweBadge cwe={finding.cwe} />
         <RungBadge rung={finding.rung} />
         <VerifiedBadge verified={finding.verified} />
         <ConfidenceBadge confidence={finding.confidence} />
       </div>
 
-      <h3 className="mt-3 text-lg font-semibold text-ink">{finding.title}</h3>
-      <div className="mt-1 font-mono text-sm text-muted">
+      <h3 className="mt-3 text-lg font-semibold leading-snug text-ink">{finding.title}</h3>
+      <div className="mt-1 font-mono text-xs text-faint">
         {locationOf(finding.file, finding.line_range)}
       </div>
 
       {finding.description && (
-        <p className="mt-3 text-sm leading-relaxed text-ink/80">{finding.description}</p>
+        <p className="mt-3 text-sm leading-relaxed text-muted">{finding.description}</p>
       )}
 
       <Trace steps={finding.trace} />
@@ -48,7 +51,7 @@ export function FindingCard({ finding }: { finding: Finding }) {
       {finding.patch_diff && (
         <div className="mt-4">
           <button
-            className="btn-ghost text-xs"
+            className="btn-ghost px-3 py-1.5 text-xs"
             onClick={() => setShowPatch((v) => !v)}
             aria-expanded={showPatch}
           >
@@ -61,14 +64,14 @@ export function FindingCard({ finding }: { finding: Finding }) {
       {finding.detection_rule && (
         <div className="mt-3">
           <button
-            className="btn-ghost text-xs"
+            className="btn-ghost px-3 py-1.5 text-xs"
             onClick={() => setShowRule((v) => !v)}
             aria-expanded={showRule}
           >
             {showRule ? "▾ Hide detection rule" : "▸ Detection rule (rung 5)"}
           </button>
           {showRule && (
-            <pre className="mt-2 overflow-x-auto rounded-lg border border-edge bg-ground p-3 font-mono text-xs">
+            <pre className="mt-2 overflow-x-auto rounded-lg border border-border bg-sand p-3 font-mono text-xs text-body">
               <code>{finding.detection_rule}</code>
             </pre>
           )}

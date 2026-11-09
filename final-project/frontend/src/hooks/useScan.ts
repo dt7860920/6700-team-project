@@ -89,5 +89,34 @@ export function useScan() {
     [poll],
   );
 
-  return { ...state, start, reset };
+  const load = useCallback(
+    async (scanId: string) => {
+      cancelled.current = false;
+      clearTimer();
+      setState({ phase: "running", scan: null, findings: [], error: null });
+      try {
+        const scan = await api.getScan(scanId);
+        if (cancelled.current) return;
+        if (isTerminal(scan.status)) {
+          const findings = scan.status === "done" ? await api.getFindings(scanId) : [];
+          if (cancelled.current) return;
+          setState({
+            phase: scan.status === "done" ? "done" : "failed",
+            scan,
+            findings,
+            error: scan.status === "failed" ? scan.message || "Scan failed." : null,
+          });
+        } else {
+          setState({ phase: "running", scan, findings: [], error: null });
+          poll(scanId);
+        }
+      } catch (err) {
+        const detail = err instanceof ApiError ? err.detail : "Could not load that scan.";
+        setState({ phase: "error", scan: null, findings: [], error: detail });
+      }
+    },
+    [poll],
+  );
+
+  return { ...state, start, load, reset };
 }

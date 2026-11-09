@@ -11,17 +11,17 @@ export function Trace({ steps }: { steps: TraceStep[] }) {
         {steps.map((step, i) => (
           <li key={`${step.file}:${step.line}:${i}`} className="flex gap-3">
             <div className="flex flex-col items-center">
-              <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full border border-edge bg-ground text-[10px] text-muted">
+              <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full border border-border bg-sand text-[10px] text-muted">
                 {i + 1}
               </span>
-              {i < steps.length - 1 && <span className="w-px flex-1 bg-edge" />}
+              {i < steps.length - 1 && <span className="w-px flex-1 bg-border2" />}
             </div>
             <div className="pb-1">
               <div className="font-mono text-xs text-ink">
                 {step.file}:{step.line}{" "}
-                <span className="text-indigo-300">{step.symbol}</span>
+                <span className="text-claydeep">{step.symbol}</span>
               </div>
-              {step.note && <div className="text-xs text-muted">{step.note}</div>}
+              {step.note && <div className="text-xs text-faint">{step.note}</div>}
             </div>
           </li>
         ))}
