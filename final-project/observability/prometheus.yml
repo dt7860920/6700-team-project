@@ -1,0 +1,31 @@
+# Prometheus scrape config for the optional observability profile (compose.yml).
+#
+# Prometheus runs INSIDE the Compose network and reaches the app by service name; the
+# app's /metrics endpoint is unauthenticated because only :8080 is ever published and
+# this scrape never leaves the box. See observability/README.md.
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: ono
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["app:8080"]
+        labels:
+          service: ono-app
+
+  # Prometheus about itself (handy to confirm the stack is alive).
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # TODO(metrics): when the model runs in-box behind vLLM (MODEL_BACKEND=local), add its
+  # /metrics - it carries the time-to-first-token histogram the app cannot observe
+  # with non-streaming calls (vllm:time_to_first_token_seconds_bucket) plus KV-cache
+  # and queue depth. The host is reachable as host.docker.internal from the stack.
+  #
+  # - job_name: vllm
+  #   static_configs:
+  #     - targets: ["host.docker.internal:8000"]

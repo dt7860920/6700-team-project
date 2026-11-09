@@ -11,6 +11,8 @@ One process, one published port (8080). OpenAPI docs live at ``/docs``.
     GET  /scans/{scan_id}/findings   findings for a scan (so far)
     GET  /findings/{finding_id}      one finding
     GET  /ui                         Gradio analyst UI  (``/`` redirects here)
+    GET  /metrics                    Prometheus text exposition (``metrics_enabled``; not
+                                     in the OpenAPI schema, unauthenticated, scrape in-box)
 """
 
 from __future__ import annotations
@@ -21,13 +23,14 @@ from contextlib import asynccontextmanager
 from typing import Annotated
 
 import gradio as gr
-from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.responses import JSONResponse, RedirectResponse
 
 from ono import __version__
 from ono.analyzer import build_analyzer
 from ono.config import Settings, configure_logging, get_settings
 from ono.errors import ScanBusyError
+from ono.metrics import TEXT_CONTENT_TYPE, build_metrics
 from ono.models import (
     ErrorResponse,
     Finding,
@@ -67,11 +70,17 @@ def create_app(
     registry = registry or get_registry()
     configure_logging(settings)
 
+    # One registry per app (None when metrics_enabled is false: nothing is collected).
+    metrics = build_metrics(settings)
+    if metrics is not None:
+        metrics.describe_build(version=__version__, model_backend=settings.model_backend)
+
     service = ScanService(
         settings=settings,
         registry=registry,
-        analyzer=build_analyzer(settings),
+        analyzer=build_analyzer(settings, metrics=metrics),
         store=InMemoryScanStore(),
+        metrics=metrics,
     )
 
     @asynccontextmanager
@@ -105,6 +114,7 @@ def create_app(
     )
     app.state.settings = settings
     app.state.service = service
+    app.state.metrics = metrics
 
     # -- Error mapping ----------------------------------------------------
     @app.exception_handler(UnauthorizedTargetError)
@@ -208,6 +218,17 @@ def create_app(
         if finding is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, f"finding {finding_id!r} not found")
         return finding
+
+    # -- metrics ----------------------------------------------------------
+    # Registered only when enabled, so a disabled deployment answers 404 like any
+    # unknown path. Internal by design: not in the OpenAPI schema, no auth (only :8080
+    # is published and Prometheus scrapes it from inside the Compose network).
+    if metrics is not None:
+        exposed = metrics  # narrowed for the closure
+
+        @app.get("/metrics", include_in_schema=False)
+        async def prometheus_metrics() -> Response:
+            return Response(content=exposed.render(), media_type=TEXT_CONTENT_TYPE)
 
     # -- UI ---------------------------------------------------------------
     @app.get("/", include_in_schema=False)

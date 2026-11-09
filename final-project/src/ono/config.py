@@ -114,6 +114,17 @@ class Settings(BaseSettings):
         ),
     )
 
+    # -- Observability (plan §8.6, layer 2) ------------------------------------------
+    metrics_enabled: bool = Field(
+        default=True,
+        description=(
+            "Expose Prometheus metrics at GET /metrics (scan counts and durations, findings "
+            "by severity/rung/verdict, verifier results, worker-pool gauges, model latency and "
+            "tokens). The endpoint is unauthenticated and meant to be scraped in-box on the "
+            "one published port. False = no /metrics route and nothing is collected."
+        ),
+    )
+
     # -- Ingest + SAST (service / local backends; the mock backend ignores these) ----
     workspace_dir: Path = Field(
         default=Path(".ono-workspace"),
