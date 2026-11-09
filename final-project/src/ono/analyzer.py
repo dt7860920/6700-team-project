@@ -90,10 +90,16 @@ class AnalysisResult:
 
     findings: list[Finding]
     stages: list[StageResult] = field(default_factory=list)
+    candidate_count: int | None = None
 
     @property
     def summary(self) -> str:
         n = len(self.findings)
+        if self.candidate_count == 0:
+            return (
+                "0 findings: static analysis found no candidates; "
+                "model analysis and verification were skipped"
+            )
         return f"{n} verified finding{'s' if n != 1 else ''}"
 
 
@@ -164,6 +170,16 @@ class BaseAnalyzer(ABC):
             candidates = self.sast_shortlist(target, options)
             note(f"{len(candidates)} candidate(s)")
 
+        if not candidates:
+            reason = "no candidates from static analysis"
+            for stage in ("plan", "analyze", "verify"):
+                skipped = StageResult(
+                    stage=stage, status="skipped", duration_ms=0, summary=reason
+                )
+                stages.append(skipped)
+                self._progress.stage(skipped)
+            return AnalysisResult(findings=[], stages=stages, candidate_count=0)
+
         with self._timed("plan", stages) as note:
             self.report(f"Planning the investigation of {len(candidates)} candidate(s)")
             plan = self.plan(target, candidates)
@@ -180,7 +196,7 @@ class BaseAnalyzer(ABC):
             note(f"{len(verified)} passed the verifier")
 
         findings = [f for f in verified if f.rung >= options.min_rung][: options.max_findings]
-        return AnalysisResult(findings=findings, stages=stages)
+        return AnalysisResult(findings=findings, stages=stages, candidate_count=len(candidates))
 
     @contextmanager
     def _timed(self, stage: StageName, sink: list[StageResult]) -> Iterator[Callable[[str], None]]:
