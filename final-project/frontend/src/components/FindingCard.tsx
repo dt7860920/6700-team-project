@@ -11,24 +11,12 @@ import {
 import { DiffView } from "./DiffView";
 import { Trace } from "./Trace";
 
-const SEV_ACCENT: Record<Finding["severity"], string> = {
-  low: "before:bg-sev-low",
-  medium: "before:bg-sev-medium",
-  high: "before:bg-sev-high",
-  critical: "before:bg-sev-critical",
-};
-
 export function FindingCard({ finding }: { finding: Finding }) {
   const [showPatch, setShowPatch] = useState(false);
   const [showRule, setShowRule] = useState(false);
-  const critical = finding.severity === "critical";
 
   return (
-    <article
-      className={`card relative overflow-hidden pl-6 transition hover:shadow-lift before:absolute before:inset-y-0 before:left-0 before:w-1 ${SEV_ACCENT[finding.severity]} ${
-        critical ? "ring-1 ring-sev-critical/15" : ""
-      }`}
-    >
+    <article className="card transition hover:shadow-lift">
       <div className="flex flex-wrap items-center gap-2">
         <SeverityBadge severity={finding.severity} />
         <CweBadge cwe={finding.cwe} />
@@ -37,13 +25,17 @@ export function FindingCard({ finding }: { finding: Finding }) {
         <ConfidenceBadge confidence={finding.confidence} />
       </div>
 
-      <h3 className="mt-3 text-lg font-semibold leading-snug text-ink">{finding.title}</h3>
+      <h3 className="mt-3 max-w-[70ch] text-lg font-semibold leading-snug text-ink">
+        {finding.title}
+      </h3>
       <div className="mt-1 font-mono text-xs text-faint">
         {locationOf(finding.file, finding.line_range)}
       </div>
 
       {finding.description && (
-        <p className="mt-3 text-sm leading-relaxed text-muted">{finding.description}</p>
+        <p className="mt-3 max-w-[58ch] text-pretty text-sm leading-relaxed text-muted">
+          {finding.description}
+        </p>
       )}
 
       <Trace steps={finding.trace} />

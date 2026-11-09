@@ -27,7 +27,7 @@ export default {
       },
       fontFamily: {
         serif: ['"Source Serif 4"', "Georgia", '"Times New Roman"', "serif"],
-        sans: ["Inter", "ui-sans-serif", "system-ui", "-apple-system", "sans-serif"],
+        sans: ['"Hanken Grotesk"', "ui-sans-serif", "system-ui", "-apple-system", "sans-serif"],
         mono: ["ui-monospace", "SFMono-Regular", "Menlo", "monospace"],
       },
       boxShadow: {

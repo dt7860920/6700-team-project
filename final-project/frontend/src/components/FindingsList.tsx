@@ -40,16 +40,16 @@ function Summary({ findings }: { findings: Finding[] }) {
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
           <div className="eyebrow">Repository posture</div>
-          <div className="mt-1.5 text-lg font-semibold text-ink">
+          <h2 className="mt-1.5 font-sans text-lg font-semibold text-ink">
             {findings.length} finding{findings.length === 1 ? "" : "s"}
             <span className="ml-2 font-mono text-xs font-normal text-muted">
               {bySev.map(([s, n]) => `${n} ${s}`).join(" · ")}
             </span>
-          </div>
+          </h2>
         </div>
         <PostureStrip findings={findings} />
       </div>
-      <div className="mt-3 flex items-center gap-2 border-t border-border pt-3 font-mono text-[11px] text-faint">
+      <div className="mt-3 flex items-center gap-2 border-t border-border pt-3 font-mono text-xs text-faint">
         <span className={verified > 0 ? "text-ok" : "text-sev-medium"}>●</span>
         {verified > 0
           ? `${verified} of ${findings.length} verified by the deterministic verifier`

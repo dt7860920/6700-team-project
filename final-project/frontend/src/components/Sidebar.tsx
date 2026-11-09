@@ -1,11 +1,12 @@
-import type { InfoResponse, ScanStatus } from "../api/types";
+import type { ScanStatus } from "../api/types";
 import { Logo } from "./Logo";
 
 export interface ScanSummary {
   scan_id: string;
-  target_id: string;
+  name: string; // friendly target name (resolved at creation)
   status: ScanStatus;
   created_at: string;
+  findings_count: number;
 }
 
 const STATUS_DOT: Record<ScanStatus, string> = {
@@ -14,6 +15,14 @@ const STATUS_DOT: Record<ScanStatus, string> = {
   done: "bg-ok",
   failed: "bg-sev-critical",
 };
+
+function subtitle(s: ScanSummary): string {
+  const t = relTime(s.created_at);
+  if (s.status === "running" || s.status === "queued") return `scanning… · ${t}`;
+  if (s.status === "failed") return `failed · ${t}`;
+  const n = s.findings_count;
+  return `${n} finding${n === 1 ? "" : "s"} · ${t}`;
+}
 
 function relTime(iso: string): string {
   const diff = Date.now() - new Date(iso).getTime();
@@ -26,24 +35,27 @@ function relTime(iso: string): string {
 }
 
 interface Props {
-  info: InfoResponse | null;
   history: ScanSummary[];
   activeScanId: string | null;
   onNew: () => void;
   onSelect: (scanId: string) => void;
 }
 
-export function Sidebar({ info, history, activeScanId, onNew, onSelect }: Props) {
+export function Sidebar({ history, activeScanId, onNew, onSelect }: Props) {
   return (
     <aside className="flex w-64 shrink-0 flex-col border-r border-border bg-sand">
       {/* brand */}
-      <div className="flex items-center gap-2.5 px-4 py-4">
+      <button
+        className="flex items-center gap-2.5 px-4 py-4 text-left"
+        onClick={onNew}
+        title="Operation: Negative One"
+      >
         <Logo size={24} className="text-clay" />
         <div className="leading-tight">
           <div className="font-serif text-[15px] font-semibold text-ink">Negative One</div>
           <div className="text-xs text-muted">Security workbench</div>
         </div>
-      </div>
+      </button>
 
       <div className="px-3 pb-3">
         <button className="btn-soft w-full justify-start" onClick={onNew}>
@@ -51,10 +63,10 @@ export function Sidebar({ info, history, activeScanId, onNew, onSelect }: Props)
         </button>
       </div>
 
-      {/* history */}
+      {/* recents */}
       <div className="flex min-h-0 flex-1 flex-col px-3">
         <div className="px-1 pb-2 text-xs font-medium uppercase tracking-wide text-faint">
-          Recents
+          Recent scans
         </div>
         <div className="min-h-0 flex-1 space-y-0.5 overflow-y-auto pb-3">
           {history.length === 0 ? (
@@ -72,12 +84,8 @@ export function Sidebar({ info, history, activeScanId, onNew, onSelect }: Props)
                 >
                   <span className={`h-2 w-2 shrink-0 rounded-full ${STATUS_DOT[s.status]}`} />
                   <span className="min-w-0 flex-1">
-                    <span className="block truncate text-[13px] font-medium text-ink">
-                      {s.target_id}
-                    </span>
-                    <span className="block truncate font-mono text-xs text-faint">
-                      {s.scan_id} · {relTime(s.created_at)}
-                    </span>
+                    <span className="block truncate text-[13px] font-medium text-ink">{s.name}</span>
+                    <span className="block truncate text-xs text-faint">{subtitle(s)}</span>
                   </span>
                 </button>
               );
@@ -85,18 +93,6 @@ export function Sidebar({ info, history, activeScanId, onNew, onSelect }: Props)
           )}
         </div>
       </div>
-
-      {/* footer */}
-      {info && (
-        <div className="border-t border-border px-4 py-3 text-xs leading-relaxed text-muted">
-          <div className="truncate" title={info.model_name}>
-            <span className="text-clay">◆</span> {info.model_name}
-          </div>
-          <div className="text-faint">
-            {info.environment} · {info.targets_registered} targets · v{info.version}
-          </div>
-        </div>
-      )}
     </aside>
   );
 }

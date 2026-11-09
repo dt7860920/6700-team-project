@@ -67,15 +67,16 @@ export function useScan() {
   }, []);
 
   const start = useCallback(
-    async (req: ScanRequest) => {
+    async (req: ScanRequest): Promise<Scan | null> => {
       cancelled.current = false;
       clearTimer();
       setState({ phase: "starting", scan: null, findings: [], error: null });
       try {
         const scan = await api.startScan(req);
-        if (cancelled.current) return;
+        if (cancelled.current) return null;
         setState({ phase: "running", scan, findings: [], error: null });
         poll(scan.scan_id);
+        return scan;
       } catch (err) {
         const detail =
           err instanceof ApiError
@@ -84,6 +85,7 @@ export function useScan() {
               : err.detail
             : "Could not start the scan.";
         setState({ phase: "error", scan: null, findings: [], error: detail });
+        return null;
       }
     },
     [poll],
