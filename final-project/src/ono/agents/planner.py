@@ -94,10 +94,11 @@ def run_planner(
     window_text: str,
     budget: CallBudget,
     trajectory: Trajectory,
+    context: str = "",
 ) -> InvestigationPlan:
     """One model call; returns the parsed plan or :func:`default_plan` on unusable output."""
     user = (
-        "Flag:\n"
+        (f"{context}\n\n" if context else "") + "Flag:\n"
         f"  file: {candidate.file}\n"
         f"  line: {candidate.line}\n"
         f"  suspected CWE: {candidate.cwe_hint or 'unknown'}\n"

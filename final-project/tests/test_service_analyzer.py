@@ -280,6 +280,8 @@ def test_snippet_is_written_then_read_through_the_sandbox(snippet: Target, works
     assert executor.sandboxes[0].calls[0] == ("read_lines", "snippet.py", "1", "7")
     assert "RESULT" not in model.calls[1]["messages"][-1]["content"]  # confirmed straight away
     assert not (workspace / "scn_svc").exists()
+    # both agents were told this is a snippet, so a missing request handler is no excuse
+    assert all("PASTED SNIPPET" in c["messages"][1]["content"] for c in model.calls)
 
 
 def test_clean_snippet_makes_no_model_call_and_opens_no_sandbox(

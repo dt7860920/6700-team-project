@@ -17,7 +17,7 @@ import pytest
 from pydantic import SecretStr
 
 from agentfakes import FakeExecutor, LocalSandbox, ScriptedModel, action, confirm_args, native
-from ono.agents.analyst import MAX_CALLS_PER_TURN, run_analyst
+from ono.agents.analyst import MAX_CALLS_PER_TURN, context_note, run_analyst
 from ono.agents.definitions import ANALYST, PLANNER
 from ono.agents.model import (
     BudgetExhaustedError,
@@ -246,6 +246,7 @@ def _run(
     deadline: float | None = None,
     budget: CallBudget | None = None,
     plan_text: str = "",
+    context: str = "",
 ) -> Any:
     toolbox = ToolBox(sandbox, max_output_chars=6000)
     window = toolbox.dispatch(
@@ -266,6 +267,7 @@ def _run(
         budget=budget or CallBudget(limit=100),
         deadline=deadline if deadline is not None else time.monotonic() + 60,
         trajectory=Trajectory(scan_id="scn_t", role="analyst", candidate="t"),
+        context=context,
     )
 
 
@@ -286,7 +288,12 @@ def test_happy_path_dispatches_tools_in_order_and_confirms(sandbox: LocalSandbox
     ]
     assert model.n_calls == 3
     f = out.finding
-    assert (f.file, f.line_range, f.cwe, f.severity) == ("app/views.py", (16, 16), "CWE-89", "high")
+    assert (f.file, f.line_range, f.cwe, f.severity) == (
+        "app/views.py",
+        (16, 16),
+        "CWE-89",
+        "critical",
+    )
     assert [(t.file, t.line) for t in f.trace] == [("app/views.py", 13), ("app/views.py", 16)]
     assert f.rung == 2 and f.verified is False and f.patch_diff == ""
     assert f.finding_id.startswith("fnd_")
@@ -299,6 +306,58 @@ def test_happy_path_dispatches_tools_in_order_and_confirms(sandbox: LocalSandbox
     kinds = [s.kind for s in out.trajectory.steps]
     assert kinds == ["model", "tool", "model", "tool", "model", "verdict"]
     assert out.trajectory.outcome == "confirm" and out.trajectory.model_calls == 3
+
+
+def test_severity_comes_from_the_cwe_table_not_the_model(sandbox: LocalSandbox) -> None:
+    """Issue #44: the same CWE always gets the same severity, whatever the model says."""
+    model = ScriptedModel([action("confirm", **confirm_args(severity="low"))])
+    assert _run(model, sandbox).finding.severity == "critical"  # CWE-89
+    model = ScriptedModel([action("confirm", **confirm_args(cwe="CWE-1333", severity="high"))])
+    assert _run(model, sandbox).finding.severity == "high"  # unknown CWE: the model's rating
+
+
+def test_unverified_confidence_is_capped_by_evidence(sandbox: LocalSandbox) -> None:
+    """Issue #30: a model that always says 1.0 no longer produces a constant 1.0."""
+    model = ScriptedModel([action("confirm", **confirm_args(confidence=1.0))])
+    traced = _run(model, sandbox).finding
+    assert (traced.rung, traced.confidence) == (2, 0.8)
+    model = ScriptedModel([action("confirm", **confirm_args(confidence=1.0, trace=[]))])
+    bare = _run(model, sandbox).finding
+    assert (bare.rung, bare.confidence) == (1, 0.5)
+    model = ScriptedModel([action("confirm", **confirm_args(confidence=1.0, line_start=999))])
+    unanchored = _run(model, sandbox).finding
+    assert unanchored.confidence == 0.4 and "not read" in unanchored.description
+
+
+def test_a_dismissal_that_says_vulnerable_is_sent_back_once(sandbox: LocalSandbox) -> None:
+    """Issue #67: 'dismiss: ... making it vulnerable to SQL injection' gets one challenge."""
+    contradicting = "name is embedded in the SQL with no sanitization, vulnerable to SQL injection"
+    model = ScriptedModel(
+        [action("dismiss", reason=contradicting), action("confirm", **confirm_args())]
+    )
+    out = _run(model, sandbox)
+    assert out.verdict == "confirm"
+    assert "says the code IS vulnerable" in model.calls[1]["messages"][-1]["content"]
+    # a second contradicting dismissal is accepted rather than looping
+    model = ScriptedModel(
+        [action("dismiss", reason=contradicting), action("dismiss", reason=contradicting)]
+    )
+    assert _run(model, sandbox).verdict == "dismiss" and model.n_calls == 2
+    # an ordinary dismissal is never challenged
+    model = ScriptedModel([action("dismiss", reason="uid is cast to int at line 14")])
+    assert _run(model, sandbox).verdict == "dismiss" and model.n_calls == 1
+
+
+def test_snippet_context_tells_the_agents_not_to_hunt_for_a_handler(
+    sandbox: LocalSandbox,
+) -> None:
+    """Issues #66 / #27: a snippet has no request handler; that is no reason to dismiss."""
+    assert context_note("repo") == ""
+    note = context_note("snippet")
+    assert "PASTED SNIPPET" in note and "attacker-controlled" in note
+    model = ScriptedModel([action("dismiss", reason="x")])
+    _run(model, sandbox, context=note)
+    assert note in model.calls[0]["messages"][1]["content"]
 
 
 def test_garbage_replies_are_retried_within_budget(sandbox: LocalSandbox) -> None:
