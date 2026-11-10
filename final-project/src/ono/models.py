@@ -9,10 +9,11 @@ OpenAPI document at ``/docs`` is the authoritative contract.
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 Severity = Literal["low", "medium", "high", "critical"]
 SnippetLanguage = Literal["auto", "python", "javascript"]
@@ -63,6 +64,31 @@ def severity_for(cwe: str, fallback: Severity = "medium") -> Severity:
     return CWE_SEVERITY.get(cwe, fallback)
 
 
+SNIPPET_MAX_CHARS = 20_000
+
+
+def friendly_errors(errors: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Validation errors as ``{loc, msg, type}``, never echoing the submitted value.
+
+    FastAPI's default 422 body repeats each bad ``input`` - for an oversized snippet that is
+    all 20,000 characters of pasted (possibly proprietary) code. This drops ``input`` and
+    rewrites the two messages users actually hit into plain language.
+    """
+    out: list[dict[str, Any]] = []
+    for e in errors:
+        loc = [str(p) for p in e.get("loc", ())]
+        field = loc[-1] if loc else ""
+        kind = str(e.get("type", ""))
+        msg = str(e.get("msg", "invalid value"))
+        value = e.get("input")
+        if field == "snippet" and kind == "string_too_long" and isinstance(value, str):
+            msg = f"snippet is {len(value):,} characters; the limit is {SNIPPET_MAX_CHARS:,}"
+        elif field == "target_id" and kind in ("string_pattern_mismatch", "string_too_long"):
+            msg = "target_id must be an id from GET /targets (e.g. 'pygoat'), never a URL or path"
+        out.append({"loc": loc, "msg": msg, "type": kind})
+    return out
+
+
 def utcnow() -> datetime:
     return datetime.now(tz=UTC)
 
@@ -96,8 +122,11 @@ class ScanOptions(BaseModel):
 
     snippet: str | None = Field(
         default=None,
-        max_length=20_000,
-        description="Source code to analyze when target_id == 'snippet'. Ignored otherwise.",
+        max_length=SNIPPET_MAX_CHARS,
+        description=(
+            "Source code to analyze; required (non-empty) when target_id == 'snippet' and "
+            "rejected for any other target. At most 20,000 characters."
+        ),
     )
     snippet_language: SnippetLanguage = Field(
         default="auto",
@@ -106,8 +135,19 @@ class ScanOptions(BaseModel):
             "code; other languages are not supported and would be scanned as Python."
         ),
     )
-    max_findings: int = Field(default=10, ge=1, le=50, description="Cap on findings returned.")
-    min_rung: Rung = Field(default=1, description="Drop findings below this output rung.")
+    max_findings: int = Field(
+        default=10,
+        ge=1,
+        le=50,
+        description=(
+            "API-only. Show at most this many findings (strongest first); the service backend "
+            "also stops reviewing candidates once this many are confirmed."
+        ),
+    )
+    min_rung: Rung = Field(
+        default=1,
+        description="API-only. Hide findings below this rung; the scan message counts them.",
+    )
 
 
 class ScanRequest(BaseModel):
@@ -125,6 +165,21 @@ class ScanRequest(BaseModel):
         examples=["pygoat"],
     )
     options: ScanOptions = Field(default_factory=ScanOptions)
+
+    @model_validator(mode="after")
+    def _snippet_matches_target(self) -> Self:
+        """Reject a request whose code would be silently ignored or which has no code."""
+        code = self.options.snippet
+        if self.target_id == "snippet" and not (code or "").strip():
+            msg = "target_id 'snippet' needs code to scan: options.snippet is missing or empty"
+            raise ValueError(msg)
+        if self.target_id != "snippet" and code is not None:
+            msg = (
+                "options.snippet is only read for target_id 'snippet'; it would be ignored "
+                f"for {self.target_id!r}. Drop it, or use target_id 'snippet'."
+            )
+            raise ValueError(msg)
+        return self
 
 
 # ---------------------------------------------------------------------------
@@ -261,6 +316,11 @@ class InfoResponse(BaseModel):
     model_backend: str
     model_name: str
     targets_registered: int
+    max_active_scans: int = Field(description="Scans that run at the same time.")
+    max_queued_scans: int = Field(
+        description="Scans that may wait for a worker (status 'queued'); beyond "
+        "max_active_scans + max_queued_scans in flight, POST /scans answers 429."
+    )
 
 
 class TargetsResponse(BaseModel):
