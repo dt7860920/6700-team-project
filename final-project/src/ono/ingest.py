@@ -7,7 +7,8 @@ The workspace is ``<workspace_dir>/<scan_id>/`` and is removed when the scan end
   ``.git`` directory is deleted right after the clone: the plan's isolation
   principle is that the origin is contacted exactly once and never again.
   Nothing cloned is ever executed - the workspace is read by SAST and the model.
-* ``snippet`` targets are written to ``snippet.py`` so SAST runs over them uniformly.
+* ``snippet`` targets are written to ``snippet.py`` or ``snippet.js`` (by
+  ``options.snippet_language``, auto-detected by default) so SAST runs the right rules.
 * A ``source`` that is an existing local directory (a pre-ingested snapshot, or a
   test fixture) is copied instead of cloned - no network involved.
 
@@ -19,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -29,6 +31,20 @@ from ono.targets import Target
 log = logging.getLogger(__name__)
 
 SNIPPET_FILE = "snippet.py"
+SNIPPET_FILES: dict[str, str] = {"python": "snippet.py", "javascript": "snippet.js"}
+
+# Line-level tells, scored: whichever language collects more wins; ties go to Python.
+_JS_TELLS = re.compile(
+    r"^\s*(?:const|let|var)\s+\w+\s*=|=>|\bfunction\b\s*\w*\s*\(|\brequire\(|"
+    r"\bconsole\.\w+\(|^\s*import\s+.+\s+from\s+['\"]|^\s*export\s|;\s*$|"
+    r"\b(?:req|res)\.(?:query|body|params|send)\b|===|!==",
+    re.MULTILINE,
+)
+_PY_TELLS = re.compile(
+    r"^\s*def\s+\w+\s*\(|^\s*(?:from\s+\w[\w.]*\s+)?import\s+\w[\w., ]*$|:\s*$|"
+    r"\bprint\(|\bself\b|\bNone\b|\bTrue\b|\bFalse\b|^\s*@\w+",
+    re.MULTILINE,
+)
 _ALLOWED_SCHEMES = ("https://", "http://")
 
 
@@ -55,7 +71,7 @@ def ingest_target(
     workspace.mkdir(parents=True, exist_ok=False)
     try:
         if target.kind == "snippet":
-            return write_snippet(options.snippet or "", workspace)
+            return write_snippet(options.snippet or "", workspace, snippet_language(options))
         return fetch_source(
             target.source, workspace, clone_timeout_s=clone_timeout_s, max_clone_mb=max_clone_mb
         )
@@ -64,10 +80,27 @@ def ingest_target(
         raise
 
 
-def write_snippet(code: str, workspace: Path) -> Path:
-    path = workspace / SNIPPET_FILE
+def detect_language(code: str) -> str:
+    """``"javascript"`` or ``"python"`` from simple syntax tells (Python on a tie)."""
+    js, py = len(_JS_TELLS.findall(code)), len(_PY_TELLS.findall(code))
+    return "javascript" if js > py else "python"
+
+
+def snippet_language(options: ScanOptions) -> str:
+    """The snippet's language: the explicit choice, or detected from the code."""
+    if options.snippet_language != "auto":
+        return options.snippet_language
+    return detect_language(options.snippet or "")
+
+
+def snippet_filename(options: ScanOptions) -> str:
+    return SNIPPET_FILES[snippet_language(options)]
+
+
+def write_snippet(code: str, workspace: Path, language: str = "python") -> Path:
+    path = workspace / SNIPPET_FILES[language]
     path.write_text(code, encoding="utf-8")
-    log.info("ingest: wrote inline snippet (%d chars) to %s", len(code), path)
+    log.info("ingest: wrote inline %s snippet (%d chars) to %s", language, len(code), path)
     return workspace
 
 
