@@ -202,16 +202,16 @@ def test_repo_scan_end_to_end(repo: Target, workspace: Path) -> None:
     reads = [c for c in executor.sandboxes[0].calls if c[0] == "read_lines"]
     assert [c[1] for c in reads] == ["app/util.py", "app/views.py", "app/views.py"]
     assert sum(1 for c in executor.sandboxes[0].calls if c[0] == "grep") == 3
-    # findings: anchored, unverified, rung 1-2, stable ids
+    # findings: anchored, unverified, rung 1-2, strongest (highest rung) first
     assert [(f.file, f.line_range, f.cwe, f.rung) for f in result.findings] == [
-        ("app/util.py", (5, 5), "CWE-502", 1),
         ("app/views.py", (16, 16), "CWE-89", 2),
+        ("app/util.py", (5, 5), "CWE-502", 1),
     ]
     assert all(
         f.verified is False and f.scan_id == "scn_repo" and f.patch_diff == ""
         for f in result.findings
     )
-    assert [t.line for t in result.findings[1].trace] == [13, 16]
+    assert [t.line for t in result.findings[0].trace] == [13, 16]
     assert model.n_calls == 3 * 3  # planner + grep + verdict per candidate
     report = analyzer.last_report
     assert report is not None and [o.state for o in report.outcomes] == [
@@ -402,3 +402,73 @@ def test_stages_outside_run_fail_loudly(repo: Target, workspace: Path) -> None:
     analyzer = _analyzer(_settings(workspace), ScriptedModel())
     with pytest.raises(RuntimeError, match="must run via run"):
         analyzer.sast_shortlist(repo, ScanOptions())
+
+
+_TRACED = [
+    {"file": "app/views.py", "line": 13, "symbol": "request.args.get('id')"},
+    {"file": "app/views.py", "line": 16, "symbol": "cur.execute(f...)"},
+]
+
+
+def test_max_findings_keeps_the_strongest_and_stops_once_the_cap_is_top_rung(
+    repo: Target, workspace: Path
+) -> None:
+    """Issue #39 (live vulpy run): a rung-1 finding first in the queue must not win the cap.
+
+    The walk goes on past the weak confirmation, stops at the first rung-2 one (the highest
+    rung the analyst can reach), and keeps that one.
+    """
+    model = ScriptedModel(
+        script=_script(
+            {
+                "app/util.py:5": _confirm("app/util.py", 5, "CWE-502"),  # rung 1
+                "app/views.py:16": _confirm("app/views.py", 16, "CWE-89", trace=_TRACED),
+                "app/views.py:23": action("dismiss", reason="never reached"),
+            }
+        )
+    )
+    result = _analyzer(_settings(workspace), model, FakeExecutor()).run(
+        "scn_cap", repo, ScanOptions(max_findings=1)
+    )
+    assert [(f.file, f.rung) for f in result.findings] == [("app/views.py", 2)]
+    assert model.n_calls == 6  # planner + grep + verdict for the first two candidates only
+    assert "stopped after max_findings=1; 1 candidate(s) not reviewed" in result.summary
+    assert "1 more over max_findings=1 not shown" in result.summary
+
+
+def test_max_findings_does_not_stop_early_on_weak_findings(repo: Target, workspace: Path) -> None:
+    """With only rung-1 confirmations the cap never ends the walk: a stronger one may follow."""
+    model = ScriptedModel(
+        script=_script(
+            {
+                "app/util.py:5": _confirm("app/util.py", 5, "CWE-502"),
+                "app/views.py:16": _confirm("app/views.py", 16, "CWE-89"),
+                "app/views.py:23": _confirm("app/views.py", 23, "CWE-78"),
+            }
+        )
+    )
+    result = _analyzer(_settings(workspace), model, FakeExecutor()).run(
+        "scn_weak", repo, ScanOptions(max_findings=1)
+    )
+    assert model.n_calls == 9  # every candidate reviewed
+    assert len(result.findings) == 1 and result.findings[0].rung == 1
+    assert "stopped after" not in result.summary
+    assert "2 more over max_findings=1 not shown" in result.summary
+
+
+def test_min_rung_filter_says_what_it_hid(repo: Target, workspace: Path) -> None:
+    """Issue #40: findings hidden by min_rung are counted in the message, not silently dropped."""
+    model = ScriptedModel(
+        script=_script(
+            {
+                "app/util.py:5": _confirm("app/util.py", 5, "CWE-502"),
+                "app/views.py:16": _confirm("app/views.py", 16, "CWE-89"),
+                "app/views.py:23": action("dismiss", reason="validated"),
+            }
+        )
+    )
+    result = _analyzer(_settings(workspace), model, FakeExecutor()).run(
+        "scn_rung", repo, ScanOptions(min_rung=3)
+    )
+    assert result.findings == []
+    assert result.summary == "0 findings at rung >= 3; 2 below min_rung=3 hidden"
