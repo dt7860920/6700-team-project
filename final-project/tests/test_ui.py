@@ -137,7 +137,37 @@ def test_analyze_clean_snippet_shows_the_empty_state(settings: Settings) -> None
         )
     finally:
         service.close()
-    assert "No vulnerabilities found" in findings
+    assert "No findings to show" in findings
+    assert "not proof that the code is safe" in findings
+
+
+def test_empty_scan_explains_that_model_analysis_was_skipped() -> None:
+    scan = _scan(
+        status="done",
+        message=(
+            "0 findings: static analysis found no candidates; "
+            "model analysis and verification were skipped"
+        ),
+        pipeline=[
+            StageResult(
+                stage="plan", status="skipped", duration_ms=0,
+                summary="no candidates from static analysis",
+            ),
+            StageResult(
+                stage="analyze", status="skipped", duration_ms=0,
+                summary="no candidates from static analysis",
+            ),
+            StageResult(
+                stage="verify", status="skipped", duration_ms=0,
+                summary="no candidates from static analysis",
+            ),
+        ],
+    )
+    findings = ui.render_findings(scan, [])
+    status = ui._stage_rows(scan)
+    assert "model analysis and verification were skipped" in findings
+    assert "not proof that the code is safe" in findings
+    assert status.count("skipped - no candidates from static analysis") == 3
 
 
 def test_analyze_rejects_unknown_and_busy_and_invalid_without_raising(
@@ -215,7 +245,7 @@ def test_watch_yields_each_state_until_terminal() -> None:
     assert 'class="ono-stage active"' in third and third.count('class="ono-stage ok"') == 3
     last_status, last_findings, raw = views[3]
     assert "Done" in last_status and "1m 35s" in last_status
-    assert "No vulnerabilities found" in last_findings
+    assert "No findings to show" in last_findings
     assert "1 confirmed, 2 dismissed" in last_findings  # dismissed-vs-confirmed is legible
     assert raw["scan"]["status"] == "done"
 

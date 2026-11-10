@@ -158,7 +158,7 @@ def _stage_rows(scan: Scan) -> str:
             if result.status == "failed":
                 icon, cls, detail = "✖", "failed", f"failed - {_e(result.summary)}"
             elif result.status == "skipped":
-                icon, cls, detail = "-", "skipped", "skipped"
+                icon, cls, detail = "-", "skipped", f"skipped - {_e(result.summary)}"
             else:
                 icon, cls = "✔", "ok"
                 detail = f"{_fmt_ms(result.duration_ms)} · {_e(result.summary)}"
@@ -385,10 +385,16 @@ def render_findings(scan: Scan | None, findings: list[Finding]) -> str:
             "in the activity log.</div>"
         )
     if not findings:
+        message = (
+            _e(scan.message)
+            if scan.message
+            else "The scan completed without confirmed findings."
+        )
         return (
-            '<div class="ono-empty"><div class="ono-empty-title">✅ No vulnerabilities found'
-            "</div><div>The pipeline ran to completion and nothing passed the analysis for "
-            f"this target.</div>{verdict_line}</div>"
+            '<div class="ono-empty"><div class="ono-empty-title">No findings to show'
+            f"</div><div>{message}</div>"
+            "<div>An empty result is not proof that the code is safe.</div>"
+            f"{verdict_line}</div>"
         )
 
     by_sev = {s: sum(1 for f in findings if f.severity == s) for s in SEVERITY_ORDER}
