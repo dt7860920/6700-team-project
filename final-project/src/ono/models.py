@@ -32,6 +32,36 @@ Rung = Annotated[
 ]
 
 
+# Severity is a property of the weakness class, not of the model's mood: a known CWE always
+# gets the same rating, so findings sort and triage consistently across scans. The model's
+# own rating is used only for CWEs missing from this table.
+CWE_SEVERITY: dict[str, Severity] = {
+    "CWE-77": "critical",  # command injection
+    "CWE-78": "critical",  # OS command injection
+    "CWE-89": "critical",  # SQL injection
+    "CWE-94": "critical",  # code injection
+    "CWE-95": "critical",  # eval injection
+    "CWE-502": "critical",  # unsafe deserialization (pickle, yaml.load)
+    "CWE-22": "high",  # path traversal
+    "CWE-611": "high",  # XXE
+    "CWE-798": "high",  # hard-coded credentials
+    "CWE-918": "high",  # SSRF
+    "CWE-79": "medium",  # XSS
+    "CWE-327": "medium",  # broken / risky crypto (MD5, SHA-1)
+    "CWE-328": "medium",  # weak hash
+    "CWE-352": "medium",  # CSRF
+    "CWE-601": "medium",  # open redirect
+    "CWE-916": "medium",  # weak password hashing
+    "CWE-209": "low",  # error message information leak
+    "CWE-489": "low",  # debug mode left on
+}
+
+
+def severity_for(cwe: str, fallback: Severity = "medium") -> Severity:
+    """The fixed rating for a known CWE, else ``fallback`` (e.g. the model's own rating)."""
+    return CWE_SEVERITY.get(cwe, fallback)
+
+
 def utcnow() -> datetime:
     return datetime.now(tz=UTC)
 

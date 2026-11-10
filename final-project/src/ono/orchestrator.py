@@ -29,7 +29,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, Protocol
 
-from ono.agents.analyst import MAX_ANALYST_RUNG, AnalystOutcome, run_analyst
+from ono.agents.analyst import MAX_ANALYST_RUNG, AnalystOutcome, context_note, run_analyst
 from ono.agents.definitions import ANALYST, PLANNER, AgentDefinition
 from ono.agents.model import BudgetExhaustedError, CallBudget, ChatModel, ModelError, ToolCall
 from ono.agents.planner import InvestigationPlan, default_plan, run_planner
@@ -156,6 +156,7 @@ class DetectionOrchestrator:
         progress: ProgressCallback | None = None,
         stop_after: int | None = None,
         min_rung: int = 1,
+        target_kind: str = "repo",
     ) -> DetectionReport:
         """Walk the candidate queue. ``progress`` (optional) only *reports* where the loop is.
 
@@ -199,7 +200,9 @@ class DetectionOrchestrator:
                         f"{candidate.file}:{candidate.line} ({candidate.cwe_hint})"
                     )
                     try:
-                        outcome = self._investigate(sandbox, scan_id, target_id, candidate, budget)
+                        outcome = self._investigate(
+                            sandbox, scan_id, target_id, candidate, budget, target_kind
+                        )
                     except BudgetExhaustedError as exc:
                         report.stopped_early = str(exc)
                         break
@@ -243,6 +246,7 @@ class DetectionOrchestrator:
         target_id: str,
         c: Candidate,
         budget: CallBudget,
+        target_kind: str = "repo",
     ) -> CandidateOutcome:
         """WINDOW -> PLAN -> ANALYZE for one candidate, inside the open sandbox."""
         label = f"{c.file}:{c.line} ({c.rule})"
@@ -261,6 +265,7 @@ class DetectionOrchestrator:
             log.warning("orchestrator[%s]: skipping %s - %s", scan_id, label, reason)
             return CandidateOutcome(c, "skipped", reason)
         window_text = _mark_flagged_line(window.text, c.line)
+        context = context_note(target_kind)
 
         # PLAN
         outcome = CandidateOutcome(c, "skipped")
@@ -273,6 +278,7 @@ class DetectionOrchestrator:
                 window_text=window_text,
                 budget=budget,
                 trajectory=plan_traj,
+                context=context,
             )
             outcome.trajectories.append(plan_traj)
             self.trajectories.write(plan_traj)
@@ -294,6 +300,7 @@ class DetectionOrchestrator:
             budget=budget,
             deadline=deadline,
             trajectory=traj,
+            context=context,
         )
         outcome.trajectories.append(traj)
         self.trajectories.write(traj)
