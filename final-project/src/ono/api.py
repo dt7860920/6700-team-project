@@ -22,6 +22,7 @@ from contextlib import asynccontextmanager
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
@@ -41,6 +42,7 @@ from ono.models import (
     SourceCheckResponse,
     TargetsResponse,
     TargetSummary,
+    friendly_errors,
 )
 from ono.service import ScanService
 from ono.sources import SourceCheckError
@@ -124,6 +126,26 @@ def create_app(
             ).model_dump(),
         )
 
+    @app.exception_handler(RequestValidationError)
+    async def _invalid_request(_: Request, exc: RequestValidationError) -> JSONResponse:
+        errors = friendly_errors(exc.errors())
+        # A malformed target_id (a URL, a path) is still "not on the allowlist": answer it
+        # like any unknown id - 403 with a pointer to GET /targets - not a bare regex error.
+        if errors and all(
+            e["loc"] == ["body", "target_id"] and e["type"] != "missing" for e in errors
+        ):
+            detail = (
+                "target_id is not an authorized target. See GET /targets for the allowlist, "
+                "or pass a public GitHub URL as repo_url."
+            )
+            return JSONResponse(
+                status_code=status.HTTP_403_FORBIDDEN,
+                content=ErrorResponse(detail=detail).model_dump(),
+            )
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, content={"detail": errors}
+        )
+
     @app.exception_handler(ScanBusyError)
     async def _busy(_: Request, exc: ScanBusyError) -> JSONResponse:
         log.warning("rejected scan: %s", exc)
@@ -148,6 +170,8 @@ def create_app(
             model_backend=s.model_backend,
             model_name=s.model_name,
             targets_registered=len(svc.registry),
+            max_active_scans=svc.max_active_scans,
+            max_queued_scans=svc.max_queued_scans,
         )
 
     # -- targets ----------------------------------------------------------
