@@ -404,13 +404,25 @@ def test_stages_outside_run_fail_loudly(repo: Target, workspace: Path) -> None:
         analyzer.sast_shortlist(repo, ScanOptions())
 
 
-def test_max_findings_stops_analysis_early_and_says_so(repo: Target, workspace: Path) -> None:
-    """Issue #39: with max_findings=1 the walk ends at the first qualifying confirmation."""
+_TRACED = [
+    {"file": "app/views.py", "line": 13, "symbol": "request.args.get('id')"},
+    {"file": "app/views.py", "line": 16, "symbol": "cur.execute(f...)"},
+]
+
+
+def test_max_findings_keeps_the_strongest_and_stops_once_the_cap_is_top_rung(
+    repo: Target, workspace: Path
+) -> None:
+    """Issue #39 (live vulpy run): a rung-1 finding first in the queue must not win the cap.
+
+    The walk goes on past the weak confirmation, stops at the first rung-2 one (the highest
+    rung the analyst can reach), and keeps that one.
+    """
     model = ScriptedModel(
         script=_script(
             {
-                "app/util.py:5": _confirm("app/util.py", 5, "CWE-502"),
-                "app/views.py:16": _confirm("app/views.py", 16, "CWE-89"),
+                "app/util.py:5": _confirm("app/util.py", 5, "CWE-502"),  # rung 1
+                "app/views.py:16": _confirm("app/views.py", 16, "CWE-89", trace=_TRACED),
                 "app/views.py:23": action("dismiss", reason="never reached"),
             }
         )
@@ -418,9 +430,30 @@ def test_max_findings_stops_analysis_early_and_says_so(repo: Target, workspace: 
     result = _analyzer(_settings(workspace), model, FakeExecutor()).run(
         "scn_cap", repo, ScanOptions(max_findings=1)
     )
-    assert [f.file for f in result.findings] == ["app/util.py"]
-    assert model.n_calls == 3  # planner + grep + verdict for the first candidate only
-    assert "stopped after max_findings=1; 2 candidate(s) not reviewed" in result.summary
+    assert [(f.file, f.rung) for f in result.findings] == [("app/views.py", 2)]
+    assert model.n_calls == 6  # planner + grep + verdict for the first two candidates only
+    assert "stopped after max_findings=1; 1 candidate(s) not reviewed" in result.summary
+    assert "1 more over max_findings=1 not shown" in result.summary
+
+
+def test_max_findings_does_not_stop_early_on_weak_findings(repo: Target, workspace: Path) -> None:
+    """With only rung-1 confirmations the cap never ends the walk: a stronger one may follow."""
+    model = ScriptedModel(
+        script=_script(
+            {
+                "app/util.py:5": _confirm("app/util.py", 5, "CWE-502"),
+                "app/views.py:16": _confirm("app/views.py", 16, "CWE-89"),
+                "app/views.py:23": _confirm("app/views.py", 23, "CWE-78"),
+            }
+        )
+    )
+    result = _analyzer(_settings(workspace), model, FakeExecutor()).run(
+        "scn_weak", repo, ScanOptions(max_findings=1)
+    )
+    assert model.n_calls == 9  # every candidate reviewed
+    assert len(result.findings) == 1 and result.findings[0].rung == 1
+    assert "stopped after" not in result.summary
+    assert "2 more over max_findings=1 not shown" in result.summary
 
 
 def test_min_rung_filter_says_what_it_hid(repo: Target, workspace: Path) -> None:

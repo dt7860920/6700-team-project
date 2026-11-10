@@ -29,7 +29,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, Protocol
 
-from ono.agents.analyst import AnalystOutcome, run_analyst
+from ono.agents.analyst import MAX_ANALYST_RUNG, AnalystOutcome, run_analyst
 from ono.agents.definitions import ANALYST, PLANNER, AgentDefinition
 from ono.agents.model import BudgetExhaustedError, CallBudget, ChatModel, ModelError, ToolCall
 from ono.agents.planner import InvestigationPlan, default_plan, run_planner
@@ -159,9 +159,13 @@ class DetectionOrchestrator:
     ) -> DetectionReport:
         """Walk the candidate queue. ``progress`` (optional) only *reports* where the loop is.
 
-        ``stop_after``: end the walk once that many findings at rung >= ``min_rung`` are
-        confirmed (the scan's ``max_findings``), so a capped scan also finishes sooner. The
-        queue is SAST-ranked, so the candidates reviewed first are the most promising ones.
+        ``stop_after``: end the walk once that many findings at the highest rung the analyst
+        can reach (``MAX_ANALYST_RUNG``, or ``min_rung`` if higher) are confirmed - the
+        scan's ``max_findings`` - so a capped scan also finishes sooner. Stopping at the
+        first ``stop_after`` confirmations of *any* rung would keep a weak finding that
+        happened to come first over stronger ones further down the queue (#39). No later
+        candidate can outrank a top-rung finding on rung; severity breaks ties only among
+        the candidates that were reviewed.
         """
         report_progress: ProgressCallback = progress if progress is not None else _no_progress
         queue = list(candidates[: self.settings.max_candidates])
@@ -209,8 +213,9 @@ class DetectionOrchestrator:
                     if outcome.finding is not None and outcome.finding.finding_id not in seen:
                         seen.add(outcome.finding.finding_id)
                         report.findings.append(outcome.finding)
-                    qualifying = sum(1 for f in report.findings if f.rung >= min_rung)
-                    if stop_after is not None and qualifying >= stop_after and index < total:
+                    top_rung = max(min_rung, MAX_ANALYST_RUNG)
+                    strongest = sum(1 for f in report.findings if f.rung >= top_rung)
+                    if stop_after is not None and strongest >= stop_after and index < total:
                         report.not_reviewed = total - index
                         report.stopped_early = (
                             f"max_findings={stop_after} reached; "
