@@ -160,6 +160,17 @@ def test_snippet_target_reacts_to_input(client: TestClient) -> None:
     assert findings[0]["line_range"] == [1, 1]
 
 
+def test_javascript_snippet_gets_javascript_rules(client: TestClient) -> None:
+    """Issue #65: pasted JS SQL concatenation is a finding, not 'no vulnerabilities'."""
+    code = 'const name = req.query.name;\ndb.query("SELECT * FROM u WHERE n = \'" + name + "\'");\n'
+    done = start_and_wait(client, {"target_id": "snippet", "options": {"snippet": code}})
+    findings = client.get(f"/scans/{done['scan_id']}/findings").json()
+    assert [(f["cwe"], f["file"], f["line_range"]) for f in findings] == [
+        ("CWE-89", "snippet.js", [2, 2])
+    ]
+    assert done["pipeline"][0]["summary"].startswith("snapshot inline javascript snippet")
+
+
 def test_scan_options_are_validated(client: TestClient) -> None:
     r = client.post("/scans", json={"target_id": "pygoat", "options": {"bogus": 1}})
     assert r.status_code == 422

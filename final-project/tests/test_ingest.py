@@ -52,6 +52,41 @@ def test_snippet_is_written_to_a_file(tmp_path: Path) -> None:
     assert (ws / ingest.SNIPPET_FILE).read_text() == "x = eval(data)\n"
 
 
+JS_SQL = 'const name = req.query.name;\ndb.query("SELECT * FROM u WHERE n = \'" + name + "\'");\n'
+
+
+def test_javascript_snippet_is_detected_and_written_as_js(tmp_path: Path) -> None:
+    """Issues #35 / #65: pasted JavaScript is no longer scanned as Python."""
+    ws = tmp_path / "scn_js"
+    ingest.ingest_target(
+        _target("snippet", "inline"),
+        ScanOptions(snippet=JS_SQL),
+        workspace=ws,
+        clone_timeout_s=5.0,
+        max_clone_mb=50,
+    )
+    assert [p.name for p in ws.iterdir()] == ["snippet.js"]
+
+
+@pytest.mark.parametrize(
+    ("code", "language"),
+    [
+        (JS_SQL, "javascript"),
+        ("function f(x) { return eval(x) }", "javascript"),
+        ('import os\ndef run(u):\n    os.system("ping " + u)\n', "python"),
+        ("x = eval(user_input)", "python"),  # no tells either way: Python
+        ("", "python"),
+    ],
+)
+def test_detect_language(code: str, language: str) -> None:
+    assert ingest.detect_language(code) == language
+
+
+def test_explicit_snippet_language_wins_over_detection() -> None:
+    options = ScanOptions(snippet="x = 1", snippet_language="javascript")
+    assert ingest.snippet_filename(options) == "snippet.js"
+
+
 def test_https_source_is_shallow_cloned_with_bounds(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

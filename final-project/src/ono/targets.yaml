@@ -50,9 +50,11 @@ targets:
   snippet:
     name: Pasted code snippet
     kind: snippet
-    languages: [python]
+    languages: [python, javascript]
     description: >-
       Pseudo-target for code the analyst pastes into the UI (or sends in
-      `options.snippet`). Analyzed statically in-process; nothing is executed.
+      `options.snippet`). Python or JavaScript/TypeScript, auto-detected (or set
+      `options.snippet_language`); other languages are not supported. Up to 20,000
+      characters. Nothing is executed.
     source: inline
     snapshot: "n/a"
