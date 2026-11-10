@@ -39,6 +39,9 @@ log = logging.getLogger(__name__)
 
 MAX_CALLS_PER_TURN = 3
 MAX_TRACE_HOPS = 12
+# Highest rung the analyst can assign on its own: 2 (CWE + a multi-line trace). Rung 3+
+# needs the graded verifier, which does not exist yet.
+MAX_ANALYST_RUNG = 2
 
 Verdict = Literal["confirm", "dismiss", "exhausted", "timeout"]
 
@@ -313,7 +316,7 @@ def finding_from_verdict(
     # Rung 2 = CWE + an evidence-backed source->sink trace (distinct read lines). The patch
     # slot stays empty until the fixer (3b-2); rung 3+ needs the graded verifier.
     distinct = {(t.file, t.line) for t in trace}
-    rung = 2 if len(distinct) >= 2 else 1
+    rung = MAX_ANALYST_RUNG if len(distinct) >= 2 else 1
     return (
         Finding(
             finding_id=finding_id_for(scan_id, target_id, file, line_start, cwe),
