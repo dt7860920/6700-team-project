@@ -33,6 +33,14 @@ ModelBackend = Literal["mock", "local", "service"]
 AgentToolProtocol = Literal["auto", "native", "text"]
 """How agent tools are presented to the model (see ``Settings.agent_tool_protocol``)."""
 
+UIBackend = Literal["spa", "gradio", "none"]
+"""Which analyst UI to mount at ``/ui``.
+
+* ``spa``    - the React single-page app built to ``ono/webui/static`` (default).
+* ``gradio`` - the legacy Gradio UI (kept while the SPA is being verified).
+* ``none``   - no UI; ``/`` redirects to ``/docs`` (useful for API-only deployments).
+"""
+
 
 class Settings(BaseSettings):
     """Runtime settings, loaded from the environment / ``.env``.
@@ -97,6 +105,10 @@ class Settings(BaseSettings):
         ge=0,
         le=100,
         description="Scans that may wait for a worker before POST /scans answers 429 (busy).",
+    )
+    ui_backend: UIBackend = Field(
+        default="spa",
+        description="UI mounted at /ui: the React SPA, the legacy Gradio UI, or none.",
     )
     ui_poll_interval_s: float = Field(
         default=1.0,

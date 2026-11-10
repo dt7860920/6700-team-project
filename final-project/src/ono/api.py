@@ -20,9 +20,9 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Annotated
 
-import gradio as gr
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
 
 from ono import __version__
 from ono.analyzer import build_analyzer
@@ -41,7 +41,7 @@ from ono.models import (
 from ono.service import ScanService
 from ono.store import InMemoryScanStore
 from ono.targets import TargetRegistry, UnauthorizedTargetError, get_registry
-from ono.ui import UI_CSS, build_ui
+from ono.webui import STATIC_DIR, spa_built
 
 log = logging.getLogger(__name__)
 
@@ -210,11 +210,30 @@ def create_app(
         return finding
 
     # -- UI ---------------------------------------------------------------
+    # `mount_ui=False` forces API-only (tests); otherwise settings decide which UI.
+    ui_backend = "none" if not mount_ui else settings.ui_backend
+    if ui_backend == "spa" and not spa_built():
+        log.warning(
+            "ui_backend='spa' but the SPA is not built (%s missing); "
+            "run `npm run build` in frontend/. Serving API only.",
+            STATIC_DIR / "index.html",
+        )
+        ui_backend = "none"
+    ui_mounted = ui_backend != "none"
+
     @app.get("/", include_in_schema=False)
     async def root() -> RedirectResponse:
-        return RedirectResponse(url=UI_PATH if mount_ui else "/docs")
+        return RedirectResponse(url=UI_PATH if ui_mounted else "/docs")
 
-    if mount_ui:
+    if ui_backend == "spa":
+        # Serve the built React SPA. html=True makes it return index.html for
+        # unknown sub-paths, so client-side routing and deep links work.
+        app.mount(UI_PATH, StaticFiles(directory=STATIC_DIR, html=True), name="ui")
+    elif ui_backend == "gradio":
+        import gradio as gr  # lazy: only needed for the legacy UI
+
+        from ono.ui import UI_CSS, build_ui
+
         gr.mount_gradio_app(
             app,
             build_ui(service),
