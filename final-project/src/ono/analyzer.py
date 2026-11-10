@@ -158,6 +158,8 @@ class BaseAnalyzer(ABC):
     """
 
     backend: str = "base"
+    verifier_enabled: bool = True
+    """False while ``verify`` is a pass-through: the stage then reports itself as skipped."""
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -260,9 +262,20 @@ class BaseAnalyzer(ABC):
             note(f"{len(raw)} raw finding(s)")
 
         with self._timed("verify", stages) as note:
-            self.report(f"Verifying {len(raw)} raw finding(s)")
-            verified = self.verify(target, raw)
-            note(f"{len(verified)} passed the verifier")
+            if not raw:
+                verified = []
+                note("no findings to verify", status="skipped")
+            elif not self.verifier_enabled:
+                verified = self.verify(target, raw)
+                note(
+                    f"verifier not enabled yet; {len(raw)} finding(s) left unverified",
+                    status="skipped",
+                )
+            else:
+                self.report(f"Verifying {len(raw)} raw finding(s)")
+                verified = self.verify(target, raw)
+                passed = sum(1 for f in verified if f.verified)
+                note(f"{passed} of {len(raw)} passed the verifier")
 
         # Filter, then keep the strongest - never just the first - under the cap.
         eligible = strongest_first([f for f in verified if f.rung >= options.min_rung])
@@ -763,6 +776,7 @@ class ServiceAnalyzer(BaseAnalyzer):
     """
 
     backend = "service"
+    verifier_enabled = False  # TODO(3b-2): the graded verifier
 
     def __init__(
         self,
