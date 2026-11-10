@@ -24,8 +24,8 @@ Each **finding** is shaped by the *output-strength ladder*:
 
 | Rung | Output |
 |---|---|
-| 1 | bare flag ("line X looks vulnerable") |
-| 2 | + CWE + suggested patch |
+| 1 | flagged line ("line X looks vulnerable"), with the suspected CWE |
+| 2 | + evidence: a source → sink trace read from the code and/or a suggested patch (patches arrive with the fixer agent) |
 | 3 | + proof the flaw is reachable (read-only PoC in the sandbox) |
 | 4 | + proof the fix works (patch applies, PoC no longer fires, tests pass) — **our floor** |
 | 5 | + a detection rule to catch exploitation until the patch ships — stretch |

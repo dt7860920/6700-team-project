@@ -188,12 +188,14 @@ def test_repo_scan_end_to_end(repo: Target, workspace: Path) -> None:
     result = analyzer.run("scn_repo", repo, ScanOptions())
 
     assert [s.stage for s in result.stages] == ["ingest", "sast", "plan", "analyze", "verify"]
-    assert all(s.status == "ok" for s in result.stages), result.stages
+    assert [s.status for s in result.stages] == ["ok", "ok", "ok", "ok", "skipped"]
     assert result.stages[0].summary == f"snapshot {workspace / 'scn_repo'}"
     assert result.stages[1].summary == "3 candidate(s)"
     assert result.stages[2].summary.startswith("planner+analyst app/util.py:5 (CWE-502)")
     assert result.stages[3].summary == "2 raw finding(s)"
-    assert result.stages[4].summary == "2 passed the verifier"
+    # issue #64: the pass-through verifier must not claim anything passed
+    assert result.stages[4].summary == "verifier not enabled yet; 2 finding(s) left unverified"
+    assert result.summary == "2 findings (0 verified)"
     # one jail for the whole scan, opened after SAST with the ingested workspace, torn down after
     assert executor.events == ["create scn_repo", "destroy scn_repo"]
     assert executor.sandboxes[0].root == workspace / "scn_repo"
