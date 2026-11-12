@@ -386,9 +386,7 @@ def render_findings(scan: Scan | None, findings: list[Finding]) -> str:
         )
     if not findings:
         message = (
-            _e(scan.message)
-            if scan.message
-            else "The scan completed without confirmed findings."
+            _e(scan.message) if scan.message else "The scan completed without confirmed findings."
         )
         return (
             '<div class="ono-empty"><div class="ono-empty-title">No findings to show'

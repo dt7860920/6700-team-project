@@ -173,9 +173,7 @@ class BaseAnalyzer(ABC):
         if not candidates:
             reason = "no candidates from static analysis"
             for stage in ("plan", "analyze", "verify"):
-                skipped = StageResult(
-                    stage=stage, status="skipped", duration_ms=0, summary=reason
-                )
+                skipped = StageResult(stage=stage, status="skipped", duration_ms=0, summary=reason)
                 stages.append(skipped)
                 self._progress.stage(skipped)
             return AnalysisResult(findings=[], stages=stages, candidate_count=0)
