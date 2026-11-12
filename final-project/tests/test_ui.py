@@ -150,15 +150,21 @@ def test_empty_scan_explains_that_model_analysis_was_skipped() -> None:
         ),
         pipeline=[
             StageResult(
-                stage="plan", status="skipped", duration_ms=0,
+                stage="plan",
+                status="skipped",
+                duration_ms=0,
                 summary="no candidates from static analysis",
             ),
             StageResult(
-                stage="analyze", status="skipped", duration_ms=0,
+                stage="analyze",
+                status="skipped",
+                duration_ms=0,
                 summary="no candidates from static analysis",
             ),
             StageResult(
-                stage="verify", status="skipped", duration_ms=0,
+                stage="verify",
+                status="skipped",
+                duration_ms=0,
                 summary="no candidates from static analysis",
             ),
         ],

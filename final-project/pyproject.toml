@@ -28,7 +28,9 @@ dependencies = [
   "uvicorn[standard]>=0.32",
 ]
 
-[project.optional-dependencies]
+# Dev tools live in a PEP 735 dependency group: `uv sync` installs them by default,
+# `uv sync --no-dev` (as in the Dockerfile) leaves them out.
+[dependency-groups]
 dev = [
   "mypy>=1.13",
   "pre-commit>=4.0",
