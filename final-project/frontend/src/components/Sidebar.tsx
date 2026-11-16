@@ -11,7 +11,7 @@ export interface ScanSummary {
 
 const STATUS_DOT: Record<ScanStatus, string> = {
   queued: "bg-faint",
-  running: "bg-clay animate-pulse",
+  running: "bg-brand animate-pulse",
   done: "bg-ok",
   failed: "bg-sev-critical",
 };
@@ -50,10 +50,9 @@ export function Sidebar({ history, activeScanId, onNew, onSelect }: Props) {
         onClick={onNew}
         title="Operation: Negative One"
       >
-        <Logo size={24} className="text-clay" />
+        <Logo size={24} className="text-brand" />
         <div className="leading-tight">
-          <div className="font-serif text-[15px] font-semibold text-ink">Negative One</div>
-          <div className="text-xs text-muted">Security workbench</div>
+          <div className="text-[15px] font-semibold tracking-tight text-ink">Operation Negative One</div>
         </div>
       </button>
 
@@ -79,7 +78,7 @@ export function Sidebar({ history, activeScanId, onNew, onSelect }: Props) {
                   key={s.scan_id}
                   onClick={() => onSelect(s.scan_id)}
                   className={`flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left transition ${
-                    active ? "bg-claysoft" : "hover:bg-border/50"
+                    active ? "bg-brandsoft" : "hover:bg-border/50"
                   }`}
                 >
                   <span className={`h-2 w-2 shrink-0 rounded-full ${STATUS_DOT[s.status]}`} />

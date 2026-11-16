@@ -4,7 +4,7 @@
 function lineClass(line: string): string {
   if (line.startsWith("+") && !line.startsWith("+++")) return "bg-ok/10 text-ok";
   if (line.startsWith("-") && !line.startsWith("---")) return "bg-sev-critical/10 text-sev-critical";
-  if (line.startsWith("@@")) return "text-claydeep";
+  if (line.startsWith("@@")) return "text-branddeep";
   if (line.startsWith("diff ") || line.startsWith("+++") || line.startsWith("---"))
     return "text-faint";
   return "text-body";

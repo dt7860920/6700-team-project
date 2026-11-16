@@ -18,7 +18,7 @@ export function SeverityBadge({ severity }: { severity: Severity }) {
 
 export function RungBadge({ rung }: { rung: Rung }) {
   return (
-    <span className="badge border-claydeep/30 bg-claysoft/50 text-claydeep" title={RUNG_HELP[rung]}>
+    <span className="badge border-branddeep/30 bg-brandsoft/50 text-branddeep" title={RUNG_HELP[rung]}>
       rung {rung}/5 · {RUNG_LABELS[rung]}
     </span>
   );

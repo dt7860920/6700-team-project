@@ -4,35 +4,36 @@ export default {
   theme: {
     extend: {
       colors: {
-        // Claude-style warm "paper" light theme with a clay/coral accent.
-        paper: "#FBFAF7", // main workspace background
-        sand: "#F3F1EA", // sidebar / inset surfaces
-        card: "#FFFFFF", // raised cards
-        border: "#E8E5DC",
-        border2: "#DAD6CA",
-        ink: "#20201D", // headings
-        body: "#3C3A35", // body text
-        muted: "#6E6B64", // secondary text (AA on paper/sand)
-        faint: "#67645D", // metadata (AA on paper/sand)
-        clay: "#D97757", // brand accent (the asterisk coral) — decorative only
-        claydeep: "#A85330", // accent for text/buttons (AA on paper)
-        claysoft: "#F6E9E2", // tinted accent surface
+        // Team palette: floral-white "paper", navy ink, indigo accent, crimson for danger.
+        paper: "#FFF8F0", // main workspace background (floral white)
+        sand: "#F6ECDF", // sidebar / inset surfaces (deeper cream)
+        card: "#FFFDF9", // raised cards
+        border: "#EADFCF",
+        border2: "#D9CBB6",
+        ink: "#102542", // headings (navy)
+        body: "#2A3852", // body text
+        muted: "#58627A", // secondary text (AA on paper/sand)
+        faint: "#5E6679", // metadata (AA on paper/sand)
+        brand: "#2E3192", // brand accent (lighter indigo) - marks, hovers, live dots
+        branddeep: "#1D1F68", // accent for text/buttons (indigo)
+        brandsoft: "#ECEBF7", // tinted accent surface
         sev: {
-          low: "#2563EB",
-          medium: "#A16207",
-          high: "#C2410C",
-          critical: "#B23B2E",
+          low: "#3B5F99",
+          medium: "#94590A",
+          high: "#B23C0A",
+          critical: "#B3001B", // crimson
         },
         ok: "#15803D",
       },
       fontFamily: {
-        serif: ['"Source Serif 4"', "Georgia", '"Times New Roman"', "serif"],
-        sans: ['"Hanken Grotesk"', "ui-sans-serif", "system-ui", "-apple-system", "sans-serif"],
+        sans: ["Inter", "ui-sans-serif", "system-ui", "-apple-system", "sans-serif"],
+        // Classic-terminal face for the scan timeline.
+        terminal: ['"IBM Plex Mono"', "ui-monospace", "SFMono-Regular", "Menlo", "monospace"],
         mono: ["ui-monospace", "SFMono-Regular", "Menlo", "monospace"],
       },
       boxShadow: {
-        card: "0 1px 2px rgba(32,32,29,0.04), 0 1px 3px rgba(32,32,29,0.06)",
-        lift: "0 4px 14px -6px rgba(32,32,29,0.12)",
+        card: "0 1px 2px rgba(16,37,66,0.04), 0 1px 3px rgba(16,37,66,0.06)",
+        lift: "0 4px 14px -6px rgba(16,37,66,0.12)",
       },
       keyframes: {
         "fade-up": {

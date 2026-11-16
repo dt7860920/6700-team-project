@@ -9,12 +9,12 @@
   body {
     @apply bg-paper text-body antialiased;
     margin: 0;
-    font-family: "Hanken Grotesk", ui-sans-serif, system-ui, -apple-system, sans-serif;
+    font-family: Inter, ui-sans-serif, system-ui, -apple-system, sans-serif;
   }
   h1,
   h2,
   h3 {
-    @apply font-serif text-ink;
+    @apply font-sans text-ink;
   }
 }
 
@@ -33,7 +33,7 @@
     @apply inline-flex items-center justify-center gap-2 rounded-xl px-4 py-2 text-sm font-medium transition disabled:cursor-not-allowed disabled:opacity-50;
   }
   .btn-primary {
-    @apply btn bg-claydeep text-white hover:bg-clay;
+    @apply btn bg-branddeep text-white hover:bg-brand;
   }
   .btn-soft {
     @apply btn border border-border bg-sand text-body hover:bg-border/60;

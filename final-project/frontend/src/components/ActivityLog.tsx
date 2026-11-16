@@ -12,7 +12,7 @@ export function ActivityLog({ events, live }: { events: ProgressEvent[]; live: b
     <div className="card">
       <div className="mb-3 flex items-center gap-2">
         <span className="text-xs font-medium uppercase tracking-wide text-faint">Activity</span>
-        {live && <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-clay" />}
+        {live && <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-brand" />}
       </div>
       <ol className="space-y-1.5">
         {events.map((e, i) => {
@@ -21,7 +21,7 @@ export function ActivityLog({ events, live }: { events: ProgressEvent[]; live: b
             <li key={i} className="flex gap-3 text-sm">
               <span className="shrink-0 pt-px font-mono text-xs text-faint">{clock(e.at)}</span>
               <span className={`${last && live ? "text-ink" : "text-body"}`}>
-                {last && live && <span className="mr-1 text-clay">›</span>}
+                {last && live && <span className="mr-1 text-brand">›</span>}
                 {e.message}
               </span>
             </li>

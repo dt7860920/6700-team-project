@@ -72,14 +72,14 @@ function derive(scan: Scan | null): Derived {
 
 const RING: Record<NodeState, string> = {
   pending: "border-border2 text-faint",
-  active: "border-clay text-ink shadow-lift",
+  active: "border-brand text-ink shadow-lift",
   ok: "border-ok/50 text-ink",
   skipped: "border-border2 text-faint opacity-70",
   failed: "border-sev-critical/60 text-ink",
 };
 const DOT: Record<NodeState, string> = {
   pending: "bg-border2",
-  active: "bg-clay animate-pulse",
+  active: "bg-brand animate-pulse",
   ok: "bg-ok",
   skipped: "bg-faint/50",
   failed: "bg-sev-critical",
@@ -120,12 +120,12 @@ const nodeTypes = { wf: WorkflowNode };
 // ---- colors ----------------------------------------------------------------
 
 const C_OK = "#15803D";
-const C_ACTIVE = "#D97757";
-const C_IDLE = "#D6D2C8";
-const C_FAINT = "#E8E5DC";
-const C_FAIL = "#B23B2E";
-const LABEL = { fill: "#6E6B64", fontFamily: "ui-monospace, monospace", fontSize: 12 } as const;
-const LABEL_BG = { fill: "#FBFAF7" } as const;
+const C_ACTIVE = "#2E3192";
+const C_IDLE = "#D9CBB6";
+const C_FAINT = "#EADFCF";
+const C_FAIL = "#B3001B";
+const LABEL = { fill: "#58627A", fontFamily: "ui-monospace, monospace", fontSize: 12 } as const;
+const LABEL_BG = { fill: "#FFF8F0" } as const;
 
 export function WorkflowGraph({ scan }: { scan: Scan | null }) {
   const { nodes, edges } = useMemo(() => {
@@ -222,7 +222,7 @@ export function WorkflowGraph({ scan }: { scan: Scan | null }) {
         panOnDrag
         zoomOnScroll={false}
       >
-        <Background variant={BackgroundVariant.Dots} gap={22} size={1} color="#E4E0D6" />
+        <Background variant={BackgroundVariant.Dots} gap={22} size={1} color="#E6D9C6" />
       </ReactFlow>
     </div>
   );

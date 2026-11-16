@@ -55,14 +55,14 @@ export function Composer({
     <div className="mx-auto w-full max-w-2xl">
       {/* greeting */}
       <div className="mb-5 flex items-center justify-center gap-3">
-        <Logo size={26} className="text-clay" />
-        <h2 className="font-serif text-3xl font-normal text-ink">Let&apos;s find the real ones</h2>
+        <Logo size={26} className="text-brand" />
+        <h2 className="font-sans text-3xl font-semibold tracking-tight text-ink">Let&apos;s find the real ones</h2>
       </div>
 
       {/* input box */}
       <div
         className={`rounded-[22px] border bg-card shadow-card transition ${
-          dragging ? "border-clay ring-2 ring-clay/30" : "border-border"
+          dragging ? "border-brand ring-2 ring-brand/30" : "border-border"
         }`}
         onDragOver={(e) => {
           e.preventDefault();
@@ -129,7 +129,7 @@ export function Composer({
       <div className="mt-3 flex flex-wrap items-center justify-between gap-2 px-1 text-[13px]">
         <div className="flex items-center gap-2">
           <select
-            className="rounded-lg border border-transparent bg-transparent py-1 pl-1 pr-2 font-medium text-body hover:border-border focus:border-clay focus:outline-none"
+            className="rounded-lg border border-transparent bg-transparent py-1 pl-1 pr-2 font-medium text-body hover:border-border focus:border-brand focus:outline-none"
             value={selected ?? ""}
             onChange={(e) => onSelect(e.target.value)}
             disabled={busy}
@@ -148,7 +148,7 @@ export function Composer({
               href={current.source}
               target="_blank"
               rel="noreferrer"
-              className="text-claydeep hover:underline"
+              className="text-branddeep hover:underline"
             >
               source ↗
             </a>

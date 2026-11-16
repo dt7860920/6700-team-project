@@ -19,7 +19,7 @@ export function Trace({ steps }: { steps: TraceStep[] }) {
             <div className="pb-1">
               <div className="font-mono text-xs text-ink">
                 {step.file}:{step.line}{" "}
-                <span className="text-claydeep">{step.symbol}</span>
+                <span className="text-branddeep">{step.symbol}</span>
               </div>
               {step.note && <div className="text-xs text-faint">{step.note}</div>}
             </div>

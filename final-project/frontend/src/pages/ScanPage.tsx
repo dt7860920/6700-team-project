@@ -3,13 +3,13 @@ import { useParams } from "react-router-dom";
 import type { TargetSummary } from "../api/types";
 import { ActivityLog } from "../components/ActivityLog";
 import { FindingsList } from "../components/FindingsList";
-import { WorkflowGraph } from "../components/WorkflowGraph";
+import { StageTimeline } from "../components/StageTimeline";
 import type { useScan } from "../hooks/useScan";
 
 const STATUS_TONE: Record<string, string> = {
   done: "text-ok",
   failed: "text-sev-critical",
-  running: "text-clay",
+  running: "text-brand",
   queued: "text-muted",
 };
 
@@ -41,7 +41,7 @@ export function ScanPage({ scan, targets }: Props) {
     <div className="mx-auto max-w-4xl space-y-5 px-4 py-8 md:px-8">
       {/* header */}
       <div className="flex flex-wrap items-baseline justify-between gap-2">
-        <h1 className="font-serif text-2xl font-normal text-ink">
+        <h1 className="font-sans text-2xl font-semibold tracking-tight text-ink">
           {s ? targetName(s.target_id) : scanId ? "Loading scan…" : "Scan"}
         </h1>
         {s && (
@@ -59,12 +59,7 @@ export function ScanPage({ scan, targets }: Props) {
 
       {s && (
         <>
-          {s.progress && (
-            <div className="font-mono text-sm text-muted">
-              <span className="text-clay">›</span> {s.progress}
-            </div>
-          )}
-          <WorkflowGraph scan={s} />
+          <StageTimeline scan={s} />
           <ActivityLog events={s.events} live={running} />
           {scan.phase === "done" && <FindingsList scan={s} findings={scan.findings} />}
         </>
