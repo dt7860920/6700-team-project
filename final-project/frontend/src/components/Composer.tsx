@@ -1,6 +1,5 @@
 import { useCallback, useRef, useState } from "react";
 import type { InfoResponse, TargetSummary } from "../api/types";
-import { Logo } from "./Logo";
 
 interface Props {
   targets: TargetSummary[];
@@ -53,12 +52,6 @@ export function Composer({
 
   return (
     <div className="mx-auto w-full max-w-2xl">
-      {/* greeting */}
-      <div className="mb-5 flex items-center justify-center gap-3">
-        <Logo size={26} className="text-brand" />
-        <h2 className="font-sans text-3xl font-semibold tracking-tight text-ink">Let&apos;s find the real ones</h2>
-      </div>
-
       {/* input box */}
       <div
         className={`rounded-[22px] border bg-card shadow-card transition ${
@@ -80,19 +73,13 @@ export function Composer({
             disabled={busy}
           />
         ) : (
-          <div className="flex h-32 items-center px-5 pt-4 text-[15px] text-muted">
-            {current ? (
-              <span>
-                {dragging ? "Drop a code file to analyze…" : current.description}
-              </span>
-            ) : (
-              <span className="text-faint">Pick a target below, or choose “snippet” to paste code.</span>
-            )}
-          </div>
+          dragging && (
+            <div className="px-5 pt-4 text-[15px] text-muted">Drop a code file to analyze…</div>
+          )
         )}
 
         {/* footer row */}
-        <div className="flex items-center justify-between gap-2 px-3 pb-3 pt-1">
+        <div className="flex items-center justify-between gap-2 px-3 pb-3 pt-3">
           <div className="flex items-center gap-1">
             <button
               type="button"
