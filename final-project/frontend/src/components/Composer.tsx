@@ -25,6 +25,8 @@ export function Composer({
   info,
 }: Props) {
   const [dragging, setDragging] = useState(false);
+  const [authorized, setAuthorized] = useState(false);
+  const [intendedUse, setIntendedUse] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
   const current = targets.find((t) => t.target_id === selected) ?? null;
   const isSnippet = current?.target_id === "snippet";
@@ -48,7 +50,9 @@ export function Composer({
     if (file) readFile(file);
   };
 
-  const canAnalyze = !busy && !!selected && (!isSnippet || snippet.trim().length > 0);
+  const agreed = authorized && intendedUse;
+  const canAnalyze =
+    agreed && !busy && !!selected && (!isSnippet || snippet.trim().length > 0);
 
   return (
     <div className="mx-auto w-full max-w-2xl">
@@ -97,7 +101,12 @@ export function Composer({
               </span>
             )}
           </div>
-          <button className="btn-primary px-5" onClick={onAnalyze} disabled={!canAnalyze}>
+          <button
+            className="btn-primary px-5"
+            onClick={onAnalyze}
+            disabled={!canAnalyze}
+            title={agreed ? undefined : "Confirm both statements below to analyze"}
+          >
             {busy ? (
               <>
                 <span className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-white/40 border-t-white" />
@@ -147,6 +156,35 @@ export function Composer({
           </span>
         )}
       </div>
+
+      {/* required acknowledgements: Analyze stays disabled until both are checked */}
+      <fieldset className="mt-5 space-y-2.5 px-1 text-[13px] leading-snug text-body" disabled={busy}>
+        <legend className="sr-only">Required confirmations</legend>
+        <label className="flex cursor-pointer items-start gap-2.5">
+          <input
+            type="checkbox"
+            className="mt-0.5 h-4 w-4 shrink-0 accent-branddeep"
+            checked={authorized}
+            onChange={(e) => setAuthorized(e.target.checked)}
+          />
+          <span>
+            By checking this box, I am confirming that{" "}
+            <strong className="font-semibold text-ink">I am authorized to share and edit this code</strong>.
+          </span>
+        </label>
+        <label className="flex cursor-pointer items-start gap-2.5">
+          <input
+            type="checkbox"
+            className="mt-0.5 h-4 w-4 shrink-0 accent-branddeep"
+            checked={intendedUse}
+            onChange={(e) => setIntendedUse(e.target.checked)}
+          />
+          <span>
+            By checking this box, I am confirming that I am using ONO for its intended purpose and am
+            not using this tool with malicious intent against any agent, person, or organization.
+          </span>
+        </label>
+      </fieldset>
 
       <input
         ref={fileRef}
