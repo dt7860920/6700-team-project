@@ -42,7 +42,7 @@ export function ScanPage({ scan, targets }: Props) {
       {/* header */}
       <div className="flex flex-wrap items-baseline justify-between gap-2">
         <h1 className="font-serif text-2xl font-normal text-ink">
-          {s ? targetName(s.target_id) : scanId ? "Loading scan…" : "Scan"}
+          {s ? (s.target_name ?? targetName(s.target_id)) : scanId ? "Loading scan…" : "Scan"}
         </h1>
         {s && (
           <div className="flex items-center gap-3 font-mono text-xs">

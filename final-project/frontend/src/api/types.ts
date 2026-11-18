@@ -72,6 +72,7 @@ export interface ProgressEvent {
 export interface Scan {
   scan_id: string;
   target_id: string;
+  target_name?: string | null;
   status: ScanStatus;
   model_backend: string;
   created_at: string;
@@ -91,8 +92,22 @@ export interface ScanOptions {
 }
 
 export interface ScanRequest {
-  target_id: string;
+  target_id?: string;
+  repo_url?: string;
+  authorized_to_scan?: boolean;
   options?: ScanOptions;
+}
+
+export interface SourceCheck {
+  repository: string;
+  canonical_url: string;
+  default_branch: string;
+  size_mb: number;
+  languages: string[];
+  supported_languages: string[];
+  unsupported_languages: string[];
+  scan_ready: boolean;
+  message: string;
 }
 
 export interface ApiError {

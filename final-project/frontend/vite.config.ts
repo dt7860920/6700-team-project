@@ -5,7 +5,16 @@ import { resolve } from "node:path";
 // API routes the SPA talks to. In dev these are proxied to the FastAPI app
 // (default :8080); in production the SPA is served same-origin from /ui so the
 // same absolute paths resolve against the app itself.
-const API_PREFIXES = ["/health", "/info", "/targets", "/scans", "/findings", "/docs", "/openapi.json"];
+const API_PREFIXES = [
+  "/health",
+  "/info",
+  "/targets",
+  "/sources",
+  "/scans",
+  "/findings",
+  "/docs",
+  "/openapi.json",
+];
 const API_TARGET = process.env.ONO_API ?? "http://localhost:8080";
 
 export default defineConfig({

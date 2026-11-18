@@ -81,6 +81,18 @@ class Settings(BaseSettings):
         default=None,
         description="API key for the model endpoint. Never logged or returned by the API.",
     )
+    github_oauth_client_id: str | None = Field(
+        default=None,
+        description="GitHub OAuth App client id for connecting an account (read:user only).",
+    )
+    github_oauth_client_secret: SecretStr | None = Field(
+        default=None,
+        description="GitHub OAuth App secret; never logged or returned by the API.",
+    )
+    github_oauth_callback_url: str | None = Field(
+        default=None,
+        description="Exact OAuth callback URL registered with GitHub.",
+    )
 
     max_verifier_retries: int = Field(
         default=3,

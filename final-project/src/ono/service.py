@@ -1,7 +1,7 @@
-"""Scan service - the one place that enforces the allowlist and runs the pipeline.
+"""Scan service - the one place that resolves scan sources and runs the pipeline.
 
-Both the HTTP API and the Gradio UI call :class:`ScanService`, so the
-authorization check cannot be bypassed by going through a different front door.
+Both the HTTP API and the Gradio UI call :class:`ScanService`. Configured targets
+must be allowlisted; public GitHub sources are validated server-side before use.
 
 Scans are **asynchronous**: :meth:`ScanService.submit_scan` authorizes the target,
 creates a ``queued`` scan record and hands the work to a small thread pool
@@ -40,6 +40,7 @@ from ono.models import (
     StageResult,
     utcnow,
 )
+from ono.sources import SourceCheckError, check_public_github_repo, target_from_public_github
 from ono.store import ScanStore
 from ono.targets import Target, TargetRegistry
 
@@ -115,8 +116,9 @@ class ScanService:
             UnauthorizedTargetError: if ``request.target_id`` is not in the allowlist.
             ScanBusyError: if the worker pool and its queue are both full.
         """
-        # 1. Allowlist gate - exact match, before anything else happens.
-        target = self.registry.require(request.target_id)
+        # Resolve configured targets through the exact allowlist. A user-selected
+        # repository is accepted only after a server-side public GitHub check.
+        target = self._resolve_target(request)
 
         # 2. Admission: a bounded queue, never an unbounded backlog of model sessions.
         with self._lock:
@@ -144,10 +146,26 @@ class ScanService:
         Raises:
             UnauthorizedTargetError: if ``request.target_id`` is not in the allowlist.
         """
-        target = self.registry.require(request.target_id)
+        target = self._resolve_target(request)
         scan = self._create_record(target, status="running")
         scan, findings = self._execute(scan.scan_id, target, request)
         return ScanResponse(**scan.model_dump(), findings=findings)
+
+    def check_repository(self, repo_url: str) -> dict[str, object]:
+        """Return the public source check shown before the user starts a scan."""
+        return check_public_github_repo(repo_url, max_clone_mb=self.settings.max_clone_mb)
+
+    def _resolve_target(self, request: ScanRequest) -> Target:
+        if request.repo_url is not None:
+            if self.analyzer.backend != "service":
+                raise SourceCheckError(
+                    "Scanning a repository URL requires the real service backend; "
+                    "the mock backend only returns demo results."
+                )
+            return target_from_public_github(request.repo_url)
+        if request.target_id is None:  # ScanRequest validation normally prevents this.
+            raise ValueError("a configured target or public repository URL is required")
+        return self.registry.require(request.target_id)
 
     def wait(self, scan_id: str, timeout: float | None = None) -> Scan | None:
         """Block until the background scan ``scan_id`` has ended (tests / scripts)."""
@@ -183,6 +201,7 @@ class ScanService:
         scan = Scan(
             scan_id=f"scn_{uuid.uuid4().hex[:12]}",
             target_id=target.target_id,
+            target_name=target.name,
             status=status,
             model_backend=self.analyzer.backend,
             created_at=utcnow(),
@@ -224,7 +243,15 @@ class ScanService:
         )
         progress = _StoreProgress(self.store, scan_id)
         try:
+            if target.snapshot.startswith("github-public:"):
+                progress.step("Checking public GitHub source and supported languages")
+                checked = self.check_repository(target.source)
+                if not checked["scan_ready"]:
+                    raise SourceCheckError(str(checked["message"]))
             result = self.analyzer.run(scan_id, target, request.options, progress=progress)
+        except SourceCheckError as exc:
+            scan = self._finish(scan_id, status="failed", message=f"source check failed: {exc}")
+            return scan, []
         except Exception as exc:
             log.exception("scan %s failed", scan_id)
             # PipelineError carries an operator-safe reason (e.g. "executor unreachable at

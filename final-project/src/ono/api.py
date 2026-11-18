@@ -6,7 +6,8 @@ One process, one published port (8080). OpenAPI docs live at ``/docs``.
     GET  /info                       app / version / environment / backend (no secrets)
     GET  /targets                    the allowlist
     POST /scans                      start a scan in the background -> 202 + scan_id
-                                     (403 if target_id is not allowlisted, 429 if busy)
+                                     (403 if target_id is not allowlisted, 422 if source check
+                                     fails, 429 if busy)
     GET  /scans/{scan_id}            live scan record: status, progress, stages, count
     GET  /scans/{scan_id}/findings   findings for a scan (so far)
     GET  /findings/{finding_id}      one finding
@@ -23,6 +24,7 @@ from typing import Annotated
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.concurrency import run_in_threadpool
 
 from ono import __version__
 from ono.analyzer import build_analyzer
@@ -35,10 +37,13 @@ from ono.models import (
     InfoResponse,
     Scan,
     ScanRequest,
+    SourceCheckRequest,
+    SourceCheckResponse,
     TargetsResponse,
     TargetSummary,
 )
 from ono.service import ScanService
+from ono.sources import SourceCheckError
 from ono.store import InMemoryScanStore
 from ono.targets import TargetRegistry, UnauthorizedTargetError, get_registry
 from ono.webui import STATIC_DIR, spa_built
@@ -87,8 +92,10 @@ def create_app(
         summary="Agentic vulnerability analysis of authorized code targets.",
         description=(
             "ONO ingests an **authorized** code target, finds vulnerabilities, proves they are "
-            "reachable, and proposes verified fixes. Scans are addressed by `target_id` from "
-            "the allowlist (`GET /targets`) - never by URL. A scan runs in the background: "
+            "reachable, and proposes fixes. Configured targets use `target_id` from the allowlist; "
+            "public GitHub repositories can be checked at `/sources/check` and scanned by HTTPS "
+            "URL. Private repositories and arbitrary hosts are not accepted. A scan runs in the "
+            "background: "
             "`POST /scans` answers **202** with a `scan_id`; poll `GET /scans/{scan_id}` "
             "(status `queued` -> `running` -> `done` | `failed`, with a live `progress` line) "
             "and read `GET /scans/{scan_id}/findings`. "
@@ -150,6 +157,19 @@ def create_app(
             targets=[TargetSummary(**t.model_dump()) for t in svc.registry.all()]
         )
 
+    @app.post(
+        "/sources/check",
+        response_model=SourceCheckResponse,
+        tags=["targets"],
+        summary="Check a public GitHub repository before scanning",
+    )
+    async def check_source(body: SourceCheckRequest, svc: ServiceDep) -> SourceCheckResponse:
+        try:
+            checked = await run_in_threadpool(svc.check_repository, body.repo_url)
+        except SourceCheckError as exc:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+        return SourceCheckResponse.model_validate(checked)
+
     # -- scans ------------------------------------------------------------
     @app.post(
         "/scans",
@@ -158,18 +178,22 @@ def create_app(
         tags=["scans"],
         responses={
             403: {"model": ErrorResponse, "description": "target_id not allowlisted"},
+            422: {"model": ErrorResponse, "description": "public repository check failed"},
             429: {"model": ErrorResponse, "description": "worker pool and queue are full"},
         },
-        summary="Start a scan of an authorized target (asynchronous)",
+        summary="Start a scan of a configured target or checked public repository",
         description=(
-            "Validates the target against the allowlist, creates the scan with "
+            "Validates configured targets against the allowlist, or checks that a submitted "
+            "GitHub repository is public, creates the scan with "
             '`status="queued"` and runs it on a background worker. Returns **202** at '
             "once; poll `GET /scans/{scan_id}` until `status` is `done` or `failed`."
         ),
     )
     async def create_scan(body: ScanRequest, svc: ServiceDep) -> Scan:
-        # submit_scan only authorizes and enqueues (no blocking work on the event loop).
-        return svc.submit_scan(body)
+        try:
+            return await run_in_threadpool(svc.submit_scan, body)
+        except SourceCheckError as exc:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
 
     @app.get(
         "/scans/{scan_id}",

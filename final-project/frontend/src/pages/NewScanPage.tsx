@@ -1,5 +1,5 @@
 import { Composer } from "../components/Composer";
-import type { InfoResponse, TargetSummary } from "../api/types";
+import type { InfoResponse, SourceCheck, TargetSummary } from "../api/types";
 
 interface Props {
   targets: TargetSummary[];
@@ -7,6 +7,14 @@ interface Props {
   onSelect: (id: string) => void;
   snippet: string;
   onSnippet: (code: string) => void;
+  repoUrl: string;
+  onRepoUrl: (value: string) => void;
+  repoCheck: SourceCheck | null;
+  repoChecking: boolean;
+  repoCheckError: string | null;
+  onCheckSource: () => void;
+  authorizedToScan: boolean;
+  onAuthorizedToScan: (value: boolean) => void;
   onAnalyze: () => void;
   busy: boolean;
   info: InfoResponse | null;
