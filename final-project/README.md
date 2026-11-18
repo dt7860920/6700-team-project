@@ -18,7 +18,7 @@ Team: Sazan Khalid · Kenedy Ducheine · Junyi Tang · Jeffrey Pinarchick
 
 ## What it does
 
-ONO never scans "a website". Every request names a **`target_id`** from an exact allowlist of targets we host ourselves — intentionally-vulnerable practice apps (OWASP PyGoat, OWASP Juice Shop), ingested open-source repository snapshots, or a pasted code snippet. An unknown id is rejected with **HTTP 403 before any analysis starts**, and a malformed one (such as a full URL) fails request validation with **HTTP 422**.
+ONO scans code snapshots, not live websites. Practice apps, snippets, and packaged examples use the exact `target_id` allowlist. Users can also check and scan a public GitHub repository by HTTPS URL; the server accepts only `github.com` repositories that GitHub confirms are public. Private repositories, arbitrary hosts, and repository archive uploads are not accepted. Unknown configured ids return **HTTP 403**; invalid or non-public repository sources return **HTTP 422**.
 
 Each **finding** is shaped by the *output-strength ladder*:
 
@@ -108,7 +108,8 @@ Interactive documentation is generated from the code at **`/docs`** (Swagger UI)
 | `GET` | `/health` | Liveness → `{"status":"ok"}` |
 | `GET` | `/info` | App name, version, environment, model backend (no secrets) |
 | `GET` | `/targets` | The authorized-target allowlist |
-| `POST` | `/scans` | Start a scan **in the background**. **202** with the scan record (`status: "queued"`, `scan_id`). **403** if `target_id` is not allowlisted; **429** if the worker pool and queue are full. |
+| `POST` | `/sources/check` | Check that a GitHub URL points to a public repo within the configured size limit and report GitHub-detected languages. |
+| `POST` | `/scans` | Start a scan in the background using an allowlisted `target_id` or public `repo_url` with `authorized_to_scan: true`. **403** for an unknown id; **422** if repository validation fails; **429** if busy. |
 | `GET` | `/scans/{scan_id}` | The **live** scan record: `status` (`queued → running → done \| failed`), `progress` (what it is doing now), `events` (activity log), `pipeline` (stage results so far), `findings_count`, `message` |
 | `GET` | `/scans/{scan_id}/findings` | Findings for a scan (empty until it is `done`) |
 | `GET` | `/findings/{finding_id}` | One finding. `finding_id` is unique per scan; the `fingerprint` field is the same for the same sink across scans, so use it to compare scans |
@@ -159,10 +160,11 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST $BASE/scans \
 
 ## The analyst UI (handoff surface)
 
-`http://<host>:8080/ui` is the only surface a reviewer needs; it is mounted inside the same FastAPI process (no extra port) and calls the same `ScanService` the API uses, so the allowlist check cannot be bypassed from the browser.
+`http://<host>:8080/ui` is the only surface a reviewer needs; it is mounted inside the same FastAPI process (no extra port) and calls the same `ScanService` the API uses, so source checks cannot be bypassed from the browser.
 
-1. **Pick a target** from the dropdown (name + kind: *practice app*, *repository*, or *paste code*). Choosing *Pasted code snippet* reveals a code box with an example.
-2. **Click Analyze.** The scan is submitted in the background and the page **polls** it every `UI_POLL_INTERVAL_S` seconds, so the browser never waits on a long request. The progress card shows a status pill (Queued / Running / Done / Failed), the elapsed time, the current step (`Cloning … → Static analysis → Analyzing candidate 2 of 3 - app/views.py:16 → Verifying`), a five-stage checklist with timings, and an expandable activity log (every candidate the agents confirmed or dismissed, and why).
+1. **Choose a source.** Pick a configured practice app/example, paste code, or choose **Public GitHub repository** and enter an HTTPS URL such as `https://github.com/owner/repository`. Press **Check source** before scanning. Public repos need no GitHub account connection; private repos and archive uploads are not supported.
+2. **Review coverage and confirm permission.** The source check reports public visibility, repository size, and GitHub-detected languages. Semgrep is configured for Python, JavaScript, TypeScript, Java, Go, Ruby, and PHP; other detected languages may not be analyzed. This is an estimate of coverage, not proof every file is scanned. The user confirms they are authorized to scan the source and that it is processed by the configured analysis service.
+3. **Click Analyze.** The scan is submitted in the background and the page **polls** it every `UI_POLL_INTERVAL_S` seconds, so the browser never waits on a long request. The progress card shows a status pill (Queued / Running / Done / Failed), the elapsed time, the current step, a five-stage checklist with timings, and an expandable activity log. The real backend checks the Docker sandbox before cloning; ONO reads code through the sandbox and does not execute repository code.
 3. **Read the findings.** Each finding is a card: title; **CWE** linked to MITRE; **severity**; the **rung** badge (1–5, hover for what it means); **✔ verified** (the deterministic verifier passed) or **⚠ not verified** (model-asserted); **confidence**; `file:line`; the readable **source → sink trace**; the description; and the **proposed patch** as a collapsible colored diff (plus the detection rule on rung 5). Cards are ordered by severity. "How to read a finding" explains the ladder; "Raw JSON" shows exactly what the API returned.
 4. **No findings** is a clear green state ("No vulnerabilities found", with how many candidates were reviewed and dismissed). **A failed scan** shows the reason in plain language ("Scan failed: executor unreachable at …") with a hint to check the model endpoint and the Executor — never a stack trace. If ONO is at capacity you see "Busy … retry in a moment".
 5. **Long scans.** A real `service`-backend scan takes minutes. You can leave the page: the scan keeps running, and **Look up a scan by id** re-attaches to it (the id is in the status card and in the API response).
@@ -218,7 +220,7 @@ All configuration is read by `ono.config.Settings` (pydantic-settings) from envi
 
 The ingest/SAST/agent settings apply to the `service` backend (`mock` never clones, runs Semgrep, calls a model or opens a sandbox). The `EXECUTOR_URL` / `EXECUTOR_TOKEN` pair is how the app reaches the Executor service; the `SANDBOX_*` settings configure the jails the Executor spawns. Upper bound on model calls per scan: `MAX_CANDIDATES × (ANALYST_MAX_STEPS + 1 if PLANNER_ENABLED)` — 180 with the defaults — and the orchestrator enforces it as a hard counter.
 
-The **target allowlist** lives in [`src/ono/targets.yaml`](src/ono/targets.yaml) and is loaded into an exact mapping (`TargetRegistry`). Adding a target means adding an entry there — nothing is accepted that is not in the file. Three real, cloneable targets ship: `pygoat` and `juice-shop` (practice apps) and `vulpy` (a small intentionally vulnerable Flask repo, the "ingested OSS repo" kind).
+The **configured target allowlist** lives in [`src/ono/targets.yaml`](src/ono/targets.yaml) and is loaded into an exact mapping (`TargetRegistry`). User-selected repositories are a narrow exception: only HTTPS GitHub owner/repository URLs are accepted, GitHub must confirm they are public and within the size limit, and each scan gets a generated target id. Three cloneable examples ship: `pygoat`, `juice-shop`, and `vulpy`.
 
 ---
 
@@ -387,4 +389,4 @@ The stress tests live in `tests/test_executor_docker.py` and run automatically w
 
 ## Guardrails
 
-ONO is defensive tooling that uses offensive techniques, so the boundary is enforced in code, not policy: scans are addressed by `target_id` only (never a URL), the registry is an exact allowlist, the agents read target code only through a jailed container with no network, and the Executor is never published. Ingest and Semgrep still run outside the jail for now. Read-only proofs-of-concept are planned for step 3b-2 and will run only inside that sandbox. The full ethics and dual-use discussion is in [§10 of the project plan](docs/plan.md#10-ethics--dual-use-guardrails).
+ONO is defensive tooling that uses offensive techniques, so the boundary is enforced in code, not policy: configured targets are allowlisted; user-selected sources are limited to public GitHub repositories; the agents read target code only through a jailed container with no network; and the Executor is never published. ONO does not run repository code. Ingest and Semgrep still run outside the jail for now. Read-only proofs-of-concept are planned for step 3b-2 and will run only inside that sandbox. The full ethics and dual-use discussion is in [§10 of the project plan](docs/plan.md#10-ethics--dual-use-guardrails).

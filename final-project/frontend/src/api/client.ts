@@ -7,6 +7,7 @@ import type {
   InfoResponse,
   Scan,
   ScanRequest,
+  SourceCheck,
   TargetsResponse,
 } from "./types";
 
@@ -46,6 +47,11 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 export const api = {
   info: () => request<InfoResponse>("/info"),
   targets: () => request<TargetsResponse>("/targets"),
+  checkSource: (repoUrl: string) =>
+    request<SourceCheck>("/sources/check", {
+      method: "POST",
+      body: JSON.stringify({ repo_url: repoUrl }),
+    }),
   startScan: (body: ScanRequest) =>
     request<Scan>("/scans", { method: "POST", body: JSON.stringify(body) }),
   getScan: (scanId: string) => request<Scan>(`/scans/${scanId}`),

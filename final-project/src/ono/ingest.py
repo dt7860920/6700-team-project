@@ -105,6 +105,8 @@ def clone_repo(source: str, dest: Path, *, timeout_s: float) -> None:
         "git",
         "-c",
         "core.hooksPath=/dev/null",  # never run hooks from a template or the clone
+        "-c",
+        "http.followRedirects=false",  # do not let a supplied repo trigger another host
         "clone",
         "--quiet",
         "--depth",

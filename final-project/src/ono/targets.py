@@ -1,9 +1,8 @@
-"""Target registry - the exact allowlist of authorized analysis targets.
+"""Configured target registry - the exact allowlist of built-in scan targets.
 
-ONO never analyzes an arbitrary URL or host. Every scan names a ``target_id``
-that must resolve through this registry to a snapshot we host ourselves. This
-is the enforcement point for the "authorized targets only" guardrail: an unknown
-``target_id`` is rejected (HTTP 403) before any pipeline stage runs.
+Configured scans name a ``target_id`` that must resolve through this registry.
+User-selected source URLs are handled separately by :mod:`ono.sources`, which
+accepts only public GitHub repositories after a fixed-host metadata check.
 
 The registry is a plain mapping loaded from ``targets.yaml`` shipped inside the
 package - an *exact* allowlist, deliberately not a probabilistic structure.

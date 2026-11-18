@@ -1,9 +1,8 @@
 # Operation: Negative One - target allowlist (the registry).
 #
-# This file IS the authorization boundary. A scan request is accepted only if its
-# `target_id` is a key below; anything else is rejected with HTTP 403 before any
-# analysis starts. The agent is never handed a URL or hostname - only a target_id
-# that resolves, through this registry, to a snapshot we host ourselves.
+# This file is the exact allowlist of built-in targets. User-selected public GitHub
+# repositories are handled separately in ono.sources, which restricts URLs to
+# github.com and checks that GitHub reports the repository as public.
 #
 # Every entry is an authorized, self-hosted target:
 #   * practice-app  - an intentionally-vulnerable training application we run in

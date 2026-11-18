@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { Route, Routes, useNavigate } from "react-router-dom";
 import { api, ApiError } from "./api/client";
-import type { InfoResponse, TargetSummary } from "./api/types";
+import type { InfoResponse, SourceCheck, TargetSummary } from "./api/types";
 import { Sidebar, type ScanSummary } from "./components/Sidebar";
 import { NewScanPage } from "./pages/NewScanPage";
 import { ScanPage } from "./pages/ScanPage";
@@ -25,6 +25,11 @@ export default function App() {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
   const [snippet, setSnippet] = useState("");
+  const [repoUrl, setRepoUrl] = useState("");
+  const [repoCheck, setRepoCheck] = useState<SourceCheck | null>(null);
+  const [repoChecking, setRepoChecking] = useState(false);
+  const [repoCheckError, setRepoCheckError] = useState<string | null>(null);
+  const [authorizedToScan, setAuthorizedToScan] = useState(false);
   const [history, setHistory] = useState<ScanSummary[]>(loadHistory);
 
   const scan = useScan();
@@ -58,7 +63,7 @@ export default function App() {
     setHistory((prev) => {
       const summary: ScanSummary = {
         scan_id: rec.scan_id,
-        name: targetName(rec.target_id),
+        name: rec.target_name ?? targetName(rec.target_id),
         status: rec.status,
         created_at: rec.created_at,
         findings_count: rec.findings_count,
@@ -78,11 +83,31 @@ export default function App() {
 
   const onAnalyze = async () => {
     if (!selected) return;
-    const started = await scan.start({
-      target_id: selected,
-      options: selected === "snippet" ? { snippet } : {},
-    });
+    const body = selected === "public-github"
+      ? { repo_url: repoUrl, authorized_to_scan: authorizedToScan }
+      : { target_id: selected, options: selected === "snippet" ? { snippet } : {} };
+    const started = await scan.start(body);
     if (started) navigate(`/scan/${started.scan_id}`);
+  };
+
+  const onRepoUrl = (value: string) => {
+    setRepoUrl(value);
+    setRepoCheck(null);
+    setRepoCheckError(null);
+    setAuthorizedToScan(false);
+  };
+
+  const onCheckSource = async () => {
+    setRepoChecking(true);
+    setRepoCheckError(null);
+    setRepoCheck(null);
+    try {
+      setRepoCheck(await api.checkSource(repoUrl));
+    } catch (err) {
+      setRepoCheckError(err instanceof ApiError ? err.detail : "Could not check this repository.");
+    } finally {
+      setRepoChecking(false);
+    }
   };
 
   const onNew = () => {
@@ -112,6 +137,14 @@ export default function App() {
                 onSelect={setSelected}
                 snippet={snippet}
                 onSnippet={setSnippet}
+                repoUrl={repoUrl}
+                onRepoUrl={onRepoUrl}
+                repoCheck={repoCheck}
+                repoChecking={repoChecking}
+                repoCheckError={repoCheckError}
+                onCheckSource={onCheckSource}
+                authorizedToScan={authorizedToScan}
+                onAuthorizedToScan={setAuthorizedToScan}
                 onAnalyze={onAnalyze}
                 busy={busy}
                 info={info}
