@@ -1,7 +1,7 @@
 .PHONY: install dev executor lint format typecheck test test-docker check smoke-ci smoke-live docker-build docker-run compose-up compose-down
 
 install:          ## Install runtime + dev dependencies
-	uv sync --extra dev
+	uv sync --frozen
 
 dev:              ## Run locally with auto-reload (reads .env)
 	uv run ono

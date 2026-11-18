@@ -1,30 +1,140 @@
 name: CI
 
+# GitHub only runs workflows from .github/workflows/ at the repository root, so this one
+# file covers both projects in the repo:
+#   ono-*     Operation: Negative One, the final project, in final-project/
+#   hw-*      the Homework package (src/team_project) at the repository root
+#
+# Every action is pinned to a full commit SHA (a tag can be moved; a SHA cannot).
+# To upgrade one, look up the new release's commit and replace both the SHA and the comment.
+
 on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  quality:
+  # ---------------------------------------------------------------------------
+  # Operation: Negative One (final-project/)
+  # ---------------------------------------------------------------------------
+  ono-quality:
+    name: "ONO: lint · types · tests · golden path (py3.13, mock backend)"
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: final-project
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv and Python 3.13
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: "3.13"
+          enable-cache: true
+          cache-dependency-glob: final-project/uv.lock
+
+      - name: Sync dependencies (lockfile only, dev group included)
+        run: uv sync --frozen
+
+      - name: Ruff (lint)
+        run: uv run ruff check
+
+      - name: Ruff (format)
+        run: uv run ruff format --check
+
+      - name: mypy
+        run: uv run mypy src/
+
+      - name: pytest
+        run: uv run pytest
+
+      - name: Golden-path smoke (in-process, mock backend)
+        run: uv run scripts/golden_path.py --in-process
+
+  ono-container:
+    name: "ONO: docker build + /health + one scan"
+    runs-on: ubuntu-latest
+    needs: ono-quality
+    defaults:
+      run:
+        working-directory: final-project
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build image
+        run: docker build -t ono:ci .
+
+      - name: Run and probe /health, then scan pygoat end to end
+        run: |
+          docker run -d --name ono-ci -p 8080:8080 --env-file .env.example.production ono:ci
+          for i in $(seq 1 20); do
+            if curl -fsS http://localhost:8080/health; then echo; break; fi
+            sleep 1
+          done
+          curl -fsS http://localhost:8080/health | grep -q '"ok"'
+          # POST /scans is asynchronous: 202 + scan_id, then poll GET /scans/{id} to "done".
+          scan_id=$(curl -fsS -X POST http://localhost:8080/scans -H 'content-type: application/json' \
+            -d '{"target_id":"pygoat"}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["scan_id"])')
+          for i in $(seq 1 30); do
+            status=$(curl -fsS "http://localhost:8080/scans/$scan_id" | python3 -c 'import json,sys; print(json.load(sys.stdin)["status"])')
+            [ "$status" = "done" ] && break
+            [ "$status" = "failed" ] && { echo "scan failed"; exit 1; }
+            sleep 1
+          done
+          [ "$status" = "done" ]
+          curl -fsS "http://localhost:8080/scans/$scan_id/findings" | grep -q '"CWE-89"'
+
+      - name: Container logs
+        if: failure()
+        run: docker logs ono-ci || true
+
+      - name: Clean up
+        if: always()
+        run: docker rm -f ono-ci || true
+
+  # ---------------------------------------------------------------------------
+  # Homework package (repository root: src/team_project)
+  # ---------------------------------------------------------------------------
+  hw-quality:
+    name: "HW package: lint · types"
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
-        with: { python-version: "3.13" }
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: "3.13"
+          cache-dependency-glob: uv.lock
       - run: uv sync --extra dev --frozen
       - run: uv run ruff check src/ tests/
       - run: uv run ruff format --check src/ tests/
       - run: uv run mypy src/
 
-  test:
+  hw-test:
+    name: "HW package: tests (py${{ matrix.python-version }})"
     runs-on: ubuntu-latest
     strategy:
       matrix:
         python-version: ["3.13", "3.14"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
-        with: { python-version: "${{ matrix.python-version }}" }
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: "${{ matrix.python-version }}"
+          cache-dependency-glob: uv.lock
       - run: uv sync --extra dev --frozen
 
       - name: Lint with ruff

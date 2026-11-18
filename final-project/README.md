@@ -50,12 +50,12 @@ Requires Python 3.13 or newer and [`uv`](https://docs.astral.sh/uv/).
 ```bash
 git clone https://github.com/dt7860920/6700-team-project.git
 cd 6700-team-project/final-project
-uv sync --extra dev
+uv sync --frozen                # installs the app + the dev group (ruff, mypy, pytest, ...)
 cp .env.example.local .env
 uv run ono                      # http://localhost:8080  (UI at /ui, docs at /docs)
 ```
 
-Quality gates (the same ones defined in the CI workflow):
+Quality gates (the same ones CI runs on every push and pull request):
 
 ```bash
 uv run ruff check && uv run ruff format --check
@@ -65,7 +65,7 @@ uv run scripts/golden_path.py --in-process     # golden-path heartbeat, no serve
 # or simply:  make check smoke-ci
 ```
 
-Run these by hand for now. The workflow is at `final-project/.github/workflows/ci.yml`, but GitHub only runs workflows from `.github/workflows/` at the repository root, and the root CI does not cover `final-project/`.
+CI lives in the repository root's [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) (GitHub only runs workflows from there). Its `ono-*` jobs run in `final-project/`: `uv sync --frozen`, ruff, mypy, pytest, the in-process golden path, then a Docker build that probes `/health` and runs one scan end to end. Every action is pinned to a commit SHA.
 
 ## Run with Docker
 
@@ -269,7 +269,6 @@ final-project/
 ├── docs/               project plan and Deliverable 2 write-up
 ├── Dockerfile · compose.yml · .dockerignore
 ├── .env.example.local · .env.example.production · .env.example.service
-├── .github/workflows/ci.yml   ruff + mypy + pytest + docker build/health (not active from this subfolder)
 └── Makefile · .pre-commit-config.yaml
 ```
 
@@ -383,7 +382,7 @@ The stress tests live in `tests/test_executor_docker.py` and run automatically w
 - **Containerized deployment** — multi-step `Dockerfile` (lockfile-first cached dependency layer, non-root user, `HEALTHCHECK`), `.dockerignore`, and a `compose.yml` where `docker compose up -d` is the whole start procedure once `.env` sets `EXECUTOR_TOKEN`.
 - **Documented API** — FastAPI with typed pydantic request/response models, generated OpenAPI at `/docs` and `/redoc`, explicit error schemas (403 / 404 / 422 / 429).
 - **Publish only the app port** — of the two Compose services, only the app publishes a port (`8080`). The Executor has no `ports:` block, and future DB / vLLM services stay internal the same way.
-- **Testing and CI** — pytest (including the blocking allowlist security test), ruff, strict mypy, a golden-path smoke script, and a GitHub Actions workflow definition that also builds the image and probes `/health` (not active from this subfolder; see [Run locally](#run-locally-uv)).
+- **Testing and CI** — pytest (including the blocking allowlist security test), ruff, strict mypy, a golden-path smoke script, and and a GitHub Actions workflow (at the repository root, actions pinned to commit SHAs) that runs all of them on every push and pull request, then builds the image, probes `/health`, and runs one scan in the container.
 
 ## Guardrails
 
