@@ -56,6 +56,9 @@ def _settings(workspace: Path, **overrides: Any) -> Settings:
         "executor_token": TOKEN,
         "workspace_dir": workspace,
         "context_lines": 5,
+        # These tests exercise the detection core; the graded verifier has its own suite
+        # (test_verifier.py / the docker variant). Off here keeps findings model-asserted.
+        "verifier_enabled": False,
     }
     return Settings(_env_file=None, **{**base, **overrides})
 
@@ -193,7 +196,8 @@ def test_repo_scan_end_to_end(repo: Target, workspace: Path) -> None:
     assert result.stages[1].summary == "3 candidate(s)"
     assert result.stages[2].summary.startswith("planner+analyst app/util.py:5 (CWE-502)")
     assert result.stages[3].summary == "2 raw finding(s)"
-    assert result.stages[4].summary == "2 passed the verifier"
+    # Verifier disabled here: findings stay model-asserted, nothing proven, nothing dropped.
+    assert result.stages[4].summary == "0 of 2 proven; 2 kept"
     # one jail for the whole scan, opened after SAST with the ingested workspace, torn down after
     assert executor.events == ["create scn_repo", "destroy scn_repo"]
     assert executor.sandboxes[0].root == workspace / "scn_repo"

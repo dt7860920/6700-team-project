@@ -15,6 +15,10 @@ from __future__ import annotations
 import copy
 import json
 import re
+import shutil
+import subprocess
+import sys
+import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -22,6 +26,7 @@ from typing import Any
 
 from ono.agents.model import CallBudget, ModelReply
 from ono.config import AgentToolProtocol
+from ono.executor._guest import apply_patch as guest_apply_patch
 from ono.executor.client import (
     ExecutorAuthError,
     ExecutorRequestError,
@@ -32,6 +37,10 @@ from ono.executor.models import (
     FileContent,
     GrepMatch,
     GrepResult,
+    PatchResult,
+    RunResult,
+    SandboxInfo,
+    TestRunResult,
     TreeEntry,
     TreeListing,
 )
@@ -251,6 +260,127 @@ class LocalSandbox:
             kind = "dir" if p.is_dir() else "file"
             entries.append(TreeEntry(path=rel.as_posix(), kind=kind, size=p.stat().st_size))
         return TreeListing(entries=entries, truncated=truncated, total=len(entries))
+
+
+class LocalExecSandbox(LocalSandbox):
+    """A full :class:`~ono.agents.tools.SandboxExecutor` over a local directory.
+
+    The reads come from :class:`LocalSandbox`; the mutating operations run against a real
+    temporary *working copy* of the directory, so the verifier's prover PoCs, patches and
+    test runs behave like the jail without Docker. ``run`` uses ``sh -c`` with the host
+    interpreter on PATH, ``apply_patch`` reuses the real in-jail diff applier, ``run_tests``
+    detects pytest, and ``reset`` restores the working copy from a pristine snapshot.
+    """
+
+    def __init__(self, workspace: Path, sandbox_id: str = "sbx_fake") -> None:
+        self._work = workspace
+        self._pristine = workspace.parent / (workspace.name + ".pristine")
+        if not self._pristine.exists():
+            shutil.copytree(workspace, self._pristine)
+        super().__init__(workspace, sandbox_id=sandbox_id)
+        self.resets = 0
+        self.runs: list[str] = []
+
+    def apply_patch(self, diff: str) -> PatchResult:
+        result = guest_apply_patch(str(self.root), diff)
+        return PatchResult(
+            applied=bool(result["applied"]),
+            reason=str(result["reason"]),
+            files=list(result["files"]),
+        )
+
+    def run(self, cmd: str, timeout_s: float | None = None) -> RunResult:
+        self.runs.append(cmd)
+        self._maybe_fail()
+        start = time.perf_counter()
+        timed_out = False
+        try:
+            proc = subprocess.run(
+                cmd,
+                shell=True,  # a test double for the jail's `sh -c`
+                cwd=self.root,
+                capture_output=True,
+                text=True,
+                timeout=timeout_s,
+                check=False,
+            )
+            stdout, stderr, code = proc.stdout, proc.stderr, proc.returncode
+        except subprocess.TimeoutExpired as exc:
+            timed_out = True
+            stdout = exc.stdout.decode() if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+            stderr = exc.stderr.decode() if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+            code = None
+        return RunResult(
+            cmd=cmd,
+            stdout=stdout,
+            stderr=stderr,
+            exit_code=code,
+            duration_ms=(time.perf_counter() - start) * 1000,
+            timed_out=timed_out,
+        )
+
+    def run_tests(self, timeout_s: float | None = None) -> TestRunResult:
+        self._maybe_fail()
+        has_tests = any(self.root.rglob("test_*.py")) or any(self.root.rglob("*_test.py"))
+        if not has_tests:
+            return TestRunResult(
+                runner="none", detected=False, passed=None, summary="no test runner detected"
+            )
+        command = f'"{sys.executable}" -m pytest -q -p no:cacheprovider'
+        result = self.run(command, timeout_s)
+        passed: bool | None
+        if result.timed_out:
+            passed = None
+        elif result.exit_code == 0:
+            passed = True
+        elif result.exit_code == 5:
+            passed = None
+        else:
+            passed = False
+        tail = next((ln for ln in reversed(result.stdout.splitlines()) if ln.strip()), "")
+        return TestRunResult(
+            runner="pytest", command=command, detected=True, passed=passed, summary=tail, run=result
+        )
+
+    def reset(self) -> SandboxInfo:
+        self.resets += 1
+        shutil.rmtree(self.root)
+        shutil.copytree(self._pristine, self.root)
+        from datetime import UTC, datetime
+
+        now = datetime.now(tz=UTC)
+        return SandboxInfo(
+            sandbox_id=self.sandbox_id,
+            scan_id="scn_fake",
+            status="running",
+            image="fake",
+            created_at=now,
+            expires_at=now,
+            resets=self.resets,
+        )
+
+
+class FakeExecExecutor:
+    """Like :class:`FakeExecutor` but yields a full :class:`LocalExecSandbox` for the verifier."""
+
+    def __init__(self, *, docker: bool = True) -> None:
+        self.docker = docker
+        self.events: list[str] = []
+        self.sandboxes: list[LocalExecSandbox] = []
+
+    def health(self) -> ExecutorHealth:
+        return ExecutorHealth(status="ok", docker=self.docker, active_sandboxes=0)
+
+    @contextmanager
+    def sandbox(self, scan_id: str, workspace_dir: Path) -> Iterator[LocalExecSandbox]:
+        assert workspace_dir.is_dir(), f"workspace {workspace_dir} must exist when the jail opens"
+        sbx = LocalExecSandbox(workspace_dir, sandbox_id=f"sbx_{scan_id}")
+        self.sandboxes.append(sbx)
+        self.events.append(f"create {scan_id}")
+        try:
+            yield sbx
+        finally:
+            self.events.append(f"destroy {scan_id}")
 
 
 class FakeExecutor:
