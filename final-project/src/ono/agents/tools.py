@@ -8,8 +8,11 @@ records in a :class:`ReadLedger` exactly which ``file:line`` pairs the model has
 seen. The ledger is what makes a finding *anchored*: a line the model claims is honoured
 only if it is in the ledger.
 
-Deliberately read-only (step 3b-1). ``apply_patch`` / ``run`` / ``run_tests`` arrive with
-the fixer and the graded verifier (3b-2).
+The toolbox is deliberately read-only for *every* agent. The sandbox's mutating operations
+(``apply_patch`` / ``run`` / ``run_tests`` / ``reset`` - the :class:`SandboxExecutor`
+protocol) are driven only by the deterministic verifier (:mod:`ono.verifier`): the prover
+and the fixer *propose* a PoC or a patch through a terminal tool (``submit_poc`` /
+``submit_patch``) and plain code decides whether it is run, applied and believed.
 """
 
 from __future__ import annotations
@@ -21,12 +24,23 @@ from typing import Any, Protocol
 
 from ono.agents.model import ToolCall
 from ono.executor.client import ExecutorRequestError
-from ono.executor.models import FileContent, GrepResult, TreeListing
+from ono.executor.models import (
+    FileContent,
+    GrepResult,
+    PatchResult,
+    RunResult,
+    SandboxInfo,
+    TestRunResult,
+    TreeListing,
+)
 
 __all__ = [
+    "FIXER_TOOLS",
+    "PROVER_TOOLS",
     "READ_TOOLS",
     "TERMINAL_TOOLS",
     "ReadLedger",
+    "SandboxExecutor",
     "SandboxReader",
     "ToolBox",
     "ToolResult",
@@ -57,6 +71,18 @@ class SandboxReader(Protocol):
     def grep(
         self, pattern: str, path: str = ".", *, ignore_case: bool = False, max_matches: int = 200
     ) -> GrepResult: ...
+
+
+class SandboxExecutor(SandboxReader, Protocol):
+    """The full jail: reads plus the mutating operations only the verifier may call."""
+
+    def apply_patch(self, diff: str) -> PatchResult: ...
+
+    def run(self, cmd: str, timeout_s: float | None = None) -> RunResult: ...
+
+    def run_tests(self, timeout_s: float | None = None) -> TestRunResult: ...
+
+    def reset(self) -> SandboxInfo: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -169,7 +195,43 @@ TERMINAL_TOOLS: tuple[ToolSpec, ...] = (
     ),
 )
 
-ALL_TOOLS: tuple[ToolSpec, ...] = (*READ_TOOLS, *TERMINAL_TOOLS)
+PROVER_TOOLS: tuple[ToolSpec, ...] = (
+    ToolSpec(
+        "submit_poc",
+        "Final answer: the read-only proof-of-concept script. It must read the payload from "
+        "os.environ['ONO_PAYLOAD'] and drive the application's own code so the payload reaches "
+        "the flagged sink.",
+        _obj(
+            {
+                "code": {"type": "string", "description": "The complete Python script."},
+                "how": {
+                    "type": "string",
+                    "description": "One sentence: which entry point the script drives and how.",
+                },
+            },
+            ["code"],
+        ),
+        terminal=True,
+    ),
+)
+
+FIXER_TOOLS: tuple[ToolSpec, ...] = (
+    ToolSpec(
+        "submit_patch",
+        "Final answer: a unified diff (--- a/path, +++ b/path, @@ hunks with exact context "
+        "lines copied from the file) that closes the vulnerability at the sink.",
+        _obj(
+            {
+                "diff": {"type": "string", "description": "The complete unified diff."},
+                "summary": {"type": "string", "description": "One sentence: what the fix does."},
+            },
+            ["diff"],
+        ),
+        terminal=True,
+    ),
+)
+
+ALL_TOOLS: tuple[ToolSpec, ...] = (*READ_TOOLS, *TERMINAL_TOOLS, *PROVER_TOOLS, *FIXER_TOOLS)
 _BY_NAME: dict[str, ToolSpec] = {t.name: t for t in ALL_TOOLS}
 
 
@@ -251,7 +313,7 @@ class ToolBox:
         self.calls += 1
         spec = _BY_NAME.get(call.name)
         if spec is None or spec.terminal:
-            known = ", ".join(t.name for t in ALL_TOOLS)
+            known = ", ".join(t.name for t in READ_TOOLS)
             return self._error(call.name, f"unknown tool {call.name!r}; available: {known}")
         if "__malformed__" in call.args:
             return self._error(call.name, "arguments were not valid JSON; resend the call")
