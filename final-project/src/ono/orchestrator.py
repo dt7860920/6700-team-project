@@ -33,7 +33,7 @@ from ono.agents.analyst import AnalystOutcome, run_analyst
 from ono.agents.definitions import ANALYST, PLANNER, AgentDefinition
 from ono.agents.model import BudgetExhaustedError, CallBudget, ChatModel, ModelError, ToolCall
 from ono.agents.planner import InvestigationPlan, default_plan, run_planner
-from ono.agents.tools import SandboxReader, ToolBox
+from ono.agents.tools import SandboxExecutor, SandboxReader, ToolBox
 from ono.agents.trajectory import Trajectory, TrajectoryWriter
 from ono.config import Settings
 from ono.errors import PipelineError
@@ -51,13 +51,19 @@ CandidateState = Literal["confirmed", "dismissed", "exhausted", "timeout", "skip
 
 
 class ExecutorProvider(Protocol):
-    """The slice of :class:`~ono.executor.client.ExecutorClient` the orchestrator uses."""
+    """The slice of :class:`~ono.executor.client.ExecutorClient` the orchestrator uses.
+
+    ``sandbox`` yields a full :class:`~ono.agents.tools.SandboxExecutor` (the real client's
+    :class:`~ono.executor.client.SandboxHandle`): the orchestrator only reads through it, but
+    the same provider feeds the graded verifier, which needs the mutating operations too, so a
+    value of this Protocol is assignable to the verifier's narrower one.
+    """
 
     def health(self) -> ExecutorHealth: ...
 
     def sandbox(
         self, scan_id: str, workspace_dir: Path
-    ) -> AbstractContextManager[SandboxReader]: ...
+    ) -> AbstractContextManager[SandboxExecutor]: ...
 
 
 @dataclass(slots=True)

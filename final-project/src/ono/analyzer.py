@@ -58,6 +58,7 @@ from ono.orchestrator import DetectionOrchestrator, DetectionReport, ExecutorPro
 from ono.progress import NullProgress, ProgressSink
 from ono.sast import PATTERN_RULES, Candidate, scan_text
 from ono.targets import Target
+from ono.verifier import GradedVerifier, VerifyReport
 
 __all__ = [
     "AnalysisResult",
@@ -191,7 +192,8 @@ class BaseAnalyzer(ABC):
         with self._timed("verify", stages) as note:
             self.report(f"Verifying {len(raw)} raw finding(s)")
             verified = self.verify(target, raw)
-            note(f"{len(verified)} passed the verifier")
+            proven = sum(1 for f in verified if f.verified)
+            note(f"{proven} of {len(raw)} proven; {len(verified)} kept")
 
         findings = [f for f in verified if f.rung >= options.min_rung][: options.max_findings]
         return AnalysisResult(findings=findings, stages=stages, candidate_count=len(candidates))
@@ -670,10 +672,14 @@ def _indent_of(line: str) -> str:
 
 
 class ServiceAnalyzer(BaseAnalyzer):
-    """Planner + analyst agents on a remote OpenAI-compatible endpoint, reading through the jail.
+    """Planner + analyst + graded verifier on a remote OpenAI-compatible endpoint.
 
-    Findings are model-asserted (``verified=False``) and capped at rung 2 (CWE plus an
-    evidence-anchored source->sink trace); nothing is executed or proven until 3b-2.
+    ``analyze`` produces model-asserted findings (rung 1-2, ``verified=False``) through the
+    read-only detection jail; ``verify`` then opens a fresh jail and tries to PROVE each one
+    (rung 3: a read-only PoC reaches the sink; rung 4: a patch applies, the PoC no longer
+    fires and the tests pass) via the bounded prover/fixer self-correction loop. Findings
+    that cannot be proven keep their analyst rung and ``verified=False`` with a
+    :class:`~ono.models.Verification` record; none is ever falsely marked verified.
     """
 
     backend = "service"
@@ -705,7 +711,12 @@ class ServiceAnalyzer(BaseAnalyzer):
             )
         self.executor: ExecutorProvider = executor
         self.orchestrator = DetectionOrchestrator(settings, model=self.model, executor=executor)
+        # The graded verifier reuses the same model and jail provider (the real ExecutorClient
+        # satisfies both the orchestrator's read-only Protocol and the verifier's mutating one).
+        self.verifier = GradedVerifier(settings, model=self.model, executor=executor)
+        self.verifier_active = settings.verifier_enabled
         self.last_report: DetectionReport | None = None
+        self.last_verify_report: VerifyReport | None = None
         # ``run`` executes all stages on one thread, so the workspace path can travel
         # from ``ingest`` to ``analyze`` in a thread-local without cross-scan leakage.
         self._local = threading.local()
@@ -720,6 +731,7 @@ class ServiceAnalyzer(BaseAnalyzer):
         progress: ProgressSink | None = None,
     ) -> AnalysisResult:
         self._local.workspace = ingest.workspace_path(self.settings.workspace_dir, scan_id)
+        self._local.scan_id = scan_id
         try:
             with self._bound_progress(progress):
                 # Fail fast: an unreachable Executor fails the scan *before* cloning
@@ -739,6 +751,7 @@ class ServiceAnalyzer(BaseAnalyzer):
             # The clone is a copy we never keep: remove it whether or not the run succeeded.
             ingest.cleanup_workspace(self._local.workspace)
             self._local.workspace = None
+            self._local.scan_id = None
 
     def _check_model(self) -> None:
         """Fail before cloning if the model endpoint is down (it used to fail mid-analysis)."""
@@ -815,10 +828,33 @@ class ServiceAnalyzer(BaseAnalyzer):
 
     # -- Stage 5 ------------------------------------------------------------
     def verify(self, target: Target, findings: list[Finding]) -> list[Finding]:
-        # TODO(3b-2): the graded verifier (line/symbol exists, PoC reaches the sink, patch
-        # applies, PoC no longer fires, tests pass) with a bounded self-correction loop.
-        # Until then this is a pass-through: findings stay verified=False.
-        return findings
+        """The graded verifier (step 3b-2): prove each finding in a fresh jail.
+
+        Opens one sandbox for the stage (separate from the detection sandbox, which is
+        already torn down), runs the prover's read-only PoC under the sink oracle to lift a
+        finding to rung 3, then the fixer's patch to lift it to rung 4 - a bounded
+        self-correction loop per finding. Returns every finding, annotated: proven ones get
+        ``verified=True`` and a higher rung, the rest keep their analyst rung with a
+        :class:`~ono.models.Verification` record of which check stopped them. Nothing is
+        dropped here; ``min_rung`` filtering happens in the shared pipeline.
+        """
+        if not self.verifier_active or not findings:
+            self.last_verify_report = None
+            return findings
+        report = self.verifier.verify(
+            self._scan_id, self._workspace, findings, progress=self.report
+        )
+        self.last_verify_report = report
+        log.info("service backend: verify %s", report.summary)
+        return report.findings
+
+    @property
+    def _scan_id(self) -> str:
+        scan_id: str | None = getattr(self._local, "scan_id", None)
+        if scan_id is None:
+            msg = "ServiceAnalyzer.verify must run via run(); no scan id is set"
+            raise RuntimeError(msg)
+        return scan_id
 
 
 # ---------------------------------------------------------------------------
