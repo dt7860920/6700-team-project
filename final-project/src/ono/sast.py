@@ -51,6 +51,9 @@ LANGUAGE_PACKS: dict[str, str] = {
     "go": "p/golang",
     "ruby": "p/ruby",
     "php": "p/php",
+    "csharp": "p/csharp",
+    "kotlin": "p/kotlin",
+    "rust": "p/rust",
 }
 
 _CWE_NUMBER = re.compile(r"CWE[-_ ]?(\d+)", re.IGNORECASE)

@@ -12,7 +12,18 @@ from ono.targets import Target
 
 GITHUB_API = "https://api.github.com"
 SUPPORTED_LANGUAGES = frozenset(
-    {"Python", "JavaScript", "TypeScript", "Java", "Go", "Ruby", "PHP"}
+    {
+        "Python",
+        "JavaScript",
+        "TypeScript",
+        "Java",
+        "Go",
+        "Ruby",
+        "PHP",
+        "C#",
+        "Kotlin",
+        "Rust",
+    }
 )
 _OWNER = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$")
 _REPO = re.compile(r"^[A-Za-z0-9_.-]{1,100}$")
@@ -130,7 +141,8 @@ def check_public_github_repo(repo_url: str, *, max_clone_mb: int) -> dict[str, o
 def target_from_public_github(repo_url: str) -> Target:
     """Resolve a GitHub URL syntactically; remote access is checked in the scan worker."""
     canonical, clone_url, repository = normalize_github_url(repo_url)
-    languages = [name.lower() for name in sorted(SUPPORTED_LANGUAGES)]
+    # GitHub names this language "C#" while Semgrep names its pack "csharp".
+    languages = [name.lower().replace("#", "sharp") for name in sorted(SUPPORTED_LANGUAGES)]
     target_hash = hashlib.sha256(clone_url.lower().encode()).hexdigest()[:16]
     return Target(
         target_id=f"gh-{target_hash}",

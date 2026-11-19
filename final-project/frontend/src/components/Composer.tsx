@@ -156,7 +156,8 @@ export function Composer({
                   Detected languages: {repoCheck.languages.join(", ") || "none"}
                 </p>
                 <p className="mt-1 text-muted">
-                  GitHub language totals are hints; eligibility can vary by file.
+                  GitHub language totals are hints; eligibility can vary by file. Configured Semgrep packs:
+                  {" "}Python, JavaScript, TypeScript, Java, Go, Ruby, PHP, C#, Kotlin, and Rust.
                 </p>
                 {repoCheck.unsupported_languages.length > 0 && (
                   <p className="mt-1 text-amber-800">
