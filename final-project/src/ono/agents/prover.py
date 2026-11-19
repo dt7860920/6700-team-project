@@ -45,12 +45,16 @@ def run_prover(
     trajectory: Trajectory,
     previous: Poc | None = None,
     failure: str = "",
+    memory_hint: str = "",
 ) -> ReactOutcome[Poc]:
-    """One bounded attempt. ``previous`` / ``failure`` carry the verifier's feedback."""
+    """One bounded attempt. ``previous`` / ``failure`` carry the verifier's feedback;
+    ``memory_hint`` is a prior verified PoC for this sink class (the learning loop)."""
     return run_react(
         model,
         definition,
-        task=_task_prompt(finding, window_text, definition.max_steps, previous, failure),
+        task=_task_prompt(
+            finding, window_text, definition.max_steps, previous, failure, memory_hint
+        ),
         toolbox=toolbox,
         budget=budget,
         deadline=deadline,
@@ -65,7 +69,12 @@ def run_prover(
 
 
 def _task_prompt(
-    f: Finding, window_text: str, max_steps: int, previous: Poc | None, failure: str
+    f: Finding,
+    window_text: str,
+    max_steps: int,
+    previous: Poc | None,
+    failure: str,
+    memory_hint: str = "",
 ) -> str:
     trace = "\n".join(f"  {t.file}:{t.line}  {t.symbol}  ({t.note})" for t in f.trace) or "  -"
     text = (
@@ -78,6 +87,8 @@ def _task_prompt(
         f"The sink and its surroundings (each line is 'N | code'; the flagged line is "
         f"{f.line_range[0]}):\n{window_text}\n\n"
     )
+    if memory_hint and previous is None:
+        text += memory_hint + "\n\n"
     if previous is not None:
         text += (
             "Your previous script did NOT prove the finding. The harness reported:\n"

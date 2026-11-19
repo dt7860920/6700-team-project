@@ -44,6 +44,7 @@ from ono.agents.model import ChatModel, ModelClient, ModelError
 from ono.config import Settings
 from ono.errors import PipelineError
 from ono.executor.client import ExecutorClient
+from ono.learning import KnowledgeMemory
 from ono.models import (
     Finding,
     ScanOptions,
@@ -690,6 +691,7 @@ class ServiceAnalyzer(BaseAnalyzer):
         *,
         model: ChatModel | None = None,
         executor: ExecutorProvider | None = None,
+        memory: KnowledgeMemory | None = None,
     ) -> None:
         super().__init__(settings)
         if not settings.model_service_url:  # Settings already validates this; be explicit.
@@ -711,9 +713,15 @@ class ServiceAnalyzer(BaseAnalyzer):
             )
         self.executor: ExecutorProvider = executor
         self.orchestrator = DetectionOrchestrator(settings, model=self.model, executor=executor)
+        # The learning loop's knowledge memory (None unless enabled). Persistent across scans.
+        self.memory = memory
+        if self.memory is None and settings.learning_enabled:
+            self.memory = KnowledgeMemory(settings.knowledge_path)
         # The graded verifier reuses the same model and jail provider (the real ExecutorClient
         # satisfies both the orchestrator's read-only Protocol and the verifier's mutating one).
-        self.verifier = GradedVerifier(settings, model=self.model, executor=executor)
+        self.verifier = GradedVerifier(
+            settings, model=self.model, executor=executor, memory=self.memory
+        )
         self.verifier_active = settings.verifier_enabled
         self.last_report: DetectionReport | None = None
         self.last_verify_report: VerifyReport | None = None

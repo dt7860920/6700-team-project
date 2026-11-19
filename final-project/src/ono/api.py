@@ -44,7 +44,7 @@ from ono.models import (
 )
 from ono.service import ScanService
 from ono.sources import SourceCheckError
-from ono.store import InMemoryScanStore
+from ono.store import InMemoryScanStore, ScanStore, SqliteScanStore
 from ono.targets import TargetRegistry, UnauthorizedTargetError, get_registry
 from ono.webui import STATIC_DIR, spa_built
 
@@ -72,11 +72,16 @@ def create_app(
     registry = registry or get_registry()
     configure_logging(settings)
 
+    store: ScanStore = (
+        SqliteScanStore(settings.data_dir / "scans.sqlite3")
+        if settings.scan_store == "sqlite"
+        else InMemoryScanStore()
+    )
     service = ScanService(
         settings=settings,
         registry=registry,
         analyzer=build_analyzer(settings),
-        store=InMemoryScanStore(),
+        store=store,
     )
 
     @asynccontextmanager

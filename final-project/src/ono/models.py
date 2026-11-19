@@ -167,6 +167,15 @@ class Verification(BaseModel):
     """
 
     attempts: int = Field(default=0, ge=0, description="Self-correction rounds used.")
+    poc_attempts: int = Field(
+        default=0,
+        ge=0,
+        description="Prover attempts until the PoC fired (0 if it never did). The learning "
+        "loop's headline metric: it trends down as the knowledge memory seeds later scans.",
+    )
+    seeded: bool = Field(
+        default=False, description="Whether a knowledge-memory hint was seeded into the prover."
+    )
     checks: list[VerificationCheck] = Field(default_factory=list)
     poc: str = Field(default="", description="The read-only PoC script that proved rung 3.")
     evidence: str = Field(
