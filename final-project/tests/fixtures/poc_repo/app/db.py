@@ -8,7 +8,7 @@ def connect() -> sqlite3.Connection:
     return conn
 
 
-def find_user(uid: str) -> str | None:
+def find_user(uid: str) -> "str | None":  # quoted: must import under Python 3.9 too
     conn = connect()
     cur = conn.cursor()
     cur.execute(f"SELECT name FROM users WHERE id = {uid}")

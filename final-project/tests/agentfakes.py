@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -294,6 +295,11 @@ class LocalExecSandbox(LocalSandbox):
         self._maybe_fail()
         start = time.perf_counter()
         timed_out = False
+        # The oracle is started as `python3 -I ...` (what the jail image provides). Make sure
+        # that resolves to the interpreter running the tests, whatever is first on the
+        # caller's PATH (a system python3 of a different version would change the result).
+        env = dict(os.environ)
+        env["PATH"] = str(Path(sys.executable).parent) + os.pathsep + env.get("PATH", "")
         try:
             proc = subprocess.run(
                 cmd,
@@ -303,6 +309,7 @@ class LocalExecSandbox(LocalSandbox):
                 text=True,
                 timeout=timeout_s,
                 check=False,
+                env=env,
             )
             stdout, stderr, code = proc.stdout, proc.stderr, proc.returncode
         except subprocess.TimeoutExpired as exc:
