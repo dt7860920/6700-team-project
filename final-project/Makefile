@@ -1,4 +1,4 @@
-.PHONY: install dev executor lint format typecheck test test-docker check smoke-ci smoke-live docker-build docker-run compose-up compose-down
+.PHONY: install dev executor lint format typecheck test test-docker check smoke-ci smoke-live docker-build docker-run compose-up compose-down compose-up-tls compose-down-tls
 
 install:          ## Install runtime + dev dependencies
 	uv sync --frozen
@@ -31,7 +31,7 @@ smoke-ci:         ## Golden path against the in-process app (mock backend, no se
 	uv run scripts/golden_path.py --in-process
 
 BASE_URL ?= http://localhost:8080
-smoke-live:       ## Golden path against a running deployment
+smoke-live:       ## Golden path against a running deployment (reads AUTH_API_TOKEN if it is gated)
 	uv run scripts/golden_path.py --base-url $(BASE_URL)
 
 docker-build:
@@ -45,3 +45,9 @@ compose-up:
 
 compose-down:
 	docker compose down
+
+compose-up-tls:   ## Base stack + the Caddy TLS front door (needs ONO_DOMAIN in .env; docs/auth.md)
+	docker compose --profile tls up -d --build
+
+compose-down-tls:
+	docker compose --profile tls down
