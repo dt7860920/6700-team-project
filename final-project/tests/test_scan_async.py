@@ -107,7 +107,7 @@ def test_submit_returns_immediately_and_the_scan_completes(settings: Settings) -
         assert done is not None and done.status == "done"
         assert done.started_at is not None and done.completed_at is not None
         assert done.findings_count == 2 and done.progress == ""
-        assert done.message == "2 verified findings"
+        assert done.message == "2 findings (2 verified)"
         assert [s.stage for s in done.pipeline] == ["ingest", "sast", "plan", "analyze", "verify"]
         findings = service.get_findings(accepted.scan_id)
         assert findings is not None and {f.cwe for f in findings} == {"CWE-89", "CWE-78"}
