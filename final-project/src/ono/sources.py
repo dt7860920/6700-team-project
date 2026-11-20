@@ -11,9 +11,7 @@ import httpx
 from ono.targets import Target
 
 GITHUB_API = "https://api.github.com"
-SUPPORTED_LANGUAGES = frozenset(
-    {"Python", "JavaScript", "TypeScript", "Java", "Go", "Ruby", "PHP"}
-)
+SUPPORTED_LANGUAGES = frozenset({"Python", "JavaScript", "TypeScript", "Java", "Go", "Ruby", "PHP"})
 _OWNER = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$")
 _REPO = re.compile(r"^[A-Za-z0-9_.-]{1,100}$")
 
@@ -106,8 +104,7 @@ def check_public_github_repo(repo_url: str, *, max_clone_mb: int) -> dict[str, o
     unsupported = [name for name in languages if name not in SUPPORTED_LANGUAGES]
     if not supported:
         message = (
-            "No supported code language was detected; "
-            "the scan may not analyze this repository."
+            "No supported code language was detected; the scan may not analyze this repository."
         )
     elif unsupported:
         message = "Some repository languages are not supported and may not be analyzed."
