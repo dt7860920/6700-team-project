@@ -57,6 +57,7 @@ from ono.models import (
     fingerprint_for,
 )
 from ono.orchestrator import DetectionOrchestrator, DetectionReport, ExecutorProvider
+from ono.planning import ThreatMap, threat_map
 from ono.progress import NullProgress, ProgressSink
 from ono.sast import PATTERN_RULES, Candidate, scan_text
 from ono.targets import Target
@@ -82,9 +83,15 @@ log = logging.getLogger(__name__)
 
 @dataclass(slots=True)
 class Plan:
-    """The adaptive per-target scaffold the planner emits (Fugu-inspired, see plan §1.5)."""
+    """The adaptive per-target scaffold the planner emits (Fugu-inspired, see plan §1.5).
+
+    ``queue`` is the candidate order ``analyze`` walks when the plan stage re-ranked or
+    extended the SAST shortlist (the threat-mapping stage); empty means "the SAST order".
+    """
 
     steps: list[str]
+    queue: list[Candidate] = field(default_factory=list)
+    summary: str = ""
 
 
 @dataclass(slots=True)
@@ -105,7 +112,7 @@ class AnalysisResult:
         n = len(self.findings)
         if self.candidate_count == 0:
             return (
-                "0 findings: static analysis found no candidates; "
+                "0 findings: static analysis and threat mapping found no candidates; "
                 "model analysis and verification were skipped"
             )
         return f"{n} verified finding{'s' if n != 1 else ''}"
@@ -178,22 +185,25 @@ class BaseAnalyzer(ABC):
             candidates = self.sast_shortlist(target, options)
             note(f"{len(candidates)} candidate(s)")
 
-        if not candidates:
-            reason = "no candidates from static analysis"
-            for stage in ("plan", "analyze", "verify"):
+        # The plan stage always runs: the threat map can add reachable sinks the pattern
+        # scanners missed, so an empty SAST shortlist is not yet "nothing to analyze".
+        with self._timed("plan", stages) as note:
+            self.report(f"Planning the investigation of {len(candidates)} candidate(s)")
+            plan = self.plan(target, candidates)
+            note(plan.summary or (" -> ".join(plan.steps) if plan.steps else "no steps"))
+        queue = plan.queue or candidates
+
+        if not queue:
+            reason = "no candidates from static analysis or threat mapping"
+            for stage in ("analyze", "verify"):
                 skipped = StageResult(stage=stage, status="skipped", duration_ms=0, summary=reason)
                 stages.append(skipped)
                 self._progress.stage(skipped)
             return AnalysisResult(findings=[], stages=stages, candidate_count=0)
 
-        with self._timed("plan", stages) as note:
-            self.report(f"Planning the investigation of {len(candidates)} candidate(s)")
-            plan = self.plan(target, candidates)
-            note(" -> ".join(plan.steps) if plan.steps else "no steps")
-
         with self._timed("analyze", stages) as note:
-            self.report(f"Analyzing {len(candidates)} candidate(s)")
-            raw = self.analyze(scan_id, target, candidates, plan)
+            self.report(f"Analyzing {len(queue)} candidate(s)")
+            raw = self.analyze(scan_id, target, queue, plan)
             note(f"{len(raw)} raw finding(s)")
 
         with self._timed("verify", stages) as note:
@@ -217,7 +227,7 @@ class BaseAnalyzer(ABC):
         return AnalysisResult(
             findings=findings,
             stages=stages,
-            candidate_count=len(candidates),
+            candidate_count=len(queue),
             verifier_passed=n_passed,
             verifier_failed=n_failed,
             verifier_skipped=n_skipped,
@@ -258,7 +268,7 @@ class BaseAnalyzer(ABC):
 
     @abstractmethod
     def plan(self, target: Target, candidates: list[Candidate]) -> Plan:
-        """Devise the per-target scaffold the analyst will execute."""
+        """Devise the per-target scaffold; may re-rank / extend the queue via ``Plan.queue``."""
 
     @abstractmethod
     def analyze(
@@ -686,8 +696,10 @@ def _indent_of(line: str) -> str:
 #               with an actionable message before anything is cloned
 #   ingest    - clone / copy / write the target into <workspace_dir>/<scan_id>/ (host)
 #   sast      - Semgrep (regex fallback) over that directory -> bounded Candidate queue
-#   plan      - deterministic: the queue the orchestrator will walk (the LLM planner
-#               runs per candidate inside ``analyze``)
+#   plan      - the threat-mapping stage (ono.planning): entry points + one-hop data flow
+#               over the workspace re-rank the SAST queue by reachability and union in
+#               reachable sinks the scanners missed; deterministic, no model call (the LLM
+#               planner still runs per candidate inside ``analyze``, now with the trace)
 #   analyze   - ``DetectionOrchestrator.detect``: ONE jailed sandbox for the scan, then
 #               per candidate planner -> analyst ReAct loop (read-only sandbox tools) ->
 #               anchored Finding or dismissal. All target-code reads go through the jail.
@@ -753,6 +765,7 @@ class ServiceAnalyzer(BaseAnalyzer):
         )
         self.verifier_active = settings.verifier_enabled
         self.last_report: DetectionReport | None = None
+        self.last_threat_map: ThreatMap | None = None
         self.last_verify_report: VerifyReport | None = None
         # ``run`` executes all stages on one thread, so the workspace path can travel
         # from ``ingest`` to ``analyze`` in a thread-local without cross-scan leakage.
@@ -843,9 +856,38 @@ class ServiceAnalyzer(BaseAnalyzer):
 
     # -- Stage 3 ------------------------------------------------------------
     def plan(self, target: Target, candidates: list[Candidate]) -> Plan:
-        # The target-level plan is the deterministic queue the orchestrator walks. The
-        # LLM *planner agent* runs per candidate inside ``analyze`` (its plan feeds the
-        # analyst directly), so this stage makes no model call.
+        """The threat-mapping stage: a deterministic per-target scaffold, no model call.
+
+        Entry points and one-hop data flow (:func:`ono.planning.threat_map`) re-rank the
+        SAST shortlist so sinks reachable from a real entry point are analyzed first, add
+        reachable sinks the scanners missed, and cap the result at ``max_candidates``. The
+        LLM *planner agent* still runs per candidate inside ``analyze`` - now seeded with the
+        source->sink trace found here.
+        """
+        self.last_threat_map = None
+        if not self.settings.threat_map_enabled:
+            return self._sast_order_plan(candidates)
+        self.report("Threat mapping: entry points, data flow and reachable sinks")
+        try:
+            result = threat_map(
+                self._workspace,
+                candidates,
+                max_candidates=self.settings.max_candidates,
+                deadline_s=self.settings.threat_map_timeout_s,
+            )
+        except Exception as exc:
+            # The threat map improves the queue; it must never cost the scan. Keep the
+            # SAST order and say so in the stage summary.
+            log.exception("service backend: threat map failed; keeping the SAST order")
+            plan = self._sast_order_plan(candidates)
+            plan.summary = f"threat map failed ({type(exc).__name__}: {exc}); SAST order kept"
+            return plan
+        self.last_threat_map = result
+        log.info("service backend: %s", result.summary())
+        return Plan(steps=result.steps(), queue=result.queue, summary=result.summary())
+
+    def _sast_order_plan(self, candidates: list[Candidate]) -> Plan:
+        """The pre-threat-map plan: walk the SAST shortlist in its own order."""
         if not candidates:
             return Plan(steps=["REPORT none (no SAST candidates)"])
         mode = "planner+analyst" if self.settings.planner_enabled else "analyst"

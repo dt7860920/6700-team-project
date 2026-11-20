@@ -263,6 +263,23 @@ class Settings(BaseSettings):
         le=5000,
         description="Snapshots larger than this (after .git is stripped) abort the scan.",
     )
+    threat_map_enabled: bool = Field(
+        default=True,
+        description=(
+            "Run the threat-mapping stage (entry points + one-hop data flow, Python and JS/TS) "
+            "as the plan stage: re-ranks the SAST queue by reachability and unions in reachable "
+            "sinks the pattern scanners missed. False = the SAST order, no union."
+        ),
+    )
+    threat_map_timeout_s: float = Field(
+        default=120.0,
+        ge=5.0,
+        le=1800.0,
+        description=(
+            "Wall-clock budget for parsing the workspace in the threat-mapping stage; files "
+            "past it are skipped and the stage summary says so."
+        ),
+    )
 
     # -- Agentic detection core (Deliverable 3, step 3b-1) ---------------------------
     # The planner and analyst are *definitions* (role prompt + tools + budget) on the one
