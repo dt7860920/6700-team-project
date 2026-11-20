@@ -43,6 +43,7 @@ class InvestigationPlan:
     steps: list[str] = field(default_factory=list)
     decision_rule: str = ""
     origin: PlanOrigin = "default"
+    trace: list[str] = field(default_factory=list)  # threat-map hops, "file:line symbol - note"
 
     def render(self) -> str:
         lines = [
@@ -50,6 +51,9 @@ class InvestigationPlan:
             f"Suspected source: {self.source}",
             f"Sink: {self.sink}",
         ]
+        if self.trace:
+            lines.append("Threat-map trace (static, verify each hop by reading it):")
+            lines.extend(f"  - {hop}" for hop in self.trace)
         if self.greps:
             lines.append("Useful greps: " + "; ".join(repr(g) for g in self.greps))
         if self.reads:
@@ -68,10 +72,12 @@ def default_plan(c: Candidate) -> InvestigationPlan:
     return InvestigationPlan(
         hypothesis=f"{c.cwe_hint or 'the flagged operation'} at {c.file}:{c.line} is reachable "
         "with attacker-controlled input",
-        source="unknown - find the request handler / entry point that feeds this code",
+        source=threat_map_source(c)
+        or "unknown - find the request handler / entry point that feeds this code",
         sink=symbol,
         greps=[],
         reads=[f"{c.file}:{max(1, c.line - 40)}-{c.line + 20}"],
+        trace=list(c.path),
         steps=[
             "Read the function containing the flagged line and identify the input variables.",
             "grep for the function's name to find its callers / the request handler.",
@@ -84,6 +90,18 @@ def default_plan(c: Candidate) -> InvestigationPlan:
         ),
         origin="default",
     )
+
+
+def threat_map_source(c: Candidate) -> str:
+    """One line summarising what the threat-mapping stage found for ``c`` ("" if nothing)."""
+    if not c.reach:
+        return ""
+    parts = [f"threat map: {c.reach}"]
+    if c.source:
+        parts.append(c.source)
+    if c.entry:
+        parts.append(f"entry point {c.entry}")
+    return "; ".join(parts)
 
 
 def run_planner(
@@ -102,7 +120,8 @@ def run_planner(
         f"  line: {candidate.line}\n"
         f"  suspected CWE: {candidate.cwe_hint or 'unknown'}\n"
         f"  rule: {candidate.rule}\n"
-        f"  flagged code: {candidate.excerpt.strip()[:200] or '(see below)'}\n\n"
+        f"  flagged code: {candidate.excerpt.strip()[:200] or '(see below)'}\n"
+        f"{_threat_map_block(candidate)}\n"
         "Code around the flag (each line is 'N | code'):\n"
         f"{window_text}\n\n"
         "Write the investigation plan as the JSON object described."
@@ -133,6 +152,18 @@ def run_planner(
     return plan
 
 
+def _threat_map_block(c: Candidate) -> str:
+    if not c.reach:
+        return ""
+    lines = [f"Threat map (static entry-point / data-flow analysis): reach = {c.reach}"]
+    if c.entry:
+        lines.append(f"  entry point: {c.entry}")
+    if c.source:
+        lines.append(f"  source: {c.source}")
+    lines.extend(f"  hop: {hop}" for hop in c.path[:8])
+    return "\n".join(lines) + "\n"
+
+
 def plan_from_dict(data: dict[str, Any], c: Candidate) -> InvestigationPlan:
     fallback = default_plan(c)
     return InvestigationPlan(
@@ -144,6 +175,7 @@ def plan_from_dict(data: dict[str, Any], c: Candidate) -> InvestigationPlan:
         steps=_strings(data.get("steps"), _MAX_LIST["steps"]) or fallback.steps,
         decision_rule=_text(data.get("decision_rule")) or fallback.decision_rule,
         origin="planner",
+        trace=fallback.trace,
     )
 
 

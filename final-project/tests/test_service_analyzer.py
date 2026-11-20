@@ -191,33 +191,51 @@ def test_repo_scan_end_to_end(repo: Target, workspace: Path) -> None:
     assert all(s.status == "ok" for s in result.stages), result.stages
     assert result.stages[0].summary == f"snapshot {workspace / 'scn_repo'}"
     assert result.stages[1].summary == "3 candidate(s)"
-    assert result.stages[2].summary.startswith("planner+analyst app/util.py:5 (CWE-502)")
+    # the plan stage is the threat map: both route sinks are reachable, the helper is not
+    assert result.stages[2].summary.startswith(
+        "threat map: 3 entry point(s) in 2 file(s) (2 python); 3 sink(s), 2 reachable "
+        "(2 direct, 0 one-hop); queue 3 = 3 from SAST (3 mapped) + 0 added"
+    )
     assert result.stages[3].summary == "2 raw finding(s)"
     assert result.stages[4].summary == "2 passed the verifier"
     # one jail for the whole scan, opened after SAST with the ingested workspace, torn down after
     assert executor.events == ["create scn_repo", "destroy scn_repo"]
     assert executor.sandboxes[0].root == workspace / "scn_repo"
     assert not (workspace / "scn_repo").exists()  # workspace cleaned up after the run
-    # all code reads went through the jail: window per candidate + the analyst's greps
+    # all code reads went through the jail: window per candidate + the analyst's greps,
+    # in threat-map order (entry-reachable sinks first, the parameter-only helper last)
     reads = [c for c in executor.sandboxes[0].calls if c[0] == "read_lines"]
-    assert [c[1] for c in reads] == ["app/util.py", "app/views.py", "app/views.py"]
+    assert [c[1] for c in reads] == ["app/views.py", "app/views.py", "app/util.py"]
     assert sum(1 for c in executor.sandboxes[0].calls if c[0] == "grep") == 3
     # findings: anchored, unverified, rung 1-2, stable ids
     assert [(f.file, f.line_range, f.cwe, f.rung) for f in result.findings] == [
-        ("app/util.py", (5, 5), "CWE-502", 1),
         ("app/views.py", (16, 16), "CWE-89", 2),
+        ("app/util.py", (5, 5), "CWE-502", 1),
     ]
     assert all(
         f.verified is False and f.scan_id == "scn_repo" and f.patch_diff == ""
         for f in result.findings
     )
-    assert [t.line for t in result.findings[1].trace] == [13, 16]
+    assert [t.line for t in result.findings[0].trace] == [13, 16]
     assert model.n_calls == 3 * 3  # planner + grep + verdict per candidate
+    # the per-candidate planner saw the threat map's trace for the reachable sink
+    first_planner_prompt = model.calls[0]["messages"][1]["content"]
+    assert (
+        "Threat map (static entry-point / data-flow analysis): reach = direct"
+        in first_planner_prompt
+    )
+    assert "entry point: ANY /user -> app/views.py:12 user()" in first_planner_prompt
+    threat_map = analyzer.last_threat_map
+    assert threat_map is not None and [c.reach for c in threat_map.queue] == [
+        "direct",
+        "direct",
+        "param",
+    ]
     report = analyzer.last_report
     assert report is not None and [o.state for o in report.outcomes] == [
         "confirmed",
-        "confirmed",
         "dismissed",
+        "confirmed",
     ]
 
 
@@ -245,11 +263,13 @@ def test_semgrep_results_feed_the_orchestrator_when_available(
     model = ScriptedModel(default=action("dismiss", reason="no"))
     analyzer = _analyzer(_settings(workspace, planner_enabled=False), model)
     analyzer.run("s", repo, ScanOptions())
-    assert model.n_calls == 4  # 5 Semgrep results -> 4 unique sinks (one no-CWE rule dropped)
-    assert (
-        "python.flask.security.injection.tainted-sql-string"
-        in model.calls[0]["messages"][1]["content"]
-    )
+    # 5 Semgrep results -> 4 unique candidates (one no-CWE rule dropped); the threat map
+    # then adds the two sinks Semgrep did not anchor at the sink line: its taint rules report
+    # the *source* line (views.py:13), so views.py:16 (CWE-89) and util.py:5 (CWE-502) are new.
+    assert model.n_calls == 6
+    prompts = [c["messages"][1]["content"] for c in model.calls]
+    assert any("python.flask.security.injection.tainted-sql-string" in p for p in prompts)
+    assert any("rule: ono.threatmap.sql-query-built-from-input" in p for p in prompts)
 
 
 # -- Snippet target goes through the jail too -----------------------------------------
@@ -291,8 +311,13 @@ def test_clean_snippet_makes_no_model_call_and_opens_no_sandbox(
     assert result.candidate_count == 0
     assert "no candidates" in result.summary
     assert "model analysis and verification were skipped" in result.summary
-    assert [stage.status for stage in result.stages[2:]] == ["skipped"] * 3
-    assert all("no candidates from static analysis" in stage.summary for stage in result.stages[2:])
+    # the plan stage (threat map) still runs - it could add sinks SAST missed - and finds none
+    assert [stage.status for stage in result.stages[2:]] == ["ok", "skipped", "skipped"]
+    assert result.stages[2].summary.startswith("threat map: 0 entry point(s) in 1 file(s)")
+    assert all(
+        "no candidates from static analysis or threat mapping" in stage.summary
+        for stage in result.stages[3:]
+    )
 
 
 # -- Failure modes: clear, never silent ------------------------------------------------
@@ -336,7 +361,8 @@ def test_service_backend_reports_candidate_progress_live(repo: Target, workspace
     assert response.status == "done"
     messages = [e.message for e in response.events]
     assert "Checking the sandbox Executor and the model endpoint" in messages
-    assert any(m.startswith("Analyzing candidate 1 of 3 - app/util.py:5") for m in messages)
+    assert "Threat mapping: entry points, data flow and reachable sinks" in messages
+    assert any(m.startswith("Analyzing candidate 1 of 3 - app/views.py:16") for m in messages)
     assert any(
         m.startswith("Candidate 3 of 3 dismissed:") and "not reachable" in m for m in messages
     )
