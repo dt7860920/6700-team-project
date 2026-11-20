@@ -210,7 +210,6 @@ class BaseAnalyzer(ABC):
             verifier_skipped=len(verified) - passed,
         )
 
-
     @contextmanager
     def _timed(self, stage: StageName, sink: list[StageResult]) -> Iterator[Callable[[str], None]]:
         summary = ""
