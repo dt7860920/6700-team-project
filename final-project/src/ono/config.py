@@ -5,8 +5,9 @@ which reads environment variables and an optional ``.env`` file. Nothing else in
 the codebase reads ``os.environ`` directly - this is the single source of truth
 that the Docker image, Compose file, and CI all configure through.
 
-Secrets (``model_service_api_key``, ``executor_token``) are ``SecretStr`` and are never
-rendered by ``repr``/``str``, so they cannot leak through logs or the ``/info`` endpoint.
+Secrets (``model_service_api_key``, ``executor_token``, ``github_oauth_client_secret``,
+``auth_session_secret``, ``auth_api_token``) are ``SecretStr`` and are never rendered by
+``repr``/``str``, so they cannot leak through logs or the ``/info`` endpoint.
 """
 
 from __future__ import annotations
@@ -91,7 +92,55 @@ class Settings(BaseSettings):
     )
     github_oauth_callback_url: str | None = Field(
         default=None,
-        description="Exact OAuth callback URL registered with GitHub.",
+        description="Exact callback URL registered with GitHub (<base>/auth/github/callback).",
+    )
+
+    # -- Tier-2 auth: who may start scans (see ono/auth.py and docs/auth.md) ---------
+    # Off by default so the open prototype, the mock backend and the test-suite are
+    # unchanged. Production turns it on; the validator below then insists on the secrets.
+    auth_required: bool = Field(
+        default=False,
+        description=(
+            "Gate POST /scans and POST /sources/check behind a GitHub session cookie or the "
+            "static bearer token. False = open (the Deliverable-2 behaviour)."
+        ),
+    )
+    auth_session_secret: SecretStr | None = Field(
+        default=None,
+        description=(
+            "HMAC key for our own session cookie (>= 32 chars; `openssl rand -hex 32`). "
+            "Required when auth_required. Never logged or returned."
+        ),
+    )
+    auth_api_token: SecretStr | None = Field(
+        default=None,
+        description=(
+            "Optional static bearer (>= 16 chars) for CI / machine clients: "
+            "`Authorization: Bearer <token>`. Never logged or returned."
+        ),
+    )
+    cookie_secure: bool = Field(
+        default=True,
+        description="Mark the session/state cookies Secure (HTTPS only). False for local http dev.",
+    )
+    trusted_proxy: bool = Field(
+        default=False,
+        description=(
+            "True only when a proxy we control (the Caddy service) is the sole way in: the "
+            "rate limiter then keys on the right-most X-Forwarded-For entry instead of the peer."
+        ),
+    )
+    rate_limit_max: int = Field(
+        default=30,
+        ge=0,
+        le=100_000,
+        description="Requests per client IP per window on the gated routes. 0 disables.",
+    )
+    rate_limit_window_s: float = Field(
+        default=60.0,
+        ge=1.0,
+        le=86400.0,
+        description="Length of the rate-limit window in seconds.",
     )
 
     max_verifier_retries: int = Field(
@@ -449,6 +498,54 @@ class Settings(BaseSettings):
             msg = (
                 "executor_token is required when model_backend == 'service': the agents read "
                 "target code only through the Executor sandbox (set EXECUTOR_TOKEN)"
+            )
+            raise ValueError(msg)
+        return self
+
+    @model_validator(mode="after")
+    def _auth_settings_are_complete(self) -> Self:
+        """Fail at boot, not at the first login, when auth is switched on half-configured."""
+        secret = self.auth_session_secret.get_secret_value() if self.auth_session_secret else ""
+        if secret and len(secret) < 32:
+            msg = "auth_session_secret must be at least 32 characters (openssl rand -hex 32)"
+            raise ValueError(msg)
+        api_token = self.auth_api_token.get_secret_value() if self.auth_api_token else ""
+        if self.auth_api_token is not None and len(api_token) < 16:
+            msg = "auth_api_token must be at least 16 characters (openssl rand -hex 32)"
+            raise ValueError(msg)
+        callback = self.github_oauth_callback_url
+        if callback and not (
+            callback.startswith(("https://", "http://"))
+            and callback.endswith("/auth/github/callback")
+        ):
+            msg = (
+                "github_oauth_callback_url must be the absolute URL of this app's "
+                "/auth/github/callback route (e.g. https://ono.example.org/auth/github/callback)"
+            )
+            raise ValueError(msg)
+        if not self.auth_required:
+            return self
+        if not secret:
+            msg = (
+                "auth_session_secret is required when auth_required=true "
+                "(set AUTH_SESSION_SECRET to `openssl rand -hex 32`)"
+            )
+            raise ValueError(msg)
+        oauth_secret = (
+            self.github_oauth_client_secret.get_secret_value()
+            if self.github_oauth_client_secret
+            else ""
+        )
+        if not (self.github_oauth_client_id and oauth_secret and callback):
+            msg = (
+                "auth_required=true needs the GitHub OAuth App: set GITHUB_OAUTH_CLIENT_ID, "
+                "GITHUB_OAUTH_CLIENT_SECRET and GITHUB_OAUTH_CALLBACK_URL (see docs/auth.md)"
+            )
+            raise ValueError(msg)
+        if self.ui_backend == "gradio":
+            # The legacy Gradio UI calls ScanService in-process, bypassing the HTTP gate.
+            msg = (
+                "auth_required=true is incompatible with ui_backend='gradio' (use 'spa' or 'none')"
             )
             raise ValueError(msg)
         return self

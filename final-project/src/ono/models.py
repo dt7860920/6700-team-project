@@ -330,6 +330,9 @@ class InfoResponse(BaseModel):
     model_backend: str
     model_name: str
     targets_registered: int
+    auth_required: bool = False
+    """Whether POST /scans and POST /sources/check need a session or bearer (so a UI can
+    decide to show "Sign in with GitHub"). Not a secret."""
 
 
 class TargetsResponse(BaseModel):

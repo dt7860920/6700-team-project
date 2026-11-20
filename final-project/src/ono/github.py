@@ -1,4 +1,9 @@
-"""Minimal GitHub account session for browsing a user's public repositories."""
+"""Our own session token for a GitHub-authenticated user (used by ``ono.auth``).
+
+``sign_session`` produces ``<base64url(payload)>.<base64url(hmac-sha256)>`` with the GitHub
+``login`` and a 12-hour ``exp``; ``verify_session`` checks the signature in constant time
+and the expiry, and returns the login or ``None``. No GitHub token is ever inside.
+"""
 
 from __future__ import annotations
 

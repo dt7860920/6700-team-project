@@ -1,0 +1,44 @@
+# Operation: Negative One - Caddy reverse proxy (TLS termination in front of the app).
+#
+# Used by the opt-in `tls` Compose profile:   docker compose --profile tls up -d --build
+# Caddy publishes 80/443 and proxies to the `app` service over the Compose network; the app
+# itself should then be bound to loopback only (ONO_APP_BIND=127.0.0.1 in .env), so the
+# proxy is the only public listener.
+#
+# The site address is ONO_DOMAIN from .env:
+#
+#   ONO_DOMAIN=ono.example.org     a DNS name that resolves to this host: Caddy obtains and
+#                                  renews a publicly trusted certificate automatically
+#                                  (Let's Encrypt / ZeroSSL, HTTP-01 on :80 or TLS-ALPN on :443)
+#                                  and redirects http:// to https://.
+#
+#   ONO_DOMAIN=149.165.154.219     a bare IP (Jetstream2 floating IP, no DNS): no public CA
+#                                  issues for an IP address, so uncomment `tls internal`
+#                                  below. Caddy's own CA then signs a certificate for the IP.
+#                                  Browsers warn once (self-signed); `curl -k`, or trust the
+#                                  root from the caddy_data volume at
+#                                  /data/caddy/pki/authorities/local/root.crt.
+#
+# Caddy sets X-Forwarded-For / X-Forwarded-Proto on every proxied request. Set
+# TRUSTED_PROXY=true on the app so the per-IP rate limiter keys on the real client address
+# (it takes the right-most entry - the one Caddy appended - never a client-supplied one).
+
+{$ONO_DOMAIN} {
+	# ---- IP-only deployments (no DNS name): self-signed by Caddy's internal CA --------
+	# tls internal
+
+	encode zstd gzip
+
+	header {
+		# Browsers remember to use HTTPS for a year (ignored for bare-IP origins, harmless).
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		-Server
+	}
+
+	# The app container on the Compose network. Never published directly when this
+	# profile is on (see ONO_APP_BIND in compose.yml).
+	reverse_proxy app:8080
+}

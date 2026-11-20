@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import sys
 import time
 
@@ -89,6 +90,14 @@ async def main() -> None:
         default=600.0,
         help="seconds to wait for the scan to finish (a real service-backend scan takes minutes)",
     )
+    parser.add_argument(
+        "--api-token",
+        default=os.environ.get("AUTH_API_TOKEN"),
+        help=(
+            "static bearer for a deployment running AUTH_REQUIRED=true (sent as "
+            "'Authorization: Bearer ...'); defaults to $AUTH_API_TOKEN"
+        ),
+    )
     args = parser.parse_args()
 
     if args.in_process:
@@ -104,7 +113,8 @@ async def main() -> None:
             app.state.service.close()  # no lifespan under ASGITransport: stop the workers
     else:
         print(f"target: {args.base_url}")
-        async with httpx.AsyncClient(base_url=args.base_url, timeout=30) as client:
+        headers = {"Authorization": f"Bearer {args.api_token}"} if args.api_token else {}
+        async with httpx.AsyncClient(base_url=args.base_url, timeout=30, headers=headers) as client:
             await run(client, poll_timeout=args.timeout)
 
 

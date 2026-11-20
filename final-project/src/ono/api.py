@@ -14,6 +14,14 @@ One process, one published port (8080). OpenAPI docs live at ``/docs``.
     GET  /ui                         Gradio analyst UI  (``/`` redirects here)
     GET  /metrics                    Prometheus text exposition (``metrics_enabled``; not
                                      in the OpenAPI schema, unauthenticated, scrape in-box)
+    /auth/...                        GitHub sign-in, session, logout (see ono/auth.py)
+
+  Access control (``ono/auth.py``, flag ``AUTH_REQUIRED``, off by default): the two routes
+  that spend real resources - ``POST /scans`` (clone + Semgrep + model) and
+  ``POST /sources/check`` (outbound calls to api.github.com) - are per-IP rate limited and,
+  when the flag is on, need a session cookie or ``Authorization: Bearer <AUTH_API_TOKEN>``.
+  Everything else (``/health``, ``/info``, ``/targets``, the read-only scan/finding GETs
+  keyed by unguessable ids, ``/ui``, ``/docs``) stays public.
 """
 
 from __future__ import annotations
@@ -30,6 +38,7 @@ from starlette.concurrency import run_in_threadpool
 
 from ono import __version__
 from ono.analyzer import build_analyzer
+from ono.auth import GUARDS, AuthDep, install_auth
 from ono.config import Settings, configure_logging, get_settings
 from ono.errors import ScanBusyError
 from ono.metrics import TEXT_CONTENT_TYPE, build_metrics
@@ -120,10 +129,12 @@ def create_app(
             {"name": "ops", "description": "Health and runtime info."},
             {"name": "targets", "description": "The authorized-target allowlist."},
             {"name": "scans", "description": "Start scans and read results."},
+            {"name": "auth", "description": "GitHub sign-in and the session cookie."},
         ],
     )
     app.state.settings = settings
     app.state.service = service
+    install_auth(app, settings)  # /auth routes + the rate limiter / OAuth client state
     app.state.metrics = metrics
 
     # -- Error mapping ----------------------------------------------------
@@ -161,6 +172,7 @@ def create_app(
             model_backend=s.model_backend,
             model_name=s.model_name,
             targets_registered=len(svc.registry),
+            auth_required=s.auth_required,
         )
 
     # -- targets ----------------------------------------------------------
@@ -175,8 +187,16 @@ def create_app(
         response_model=SourceCheckResponse,
         tags=["targets"],
         summary="Check a public GitHub repository before scanning",
+        dependencies=GUARDS,
+        responses={
+            401: {"model": ErrorResponse, "description": "sign-in or bearer required"},
+            429: {"model": ErrorResponse, "description": "per-IP rate limit exceeded"},
+        },
     )
-    async def check_source(body: SourceCheckRequest, svc: ServiceDep) -> SourceCheckResponse:
+    async def check_source(
+        body: SourceCheckRequest, svc: ServiceDep, who: AuthDep
+    ) -> SourceCheckResponse:
+        log.info("source check requested by %s", who.label)
         try:
             checked = await run_in_threadpool(svc.check_repository, body.repo_url)
         except SourceCheckError as exc:
@@ -189,10 +209,15 @@ def create_app(
         response_model=Scan,
         status_code=status.HTTP_202_ACCEPTED,
         tags=["scans"],
+        dependencies=GUARDS,
         responses={
+            401: {"model": ErrorResponse, "description": "sign-in or bearer required"},
             403: {"model": ErrorResponse, "description": "target_id not allowlisted"},
             422: {"model": ErrorResponse, "description": "public repository check failed"},
-            429: {"model": ErrorResponse, "description": "worker pool and queue are full"},
+            429: {
+                "model": ErrorResponse,
+                "description": "per-IP rate limit exceeded, or worker pool and queue are full",
+            },
         },
         summary="Start a scan of a configured target or checked public repository",
         description=(
@@ -202,7 +227,8 @@ def create_app(
             "once; poll `GET /scans/{scan_id}` until `status` is `done` or `failed`."
         ),
     )
-    async def create_scan(body: ScanRequest, svc: ServiceDep) -> Scan:
+    async def create_scan(body: ScanRequest, svc: ServiceDep, who: AuthDep) -> Scan:
+        log.info("scan requested by %s", who.label)
         try:
             return await run_in_threadpool(svc.submit_scan, body)
         except SourceCheckError as exc:

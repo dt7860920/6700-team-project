@@ -91,6 +91,70 @@ def test_invalid_log_level_rejected() -> None:
         Settings(_env_file=None, log_level="loud")
 
 
+_OAUTH = {
+    "github_oauth_client_id": "Iv1.test",
+    "github_oauth_client_secret": SecretStr("app-secret"),
+    "github_oauth_callback_url": "https://ono.example.org/auth/github/callback",
+}
+
+
+def test_auth_defaults_are_off_and_rate_limited() -> None:
+    s = Settings(_env_file=None)
+    assert s.auth_required is False
+    assert s.auth_session_secret is None and s.auth_api_token is None
+    assert s.cookie_secure is True and s.trusted_proxy is False
+    assert (s.rate_limit_max, s.rate_limit_window_s) == (30, 60.0)
+
+
+def test_auth_required_fails_fast_without_session_secret() -> None:
+    with pytest.raises(ValidationError, match="auth_session_secret is required"):
+        Settings(_env_file=None, auth_required=True, **_OAUTH)
+
+
+def test_auth_required_fails_fast_without_oauth_app() -> None:
+    with pytest.raises(ValidationError, match="GITHUB_OAUTH_CLIENT_ID"):
+        Settings(_env_file=None, auth_required=True, auth_session_secret=SecretStr("s" * 32))
+
+
+def test_auth_required_rejects_the_ungated_gradio_ui() -> None:
+    with pytest.raises(ValidationError, match="ui_backend='gradio'"):
+        Settings(
+            _env_file=None,
+            auth_required=True,
+            auth_session_secret=SecretStr("s" * 32),
+            ui_backend="gradio",
+            **_OAUTH,
+        )
+
+
+def test_auth_secret_lengths_and_callback_shape_are_validated() -> None:
+    with pytest.raises(ValidationError, match="at least 32"):
+        Settings(_env_file=None, auth_session_secret=SecretStr("short"))
+    with pytest.raises(ValidationError, match="at least 16"):
+        Settings(_env_file=None, auth_api_token=SecretStr("short"))
+    with pytest.raises(ValidationError, match="/auth/github/callback"):
+        Settings(
+            _env_file=None, github_oauth_callback_url="https://ono.example.org/github/callback"
+        )
+    with pytest.raises(ValidationError, match="/auth/github/callback"):
+        Settings(_env_file=None, github_oauth_callback_url="ono.example.org/auth/github/callback")
+
+
+def test_auth_required_accepts_a_complete_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AUTH_REQUIRED", "true")
+    monkeypatch.setenv("AUTH_SESSION_SECRET", "s" * 32)
+    monkeypatch.setenv("AUTH_API_TOKEN", "t" * 16)
+    monkeypatch.setenv("GITHUB_OAUTH_CLIENT_ID", "Iv1.test")
+    monkeypatch.setenv("GITHUB_OAUTH_CLIENT_SECRET", "app-secret")
+    monkeypatch.setenv("GITHUB_OAUTH_CALLBACK_URL", "https://ono.example.org/auth/github/callback")
+    monkeypatch.setenv("TRUSTED_PROXY", "true")
+    monkeypatch.setenv("RATE_LIMIT_MAX", "10")
+    s = Settings(_env_file=None)
+    assert s.auth_required and s.trusted_proxy and s.rate_limit_max == 10
+    for secret in ("s" * 32, "t" * 16, "app-secret"):
+        assert secret not in repr(s) and secret not in s.model_dump_json()
+
+
 def test_ingest_and_sast_settings_have_safe_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     s = Settings(_env_file=None)
     assert s.workspace_dir == Path(".ono-workspace")
