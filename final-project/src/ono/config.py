@@ -98,7 +98,81 @@ class Settings(BaseSettings):
         default=3,
         ge=1,
         le=5,
-        description="Hard cap on the verifier-in-the-loop self-correction cycle (prevents thrash).",
+        description=(
+            "Hard cap on the verifier-in-the-loop self-correction cycle per finding: how many "
+            "times the prover / fixer may revise after the deterministic checks fail "
+            "(prevents thrash; 'give up -> unverified' is a first-class outcome)."
+        ),
+    )
+
+    # -- Graded verifier (Deliverable 3, step 3b-2) -----------------------------------
+    # The verifier opens its own jail after analysis, runs the prover's read-only PoC under
+    # the sink oracle (rung 3), then applies the fixer's patch and re-checks (rung 4). The
+    # agents only ever propose; every execution is done by deterministic code.
+    verifier_enabled: bool = Field(
+        default=True,
+        description=(
+            "Run the graded verifier on the service/local backends. False = findings stay "
+            "model-asserted (verified=False, rung <= 2) and no PoC or patch is attempted."
+        ),
+    )
+    prover_max_steps: int = Field(
+        default=4,
+        ge=1,
+        le=16,
+        description="Model calls the prover may spend per attempt (reads + the submission).",
+    )
+    fixer_max_steps: int = Field(
+        default=4,
+        ge=1,
+        le=16,
+        description="Model calls the fixer may spend per attempt (reads + the submission).",
+    )
+    verifier_poc_timeout_s: float = Field(
+        default=60.0,
+        ge=1.0,
+        le=3600.0,
+        description="Hard cap on one PoC run under the sink oracle inside the jail.",
+    )
+    verifier_tests_timeout_s: float = Field(
+        default=240.0,
+        ge=1.0,
+        le=3600.0,
+        description="Hard cap on the target's test suite run after a patch.",
+    )
+    verifier_finding_timeout_s: float = Field(
+        default=600.0,
+        ge=10.0,
+        le=7200.0,
+        description="Wall-clock budget for verifying one finding (all attempts together).",
+    )
+
+    # -- Persistence + the learning loop (Deliverable 3, plan sections 1.5 / 8.6) -----
+    data_dir: Path = Field(
+        default=Path(".ono-data"),
+        description="Directory for durable state (the SQLite scan store and knowledge memory).",
+    )
+    scan_store: Literal["memory", "sqlite"] = Field(
+        default="memory",
+        description=(
+            "Where scans/findings live. 'memory' is lost on restart (default, what tests and "
+            "the mock backend use); 'sqlite' is a durable single file under data_dir."
+        ),
+    )
+    learning_enabled: bool = Field(
+        default=False,
+        description=(
+            "Turn on the frontier-free learning loop: harvest verifier-passed PoCs into a "
+            "persistent knowledge memory and seed the prover with them on later scans. Off by "
+            "default (changes nothing about a single scan); measurable across rounds when on."
+        ),
+    )
+    knowledge_db_path: Path | None = Field(
+        default=None,
+        description=(
+            "Override for the knowledge-memory SQLite file. Defaults to "
+            "<data_dir>/knowledge.sqlite3 when learning is enabled."
+        ),
     )
 
     # -- Scan workers + the polling UI -----------------------------------------------
@@ -191,6 +265,23 @@ class Settings(BaseSettings):
         ge=1,
         le=5000,
         description="Snapshots larger than this (after .git is stripped) abort the scan.",
+    )
+    threat_map_enabled: bool = Field(
+        default=True,
+        description=(
+            "Run the threat-mapping stage (entry points + one-hop data flow, Python and JS/TS) "
+            "as the plan stage: re-ranks the SAST queue by reachability and unions in reachable "
+            "sinks the pattern scanners missed. False = the SAST order, no union."
+        ),
+    )
+    threat_map_timeout_s: float = Field(
+        default=120.0,
+        ge=5.0,
+        le=1800.0,
+        description=(
+            "Wall-clock budget for parsing the workspace in the threat-mapping stage; files "
+            "past it are skipped and the stage summary says so."
+        ),
     )
 
     # -- Agentic detection core (Deliverable 3, step 3b-1) ---------------------------
@@ -345,6 +436,11 @@ class Settings(BaseSettings):
     @property
     def is_production(self) -> bool:
         return self.environment == "production"
+
+    @property
+    def knowledge_path(self) -> Path:
+        """Where the knowledge memory lives (explicit override, else under data_dir)."""
+        return self.knowledge_db_path or (self.data_dir / "knowledge.sqlite3")
 
 
 @lru_cache(maxsize=1)

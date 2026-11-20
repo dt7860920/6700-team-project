@@ -123,6 +123,66 @@ def test_unsupported_source_is_rejected(tmp_path: Path) -> None:
         _ingest(_target("repo", "/definitely/not/a/dir"), tmp_path / "scn_6")
 
 
+def test_http_scheme_is_rejected(tmp_path: Path) -> None:
+    # Only HTTPS is cloneable; plaintext http:// must not be accepted (no MITM downgrade).
+    with pytest.raises(ingest.IngestError, match="unsupported target source"):
+        _ingest(_target("repo", "http://github.com/example/app"), tmp_path / "scn_http")
+
+
+def test_clone_command_ends_options_with_double_dash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        calls.append(cmd)
+        (Path(cmd[-1]) / "main.py").write_text("print('hi')\n")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(ingest.subprocess, "run", fake_run)
+    ws = tmp_path / "scn_dd"
+    _ingest(_target("practice-app", "https://github.com/example/app"), ws)
+    cmd = calls[0]
+    assert "--" in cmd
+    # Everything after "--" is positional: exactly [source, dest].
+    assert cmd[cmd.index("--") + 1 :] == ["https://github.com/example/app", str(ws)]
+
+
+def test_escaping_symlinks_are_removed_internal_kept(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    secret = tmp_path / "secret.txt"
+    secret.write_text("TOP SECRET\n")
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        dest = Path(cmd[-1])
+        (dest / "main.py").write_text("print('hi')\n")
+        (dest / "inner").symlink_to(dest / "main.py")  # stays inside the tree -> kept
+        (dest / "leak").symlink_to(secret)  # escapes the workspace -> removed
+        (dest / "dangling").symlink_to(tmp_path / "nope-outside.txt")  # outside -> removed
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(ingest.subprocess, "run", fake_run)
+    root = _ingest(_target("repo", "https://github.com/example/app"), tmp_path / "scn_sym")
+
+    assert (root / "inner").is_symlink()  # internal link kept
+    assert (root / "main.py").exists()
+    assert not (root / "leak").is_symlink()  # escaping link removed
+    assert not (root / "dangling").is_symlink()  # dangling-outside link removed
+
+
+def test_neutralize_escaping_symlinks_unit(tmp_path: Path) -> None:
+    root = tmp_path / "ws"
+    (root / "sub").mkdir(parents=True)
+    (root / "sub" / "real.py").write_text("x = 1\n")
+    (root / "ok").symlink_to(root / "sub" / "real.py")
+    (root / "bad").symlink_to(tmp_path / "outside.txt")
+    removed = ingest.neutralize_escaping_symlinks(root)
+    assert removed == 1
+    assert (root / "ok").is_symlink()
+    assert not (root / "bad").is_symlink()
+
+
 def test_size_cap_aborts_the_scan(tmp_path: Path) -> None:
     big = tmp_path / "big"
     big.mkdir()

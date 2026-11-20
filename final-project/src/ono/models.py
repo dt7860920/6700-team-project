@@ -141,6 +141,58 @@ class TraceStep(BaseModel):
     note: str = Field(default="", description="Why this hop matters (e.g. 'attacker-controlled').")
 
 
+CheckName = Literal[
+    "anchor", "poc_reaches_sink", "patch_applies", "poc_no_longer_fires", "tests_pass"
+]
+CheckStatus = Literal["passed", "failed", "skipped"]
+
+
+class VerificationCheck(BaseModel):
+    """One deterministic check of the graded verifier and what it saw."""
+
+    name: CheckName
+    status: CheckStatus
+    detail: str = Field(default="", description="Why it passed / failed / was skipped.")
+
+
+class Verification(BaseModel):
+    """The verifier's record for a finding: every check, the PoC that proved it, the cost.
+
+    The checks are the plan's ladder, in order: ``anchor`` (the flagged file:line exists
+    and is not blank), ``poc_reaches_sink`` (a read-only PoC run in the jail carried a
+    verifier-chosen canary into the dangerous argument of the flagged call -> rung 3),
+    ``patch_applies``, ``poc_no_longer_fires`` and ``tests_pass`` (-> rung 4). A check that
+    could not be attempted (no dynamic oracle for the language or CWE, no PoC to re-run)
+    is ``skipped`` with the reason, never silently passed.
+    """
+
+    attempts: int = Field(default=0, ge=0, description="Self-correction rounds used.")
+    poc_attempts: int = Field(
+        default=0,
+        ge=0,
+        description="Prover attempts until the PoC fired (0 if it never did). The learning "
+        "loop's headline metric: it trends down as the knowledge memory seeds later scans.",
+    )
+    seeded: bool = Field(
+        default=False, description="Whether a knowledge-memory hint was seeded into the prover."
+    )
+    checks: list[VerificationCheck] = Field(default_factory=list)
+    poc: str = Field(default="", description="The read-only PoC script that proved rung 3.")
+    evidence: str = Field(
+        default="", description="What the oracle saw when the PoC fired (sink kind, argument)."
+    )
+    tests: str = Field(default="", description="Test runner and summary after the patch.")
+    model_calls: int = Field(default=0, ge=0)
+
+    def check(self, name: CheckName) -> VerificationCheck | None:
+        return next((c for c in self.checks if c.name == name), None)
+
+    @property
+    def summary(self) -> str:
+        parts = [f"{c.name}={c.status}" for c in self.checks]
+        return f"{self.attempts} attempt(s): " + ", ".join(parts)
+
+
 class Finding(BaseModel):
     """A single vulnerability finding, shaped by the output-strength ladder."""
 
@@ -167,14 +219,28 @@ class Finding(BaseModel):
     confidence: float = Field(ge=0.0, le=1.0)
     rung: Rung
     verified: bool = Field(
-        description="True only if the deterministic verifier passed (line exists, PoC reaches "
-        "sink, patch applies, PoC no longer fires, tests pass)."
+        description=(
+            "True only if the deterministic verifier PROVED the finding in the sandbox: a "
+            "read-only PoC carried a canary into the flagged sink (rung 3); at rung 4 the "
+            "patch also applied, the PoC no longer fired and the tests passed. False = "
+            "model-asserted only (rung 1-2); see `verification` for which check stopped it."
+        )
     )
     description: str = ""
-    patch_diff: str = Field(description="Unified diff that closes the flaw.")
+    patch_diff: str = Field(
+        description=(
+            "Unified diff that closes the flaw. At rung 4 it is proven (applies, PoC no "
+            "longer fires, tests pass); below that it is a proposal that at least applies "
+            "cleanly, or empty when no patch could be produced."
+        )
+    )
     detection_rule: str | None = Field(
         default=None,
         description="Rung-5 extra: a detection rule (e.g. Semgrep YAML) to catch exploitation.",
+    )
+    verification: Verification | None = Field(
+        default=None,
+        description="The graded verifier's record (None when the verifier did not run).",
     )
 
     @property

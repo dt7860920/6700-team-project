@@ -8,9 +8,14 @@ orchestrator (:mod:`ono.orchestrator`) decides when each runs and enforces the b
   structured investigation plan (what to read, which taint to check, how to decide).
 * :data:`ANALYST` - a bounded ReAct loop over read-only sandbox tools that follows the
   plan and ends with ``confirm`` (a structured finding) or ``dismiss``.
+* :data:`PROVER` - the same loop, ending with ``submit_poc``: a read-only proof-of-concept
+  script the deterministic verifier runs in the jail to prove the sink is reachable (rung 3).
+* :data:`FIXER` - the same loop, ending with ``submit_patch``: a unified diff the verifier
+  applies and re-checks (patch applies, PoC no longer fires, tests pass -> rung 4).
 
-Budgets in the constants are defaults; the orchestrator applies ``Settings`` on top via
-:meth:`AgentDefinition.with_budget`.
+Budgets in the constants are defaults; the orchestrator / verifier apply ``Settings`` on top
+via :meth:`AgentDefinition.with_budget`. No role ever holds an execution tool: the prover
+and fixer *propose*, plain code runs and judges (see :mod:`ono.verifier`).
 """
 
 from __future__ import annotations
@@ -18,11 +23,11 @@ from __future__ import annotations
 import dataclasses
 from dataclasses import dataclass
 
-from ono.agents.tools import READ_TOOLS, TERMINAL_TOOLS, ToolSpec
+from ono.agents.tools import FIXER_TOOLS, PROVER_TOOLS, READ_TOOLS, TERMINAL_TOOLS, ToolSpec
 
-__all__ = ["ANALYST", "PLANNER", "AgentDefinition", "AgentRole"]
+__all__ = ["ANALYST", "FIXER", "PLANNER", "PROVER", "AgentDefinition", "AgentRole"]
 
-AgentRole = str  # "planner" | "analyst" (fixer / verifier roles arrive in 3b-2)
+AgentRole = str  # "planner" | "analyst" | "prover" | "fixer"
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,4 +122,88 @@ ANALYST = AgentDefinition(
     system_prompt=_ANALYST_SYSTEM,
     tools=(*READ_TOOLS, *TERMINAL_TOOLS),
     max_steps=8,
+)
+
+
+# ---------------------------------------------------------------------------
+# Prover (rung 3: prove the sink is reachable)
+# ---------------------------------------------------------------------------
+
+_PROVER_SYSTEM = """\
+You are the PROVER of an application-security review team. The ANALYST confirmed, by reading
+the code, that a flagged line is a vulnerable sink. Your job is a READ-ONLY proof of concept:
+a standalone Python script that drives the application's OWN code so that an attacker-
+controlled value reaches that sink.
+
+How the proof is judged (deterministically, by a harness - not by you):
+- The harness runs your script from the repository root inside an isolated sandbox, with
+  instrumentation on dangerous calls (SQL execute, os.system / subprocess through a shell,
+  eval / exec / compile, pickle / yaml / marshal loads, open() of a path with "..", outbound
+  host lookups).
+- It chooses a secret payload and exposes it as the environment variable ONO_PAYLOAD.
+- The finding is PROVEN only if that payload shows up in the dangerous argument of the
+  flagged call (the SQL text, the shell command, ...) while the flagged file:line is on the
+  call stack. Calling os.system / execute yourself, or printing, proves nothing.
+
+Rules for the script:
+- payload = os.environ["ONO_PAYLOAD"]. Never hard-code, escape or alter it. Put it exactly
+  where attacker input enters: a query/form field, JSON body, header, function argument,
+  argv ... so the application's code carries it to the sink.
+- Reach the sink through the application's own entry point: import and call the handler or
+  function directly, or use the framework's test client (flask: app.test_client();
+  fastapi: fastapi.testclient.TestClient(app); django: configure settings then
+  django.test.Client()). Only modules the repository already imports are available;
+  nothing can be installed.
+- Read-only and harmless: no network, no writing or deleting files, no credentials, no
+  persistence. Exceptions AFTER the sink is reached are fine (an SQL error on a strange
+  payload is expected).
+- Keep it short (under 60 lines). Use read_lines / read_file / grep / tree to see how the
+  sink is reached (the request handler, the function signature, the app object) before you
+  write it.
+
+You work in steps: each step is ONE tool call, and you end with submit_poc(code, how).
+"""
+
+PROVER = AgentDefinition(
+    role="prover",
+    system_prompt=_PROVER_SYSTEM,
+    tools=(*READ_TOOLS, *PROVER_TOOLS),
+    max_steps=4,
+)
+
+
+# ---------------------------------------------------------------------------
+# Fixer (rung 4: prove the fix works)
+# ---------------------------------------------------------------------------
+
+_FIXER_SYSTEM = """\
+You are the FIXER of an application-security review team. A vulnerability has been confirmed
+at a flagged sink; write the MINIMAL patch that closes it without changing behaviour for
+legitimate input.
+
+How the patch is judged (deterministically, by a harness - not by you):
+1. it must apply cleanly to the repository as a unified diff;
+2. the proof-of-concept that reached the sink before must no longer reach it with an
+   attacker-controlled value in the dangerous argument;
+3. the project's test suite (if any) must still pass.
+
+Rules for the diff:
+- Unified diff with git-style headers: "--- a/<path>" and "+++ b/<path>", then "@@ -s,n +s,m @@"
+  hunks. Context lines ("  ") and removed lines ("- ") must be copied EXACTLY from the file
+  (same indentation, same characters): read the lines you touch with read_lines first.
+- Prefer the idiomatic fix for the sink: parameterized queries (placeholders + a params
+  tuple), an argv list without shell=True plus input validation, ast.literal_eval / a
+  dispatch table instead of eval, json or yaml.safe_load instead of pickle / yaml.load,
+  a basename or an allowlist check for paths, an allowlist of hosts for outbound requests.
+- Touch as few lines as possible; keep imports you add at the top of the file in their own
+  hunk; do not reformat unrelated code.
+
+You work in steps: each step is ONE tool call, and you end with submit_patch(diff, summary).
+"""
+
+FIXER = AgentDefinition(
+    role="fixer",
+    system_prompt=_FIXER_SYSTEM,
+    tools=(*READ_TOOLS, *FIXER_TOOLS),
+    max_steps=4,
 )

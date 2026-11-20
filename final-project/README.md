@@ -10,7 +10,7 @@ Team: Sazan Khalid · Kenedy Ducheine · Junyi Tang · Jeffrey Pinarchick
 | Live app (Jetstream2) | [http://149.165.154.219:8080/ui/](http://149.165.154.219:8080/ui/), running the `service` backend with `qwen2.5-coder:7b` |
 | API docs (OpenAPI) | [http://149.165.154.219:8080/docs](http://149.165.154.219:8080/docs) |
 | Repository | [`dt7860920/6700-team-project`](https://github.com/dt7860920/6700-team-project), in `final-project/` |
-| Design docs | [Project plan](docs/plan.md) · [Deliverable 2 write-up](docs/deliverable2.md) |
+| Design docs | [Project plan](docs/plan.md) · [Deliverable 2 write-up](docs/deliverable2.md) · [Executor deployment hardening](docs/executor-hardening.md) |
 
 > **Status.** The API, configuration, container, and analyst UI are real and deployable. The default **analyzer is mocked** (`MODEL_BACKEND=mock`): it is shaped exactly like the production pipeline — `ingest → SAST shortlist → plan → analyze → verify` — but returns deterministic, representative findings instead of calling a model, so its `rung`, `verified`, and line-number values are illustrative. `MODEL_BACKEND=service` runs the real pipeline up to and including **detection** (Deliverable 3, step 3b-1): real ingest, Semgrep shortlist, and a planner + analyst agent loop that reads the target only through the jailed sandbox Executor. The verifier and fixer agent are not built yet, so real findings come back `verified=false` at rung 1 or 2 with no patch. `MODEL_BACKEND=local` is not implemented yet. See [Where the real pipeline slots in](#where-the-real-pipeline-slots-in).
 
@@ -356,7 +356,7 @@ The `.pipeline` array shows each stage's status and timing; the `analyze` summar
 
 Rung 3/4 output ("the PoC reaches the sink", "the patch applies and the tests still pass") means **running untrusted target code**. That happens only inside the **Executor**: a separate, internal-only, token-authenticated FastAPI service (`ono.executor.app`, container C in `compose.yml`) that spins up **one ephemeral, jailed Docker container per scan**, runs operations against it over `docker exec`, and destroys it afterwards (on `DELETE`, on Executor shutdown, or when the TTL sweeper finds it).
 
-**Trust boundary.** The Executor is *privileged* — it mounts the host Docker socket, which is equivalent to root on the host — so it is kept tiny and audited, never published (Compose puts it on an `internal: true` network with no `ports:`), and runs nothing untrusted itself. The **target containers it spawns are the untrusted, jailed ones**:
+**Trust boundary.** The Executor is *privileged* — it mounts the host Docker socket, which is equivalent to root on the host — so it is kept tiny and audited, never published (Compose puts it on an `internal: true` network with no `ports:`), and runs nothing untrusted itself. Operators who want a smaller blast radius have an **optional** override that puts a read-limited docker-socket-proxy in front of the daemon and lets the Executor drop root (`make compose-up-proxied`), plus guidance on `userns-remap` and token rotation, in [`docs/executor-hardening.md`](docs/executor-hardening.md). The **target containers it spawns are the untrusted, jailed ones**:
 
 | Jail flag | Why |
 |---|---|

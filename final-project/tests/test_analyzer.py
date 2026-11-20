@@ -6,8 +6,8 @@ import pytest
 
 from ono.analyzer import MockAnalyzer, build_analyzer
 from ono.config import Settings
-from ono.models import ScanOptions
-from ono.targets import TargetRegistry, UnauthorizedTargetError, get_registry
+from ono.models import Finding, ScanOptions, Verification, VerificationCheck
+from ono.targets import Target, TargetRegistry, UnauthorizedTargetError, get_registry
 
 
 @pytest.fixture
@@ -97,3 +97,33 @@ def test_registry_is_an_exact_allowlist(registry: TargetRegistry) -> None:
     assert not registry.is_authorized("pygoat ")
     with pytest.raises(UnauthorizedTargetError):
         registry.require("nodegoat")
+
+
+class _GradedVerifyAnalyzer(MockAnalyzer):
+    """Mock pipeline whose verify stage keeps every finding, like the graded verifier."""
+
+    def verify(self, target: Target, findings: list[Finding]) -> list[Finding]:
+        base = findings[0]
+        failed = Verification(
+            checks=[
+                VerificationCheck(name="anchor", status="passed"),
+                VerificationCheck(name="poc_reaches_sink", status="failed"),
+            ]
+        )
+        skipped = Verification(
+            checks=[VerificationCheck(name="poc_reaches_sink", status="skipped")]
+        )
+        return [
+            base,
+            base.model_copy(update={"verified": False, "rung": 2, "verification": failed}),
+            base.model_copy(update={"verified": False, "rung": 2, "verification": skipped}),
+            base.model_copy(update={"verified": False, "rung": 2, "verification": None}),
+        ]
+
+
+def test_verifier_counts_come_from_each_findings_verdict(
+    settings: Settings, registry: TargetRegistry
+) -> None:
+    result = _GradedVerifyAnalyzer(settings).run("scn_test", registry["pygoat"], ScanOptions())
+    assert len(result.findings) == 4  # nothing is dropped
+    assert (result.verifier_passed, result.verifier_failed, result.verifier_skipped) == (1, 1, 2)

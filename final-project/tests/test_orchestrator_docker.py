@@ -125,6 +125,7 @@ def test_service_analyzer_against_a_real_jail(live_executor: LiveServer, tmp_pat
         workspace_dir=tmp_path / "ws",
         context_lines=5,
         agent_trajectory_dir=tmp_path / "traj",
+        verifier_enabled=False,  # this test covers detection; the verifier has its own docker test
     )
     target = Target(
         target_id="fixture-repo",
@@ -147,7 +148,8 @@ def test_service_analyzer_against_a_real_jail(live_executor: LiveServer, tmp_pat
     assert result.stages[1].summary == "3 candidate(s)"
     report = analyzer.last_report
     assert report is not None and report.sandbox_id.startswith("sbx_")
-    assert [o.state for o in report.outcomes] == ["dismissed", "confirmed", "dismissed"]
+    # The threat map walks the two route-reachable sinks first, the parameter-only helper last.
+    assert [o.state for o in report.outcomes] == ["confirmed", "dismissed", "dismissed"]
 
     # The SQLi finding is anchored to lines the analyst really read from inside the jail:
     # the grep hit (13) and the read range (11-17); the invented line 99 was dropped.

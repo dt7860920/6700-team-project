@@ -29,7 +29,8 @@ from ono.targets import Target
 log = logging.getLogger(__name__)
 
 SNIPPET_FILE = "snippet.py"
-_ALLOWED_SCHEMES = ("https://", "http://")
+# HTTPS only: never clone code over plaintext (no transport downgrade / MITM).
+_ALLOWED_SCHEMES = ("https://",)
 
 
 class IngestError(RuntimeError):
@@ -83,6 +84,7 @@ def fetch_source(source: str, dest: Path, *, clone_timeout_s: float, max_clone_m
         raise IngestError(msg)
 
     strip_git(dest)
+    neutralize_escaping_symlinks(dest)
     size_mb = dir_size_bytes(dest) / 1_000_000
     if size_mb > max_clone_mb:
         msg = f"snapshot is {size_mb:.0f} MB, above max_clone_mb={max_clone_mb}; aborting"
@@ -114,6 +116,7 @@ def clone_repo(source: str, dest: Path, *, timeout_s: float) -> None:
         "--no-tags",
         "--single-branch",
         "--no-recurse-submodules",
+        "--",  # end of options: a '-'-leading source can never be read as a git flag
         source,
         str(dest),
     ]
@@ -140,6 +143,37 @@ def strip_git(root: Path) -> None:
         shutil.rmtree(git_dir)
     elif git_dir.is_file():  # worktree pointer file
         git_dir.unlink()
+
+
+def _within(child: Path, parent: Path) -> bool:
+    try:
+        child.relative_to(parent)
+    except ValueError:
+        return False
+    return True
+
+
+def neutralize_escaping_symlinks(root: Path) -> int:
+    """Remove symlinks that resolve outside the workspace; return how many.
+
+    A clone runs on the host and is read there by Semgrep (host-side, not jailed).
+    A repository can plant a symlink such as ``cfg -> /etc/passwd`` or
+    ``x -> /proc/self/environ``; a host-side reader that follows it would leak host
+    files into findings. We drop any symlink whose target resolves outside ``root``
+    (dangling links resolve outside too) and keep links that stay within the tree.
+    ``rglob`` does not descend into symlinked directories, so this terminates.
+    """
+    removed = 0
+    root_resolved = root.resolve()
+    for path in root.rglob("*"):
+        if not path.is_symlink():
+            continue
+        if not _within(path.resolve(strict=False), root_resolved):
+            path.unlink()
+            removed += 1
+    if removed:
+        log.warning("ingest: removed %d symlink(s) pointing outside the workspace", removed)
+    return removed
 
 
 def dir_size_bytes(root: Path) -> int:

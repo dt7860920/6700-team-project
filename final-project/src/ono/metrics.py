@@ -59,8 +59,9 @@ TEXT_CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8"
 """Content type of ``GET /metrics``: the Prometheus text exposition format."""
 
 VerifierResult = Literal["pass", "fail", "skip"]
-"""``pass`` = verdict true, ``fail`` = dropped by the verifier, ``skip`` = passed through
-without a verdict (the service backend's verifier is still a pass-through, step 3b-2)."""
+"""``pass`` = proven (``verified=True``), ``fail`` = not proven and a verifier check failed,
+``skip`` = not proven and no check failed (the verifier could not attempt it, e.g. an
+unsupported language/CWE, or it is disabled). The verifier keeps every finding."""
 
 SCAN_DURATION_BUCKETS: tuple[float, ...] = (
     0.1, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 600, 1200, 1800, 3600,
@@ -117,8 +118,8 @@ class Metrics:
         )
         self.verifier_results_total = Counter(
             "ono_verifier_results",
-            "Raw findings seen by the verify stage: pass (verdict true), fail (dropped), "
-            "skip (passed through without a verdict).",
+            "Findings seen by the verify stage: pass (proven), fail (a verifier check "
+            "failed), skip (the verifier could not attempt it).",
             ["result"],
             registry=self.registry,
         )

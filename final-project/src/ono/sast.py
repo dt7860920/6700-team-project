@@ -126,6 +126,13 @@ class Candidate:
     rule: str
     excerpt: str = ""
     severity: str = ""  # Semgrep's ERROR / WARNING / INFO; used only to rank the queue
+    # Filled by the threat-mapping stage (ono.planning): how the sink was found reachable.
+    reach: str = ""  # direct / one-hop / param / in-entry / dynamic / unmapped ("" = not mapped)
+    entry: str = ""  # the entry point, e.g. "GET /user -> app/views.py:11 user()"
+    source: str = (
+        ""  # the attacker-controlled expression, e.g. "request.args.get(\"id\") at views.py:13"
+    )
+    path: tuple[str, ...] = ()  # source -> sink hops, "file:line symbol - note" each
 
 
 @dataclass(slots=True)
