@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import json
+import os
 import threading
 import time
 from collections.abc import Iterator
@@ -30,6 +32,7 @@ from ono.executor.sandbox import (
     LABEL_CREATED,
     LABEL_SANDBOX,
     SANDBOX_USER,
+    SECCOMP_HARDENED,
     JailConfig,
     Sandbox,
     SandboxError,
@@ -37,12 +40,16 @@ from ono.executor.sandbox import (
     SandboxNotRunningError,
     SandboxOperationError,
     SandboxPathError,
+    load_seccomp_profile,
 )
 
 pytestmark = pytest.mark.docker
 
 FIXTURE_REPO = Path(__file__).parent / "fixtures" / "vuln_repo"
 TOKEN = "docker-test-token-0123456789"
+# ONO_SANDBOX_SECCOMP=hardened|docker-default|<path> runs this whole module under that
+# seccomp profile - how a profile is validated end to end before it becomes the default.
+SECCOMP = load_seccomp_profile(os.environ.get("ONO_SANDBOX_SECCOMP", SECCOMP_HARDENED))
 CONFIG = JailConfig(
     mem_mb=256,
     cpus=1.0,
@@ -52,6 +59,7 @@ CONFIG = JailConfig(
     output_cap_bytes=200_000,
     workspace_mb=128,
     max_active=8,
+    seccomp_profile=SECCOMP,
 )
 
 
@@ -133,6 +141,73 @@ def test_inmate_view_non_root_no_caps_no_socket_no_net(sandbox: Sandbox) -> None
     assert [line for line in lines if line.strip() == "lo"], "only the loopback interface"
     assert "eth0" not in r.stdout
     assert "docker-init" in lines[-1] and "sleep infinity" in lines[-1]
+
+
+def test_hardened_seccomp_profile_is_enforced_and_the_jail_still_works(
+    manager: SandboxManager, raw_docker: Any
+) -> None:
+    """Issue #95: the shipped profile reaches the kernel, blocks what it drops, and breaks
+    nothing the jail needs (python3 -I -S helper, tar extraction, reads, grep, patch, tests)."""
+    profile = load_seccomp_profile(SECCOMP_HARDENED)
+    assert profile is not None
+    hardened = SandboxManager(dataclasses.replace(CONFIG, seccomp_profile=profile))
+    sbx = hardened.create("scn_seccomp", FIXTURE_REPO)  # create == tar extraction worked
+    try:
+        hc = raw_docker.api.inspect_container(sbx.container_id)["HostConfig"]
+        opts = hc["SecurityOpt"]
+        assert "no-new-privileges:true" in opts
+        applied = [o for o in opts if o.startswith("seccomp=")]
+        assert len(applied) == 1
+        assert json.loads(applied[0].removeprefix("seccomp="))["defaultAction"] == "SCMP_ACT_ERRNO"
+        # the kernel has it: filter mode 2, and the dropped syscalls fail with EPERM
+        status = sbx.run("grep ^Seccomp: /proc/self/status").stdout
+        assert "Seccomp:\t2" in status, status
+        probe = sbx.run(
+            "python3 - <<'EOF'\n"
+            "import ctypes, errno, socket, os\n"
+            "libc = ctypes.CDLL(None, use_errno=True)\n"
+            "def call(name, *args):\n"
+            "    r = getattr(libc, name)(*args)\n"
+            "    return os.strerror(ctypes.get_errno()) if r == -1 else 'ok'\n"
+            "print('ptrace', call('ptrace', 0, 0, 0, 0))\n"
+            "print('personality', call('personality', 0xffffffff))\n"
+            "try:\n"
+            "    socket.socket(socket.AF_NETLINK, socket.SOCK_RAW); print('netlink ok')\n"
+            "except OSError as e:\n"
+            "    print('netlink', e.errno == errno.EPERM)\n"
+            "print('unix', socket.socket(socket.AF_UNIX).family.name)\n"
+            "print('inet', socket.socket(socket.AF_INET).family.name)\n"
+            "EOF",
+            timeout_s=20,
+        )
+        assert probe.exit_code == 0, probe.stderr
+        assert "ptrace Operation not permitted" in probe.stdout, probe.stdout
+        assert "personality Operation not permitted" in probe.stdout, probe.stdout
+        assert "netlink True" in probe.stdout, probe.stdout
+        assert "unix AF_UNIX" in probe.stdout and "inet AF_INET" in probe.stdout
+        # ... and everything the agents rely on is unaffected
+        assert "os.system" in sbx.read_file("app/views.py").content
+        assert sbx.read_lines("app/views.py", 1, 2).end_line == 2
+        assert sbx.tree().total >= 4
+        assert sbx.grep(r"os\.system").matches
+        first = sbx.read_lines("README.md", 1, 1).content
+        diff = f"--- a/README.md\n+++ b/README.md\n@@ -1 +1,2 @@\n+PATCHED\n {first}"
+        assert sbx.apply_patch(diff).applied is True
+        run = sbx.run(
+            "python3 -c 'import subprocess, json, hashlib, multiprocessing; "
+            'print(subprocess.run(["sh", "-c", "echo child"], capture_output=True)'
+            ".stdout.decode().strip())'"
+        )
+        assert run.exit_code == 0 and run.stdout == "child\n", run
+        copy = sbx.run("mkdir /tmp/c && cd /tmp/c && tar -cz -C /workspace . | tar -xz && ls app")
+        assert copy.exit_code == 0 and "views.py" in copy.stdout, copy
+        assert sbx.run("sleep 30", timeout_s=1).timed_out is True
+        assert sbx.run_tests().runner == "none"
+        assert sbx.reset().resets == 1
+        assert sbx.read_lines("README.md", 1, 1).content == first
+    finally:
+        sbx.destroy()
+        hardened.close()
 
 
 def test_rootfs_is_read_only_and_tmpfs_is_nosuid(sandbox: Sandbox) -> None:

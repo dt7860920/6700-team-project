@@ -164,3 +164,8 @@ class ExecutorHealth(BaseModel):
     status: Literal["ok", "degraded"] = "ok"
     docker: bool = Field(description="Whether the Docker daemon answered a ping.")
     active_sandboxes: int = Field(ge=0)
+    snapshot_bytes: int = Field(
+        default=0,
+        ge=0,
+        description="Workspace archives retained on disk for reset() across live sandboxes.",
+    )

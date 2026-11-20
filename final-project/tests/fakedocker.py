@@ -14,13 +14,15 @@ inspect_container/remove_container``, ``ping`` - and is realistic where it matte
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import io
 import json
 import struct
 import tarfile
+import tempfile
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import IO, Any
 
 import docker.errors
 import requests
@@ -49,12 +51,17 @@ class FakeResponse:
 
 
 class FakeRaw:
-    """The ``_sock`` underneath docker-py's SocketIO: frames are produced on first recv."""
+    """The ``_sock`` underneath docker-py's SocketIO: frames are produced on first recv.
+
+    Stdin written by the sandbox layer is spooled to a temp *file*, not kept in memory,
+    so a test measuring the Executor's own memory footprint is not polluted by the fake.
+    """
 
     def __init__(self, exec_: FakeExec, docker_: FakeDocker) -> None:
         self.exec = exec_
         self.docker = docker_
-        self.sent = bytearray()
+        self.sent: IO[bytes] = tempfile.TemporaryFile()  # noqa: SIM115 - closed in recv()
+        self.sent_bytes = 0
         self.buf = b""
         self.pos = 0
         self.produced = False
@@ -66,7 +73,8 @@ class FakeRaw:
         self.timeout = value
 
     def sendall(self, data: bytes) -> None:
-        self.sent.extend(data)
+        self.sent.write(data)
+        self.sent_bytes += len(data)
 
     def shutdown(self, _how: int) -> None:
         self.shutdown_called = True
@@ -74,7 +82,9 @@ class FakeRaw:
     def recv(self, n: int) -> bytes:
         if not self.produced:
             self.produced = True
-            code, out, err = self.docker.perform(self.exec, bytes(self.sent))
+            self.sent.seek(0)
+            code, out, err = self.docker.perform(self.exec, self.sent)
+            self.sent.close()
             self.exec.exit_code = code
             self.exec.running = False
             self.buf = b"".join(
@@ -111,6 +121,9 @@ class FakeExec:
         self.running = True
         self.hang = False
         self.stdin = b""
+        """The first 64 KiB of what the sandbox layer wrote to stdin (for assertions)."""
+        self.stdin_bytes = 0
+        self.stdin_sha256 = ""
 
 
 class FakeContainer:
@@ -260,21 +273,29 @@ class FakeDocker:
         return container
 
     # -- the fake "process" ---------------------------------------------------
-    def perform(self, exec_: FakeExec, stdin: bytes) -> tuple[int, bytes, bytes]:
-        exec_.stdin = stdin
+    def perform(self, exec_: FakeExec, stdin: IO[bytes]) -> tuple[int, bytes, bytes]:
+        digest = hashlib.sha256()
+        exec_.stdin = b""
+        while chunk := stdin.read(64 * 1024):  # small buffers: keep the fake out of RAM tests
+            if not exec_.stdin:
+                exec_.stdin = chunk
+            exec_.stdin_bytes += len(chunk)
+            digest.update(chunk)
+        exec_.stdin_sha256 = digest.hexdigest()
+        stdin.seek(0)
         cmd = exec_.cmd
         ws = self.workspaces[exec_.container_id]
         if cmd[0] == "tar":
             if self.tar_fails:
                 return 2, b"", b"tar: boom\n"
-            with tarfile.open(fileobj=io.BytesIO(stdin), mode="r:gz") as tar:
+            with tarfile.open(fileobj=stdin, mode="r:gz") as tar:
                 tar.extractall(ws, filter="data")
             return 0, b"", b""
         if cmd[0] == "python3" and cmd[1:4] == ["-I", "-S", "-c"]:
             assert cmd[4] == _guest_source(), "guest source must be shipped verbatim"
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
-                code = _guest.main(cmd[5:], root=str(ws), stdin=io.BytesIO(stdin))
+                code = _guest.main(cmd[5:], root=str(ws), stdin=stdin)
             return code, out.getvalue().encode(), b""
         if cmd[0] == "sh" and "kill -9 -1" in cmd[2]:
             return (1, b"", b"nope\n") if self.reap_fails else (0, b"", b"")

@@ -22,10 +22,14 @@ network with no ``ports:`` block - and every endpoint except ``/health`` require
 
 from __future__ import annotations
 
+import contextlib
 import hmac
 import logging
-from collections.abc import AsyncIterator
+import os
+import tempfile
+from collections.abc import AsyncIterator, Awaitable, Callable, MutableMapping
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Annotated, Any
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
@@ -117,7 +121,97 @@ _ERRORS: dict[int | str, dict[str, Any]] = {
     401: {"model": ErrorResponse, "description": "missing or invalid bearer token"},
     404: {"model": ErrorResponse, "description": "unknown sandbox"},
     409: {"model": ErrorResponse, "description": "sandbox container is not running (reset it)"},
+    413: {"model": ErrorResponse, "description": "request body larger than executor_max_body_mb"},
 }
+
+_Scope = MutableMapping[str, Any]
+_Message = MutableMapping[str, Any]
+_Receive = Callable[[], Awaitable[_Message]]
+_Send = Callable[[_Message], Awaitable[None]]
+_ASGIApp = Callable[[_Scope, _Receive, _Send], Awaitable[None]]
+
+
+class BodyTooLargeError(Exception):
+    """Raised inside ``receive()`` by :class:`BodyLimitMiddleware` once the cap is crossed."""
+
+    def __init__(self, max_bytes: int) -> None:
+        super().__init__(f"request body is larger than {max_bytes} bytes")
+        self.max_bytes = max_bytes
+
+
+class BodyLimitMiddleware:
+    """Pure-ASGI request-body cap for the JSON operation routes (issue #98).
+
+    The archive upload (``POST /sandboxes``) is exempt: it streams its body to disk
+    under its own cap (``max_clone_mb``). Every other request is bounded by
+    ``max_bytes`` - a declared ``Content-Length`` above it is refused before a byte is
+    read, and a chunked body is cut off as soon as the running total crosses the cap
+    (the bytes received so far are the most it can ever cost). Pydantic's
+    ``max_length`` limits still apply afterwards; this is the outer, byte-level wall.
+
+    The 413 is produced *here*: FastAPI turns any exception raised while it reads the
+    body into a generic 400, so the middleware swaps that response for its own.
+    """
+
+    def __init__(self, app: _ASGIApp, *, max_bytes: int) -> None:
+        self.app = app
+        self.max_bytes = max_bytes
+
+    @staticmethod
+    def exempt(scope: _Scope) -> bool:
+        return bool(scope.get("method") == "POST" and scope.get("path") == "/sandboxes")
+
+    async def __call__(self, scope: _Scope, receive: _Receive, send: _Send) -> None:
+        if scope["type"] != "http" or self.exempt(scope):
+            await self.app(scope, receive, send)
+            return
+        too_large = _error(
+            status.HTTP_413_CONTENT_TOO_LARGE, str(BodyTooLargeError(self.max_bytes))
+        )
+        declared = _content_length(scope)
+        if declared is not None and declared > self.max_bytes:
+            await too_large(scope, receive, send)
+            return
+        received = 0
+        exceeded = False
+        response_started = False
+
+        async def capped_receive() -> _Message:
+            nonlocal received, exceeded
+            message = await receive()
+            if message["type"] == "http.request":
+                received += len(message.get("body", b""))
+                if received > self.max_bytes:
+                    exceeded = True
+                    raise BodyTooLargeError(self.max_bytes)
+            return message
+
+        async def guarded_send(message: _Message) -> None:
+            nonlocal response_started
+            if not exceeded:
+                await send(message)
+                return
+            if message["type"] == "http.response.start" and not response_started:
+                response_started = True
+                await too_large(scope, receive, send)
+            # the app's own (400) body for the cut-off read is dropped
+
+        try:
+            await self.app(scope, capped_receive, guarded_send)
+        except BodyTooLargeError:
+            if not response_started:
+                response_started = True
+                await too_large(scope, receive, send)
+
+
+def _content_length(scope: _Scope) -> int | None:
+    for name, value in scope.get("headers", ()):
+        if name == b"content-length":
+            try:
+                return int(value)
+            except ValueError:
+                return None
+    return None
 
 
 def create_executor_app(
@@ -171,6 +265,7 @@ def create_executor_app(
     app.state.manager = manager
     app.state.token = token
     max_upload = manager.config.max_archive_bytes
+    app.add_middleware(BodyLimitMiddleware, max_bytes=settings.executor_max_body_mb * 1_000_000)
 
     # -- error mapping ----------------------------------------------------------
     @app.exception_handler(SandboxPathError)
@@ -207,6 +302,7 @@ def create_executor_app(
             status="ok" if docker_ok else "degraded",
             docker=docker_ok,
             active_sandboxes=len(manager.active()),
+            snapshot_bytes=manager.snapshot_bytes(),
         )
 
     # -- sandboxes --------------------------------------------------------------
@@ -230,8 +326,9 @@ def create_executor_app(
         summary="Create a jailed sandbox for a scan",
         description=(
             "Request body: a **gzipped tar** of the workspace (`Content-Type: application/gzip`), "
-            "extracted inside the jail as the sandbox user. The bytes are also kept as the clean "
-            "snapshot that `reset` restores."
+            "streamed to disk (never buffered in memory), validated, and extracted inside the "
+            "jail as the sandbox user. The file is kept on disk as the clean snapshot that "
+            "`reset` restores, and deleted with the sandbox."
         ),
         openapi_extra={
             "requestBody": {
@@ -245,20 +342,29 @@ def create_executor_app(
         manager: ManagerDep,
         scan_id: Annotated[str, Query(pattern=SCAN_ID_PATTERN, max_length=64)],
     ) -> SandboxInfo:
-        chunks: list[bytes] = []
+        # The body goes straight to a file in the snapshot directory, one chunk at a
+        # time, with the byte cap enforced as it streams: the Executor's RAM never holds
+        # the archive (issue #96). The manager takes the file over from here (it becomes
+        # the reset snapshot) and removes it on any failure.
+        spool = await run_in_threadpool(_new_spool_file, manager.snapshot_dir)
         total = 0
-        async for chunk in request.stream():  # bounded read: never buffer an unbounded body
-            total += len(chunk)
-            if total > max_upload:
-                raise HTTPException(
-                    status.HTTP_413_CONTENT_TOO_LARGE,
-                    f"workspace archive is larger than {max_upload} bytes",
-                )
-            chunks.append(chunk)
-        archive = b"".join(chunks)
-        if not archive:
-            raise HTTPException(_UNPROCESSABLE, "empty request body")
-        sandbox = await run_in_threadpool(manager.create_from_archive, scan_id, archive)
+        try:
+            with spool.open("wb") as fh:
+                async for chunk in request.stream():
+                    total += len(chunk)
+                    if total > max_upload:
+                        raise HTTPException(
+                            status.HTTP_413_CONTENT_TOO_LARGE,
+                            f"workspace archive is larger than {max_upload} bytes",
+                        )
+                    fh.write(chunk)
+            if total == 0:
+                raise HTTPException(_UNPROCESSABLE, "empty request body")
+        except BaseException:
+            with contextlib.suppress(OSError):
+                spool.unlink()
+            raise
+        sandbox = await run_in_threadpool(manager.create_from_archive, scan_id, spool)
         return sandbox.info()
 
     @app.get(
@@ -366,6 +472,13 @@ def create_executor_app(
 
 def _error(code: int, detail: str) -> JSONResponse:
     return JSONResponse(status_code=code, content=ErrorResponse(detail=detail).model_dump())
+
+
+def _new_spool_file(directory: Path) -> Path:
+    """An empty, private (0600) file in the snapshot directory for an incoming upload."""
+    fd, name = tempfile.mkstemp(prefix="upload-", suffix=".tar.gz", dir=directory)
+    os.close(fd)
+    return Path(name)
 
 
 def get_app() -> FastAPI:

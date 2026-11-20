@@ -22,14 +22,19 @@ destroyed:
 ``oom_score_adj=1000``  if the *host* is short on memory, sandbox processes die first
 no Docker socket        the socket is only ever mounted into the Executor, never into a target
 labels ``ono.*``        the TTL sweeper finds and removes orphans after a crash
+seccomp profile         Docker's default minus ptrace/AIO/SysV-IPC/... and non-INET socket
+                        families (``sandbox_seccomp_profile``, see :func:`load_seccomp_profile`)
 ======================  =====================================================================
 
 Files travel in by streaming a tar over ``docker exec`` stdin into ``tar -x`` running
 *as the sandbox user* (the archive API cannot write into a tmpfs under a read-only
-rootfs). Every operation is a ``docker exec`` with a hard deadline, a byte cap on
-output, and - for ``run()`` - a ``kill -9 -1`` sweep afterwards so nothing survives
-between operations. ``reset()`` destroys the container and recreates it from the
-snapshot kept on the (trusted) Executor side: ~100 ms plus extraction, and it also
+rootfs). The archive is only ever read from a **file** - the upload is spooled to
+disk, validated by streaming, and kept there as the :class:`~ono.executor.archive.Snapshot`
+``reset()`` restores from - so the Executor's resident memory does not grow with the
+size or number of workspaces (see issue #96). Every operation is a ``docker exec``
+with a hard deadline, a byte cap on output, and - for ``run()`` - a ``kill -9 -1``
+sweep afterwards so nothing survives between operations. ``reset()`` destroys the
+container and recreates it from the snapshot: ~100 ms plus extraction, and it also
 recovers a sandbox whose container died.
 """
 
@@ -39,8 +44,10 @@ import contextlib
 import json
 import logging
 import re
+import shutil
 import socket
 import struct
+import tempfile
 import threading
 import time
 import uuid
@@ -48,7 +55,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from importlib import resources
 from pathlib import Path
-from typing import Any, Self
+from typing import IO, Any, Self
 
 import docker
 import docker.errors
@@ -57,7 +64,13 @@ import requests
 
 from ono.config import Settings
 from ono.executor._guest import GuestError, split_rel
-from ono.executor.archive import SANDBOX_UID, ArchiveError, pack_workspace, validate_archive
+from ono.executor.archive import (
+    SANDBOX_UID,
+    SPOOL_CHUNK_BYTES,
+    ArchiveError,
+    Snapshot,
+    pack_workspace,
+)
 from ono.executor.models import (
     SANDBOX_WORKSPACE,
     SCAN_ID_PATTERN,
@@ -82,7 +95,9 @@ __all__ = [
     "SandboxNotRunningError",
     "SandboxOperationError",
     "SandboxPathError",
+    "check_grep_pattern",
     "jail_kwargs",
+    "load_seccomp_profile",
 ]
 
 log = logging.getLogger(__name__)
@@ -109,6 +124,12 @@ _OOM_RE = re.compile(r"oom_kill\s+(\d+)")
 
 # The in-jail helper is shipped by value on every call (see _guest.py's docstring).
 GUEST_SOURCE = resources.files("ono.executor").joinpath("_guest.py").read_text(encoding="utf-8")
+
+SECCOMP_DOCKER_DEFAULT = "docker-default"
+"""``sandbox_seccomp_profile`` value meaning: add nothing, keep the daemon's default."""
+SECCOMP_HARDENED = "hardened"
+"""``sandbox_seccomp_profile`` value selecting the profile shipped with the package."""
+_SECCOMP_HARDENED_FILE = "seccomp-hardened.json"
 
 _CONTAINER_ENV = {
     "HOME": "/tmp",
@@ -175,6 +196,10 @@ class JailConfig:
     workspace_mb: int = 512
     max_active: int = 8
     max_archive_bytes: int = 200_000_000
+    snapshot_dir: Path | None = None
+    """Where validated archives are kept for ``reset()``; ``None`` = a private temp dir."""
+    seccomp_profile: str | None = None
+    """Seccomp profile JSON handed to the daemon; ``None`` = Docker's default profile."""
 
     @classmethod
     def from_settings(cls, settings: Settings) -> Self:
@@ -189,7 +214,40 @@ class JailConfig:
             workspace_mb=settings.sandbox_workspace_mb,
             max_active=settings.sandbox_max_active,
             max_archive_bytes=settings.max_clone_mb * 1_000_000,
+            snapshot_dir=settings.sandbox_snapshot_dir,
+            seccomp_profile=load_seccomp_profile(settings.sandbox_seccomp_profile),
         )
+
+
+def load_seccomp_profile(spec: str | None) -> str | None:
+    """Resolve the ``sandbox_seccomp_profile`` setting to the JSON the daemon receives.
+
+    ``None`` / ``""`` / ``"docker-default"`` keep Docker's built-in profile (nothing is
+    added to ``security_opt``); ``"hardened"`` loads the profile shipped in this package
+    (Docker's default minus the syscall groups a test runner never needs - see
+    ``seccomp-hardened.json``); anything else is a path to a custom profile. The
+    Engine API takes the profile *contents* (the CLI reads the file for you; docker-py
+    does not), so the text is returned compacted and must be valid JSON.
+    """
+    if not spec or spec == SECCOMP_DOCKER_DEFAULT:
+        return None
+    if spec == SECCOMP_HARDENED:
+        text = resources.files("ono.executor").joinpath(_SECCOMP_HARDENED_FILE).read_text("utf-8")
+    else:
+        try:
+            text = Path(spec).read_text("utf-8")
+        except OSError as exc:
+            raise ValueError(f"sandbox_seccomp_profile {spec!r} cannot be read: {exc}") from exc
+    try:
+        profile = json.loads(text)
+    except ValueError as exc:
+        raise ValueError(f"sandbox_seccomp_profile {spec!r} is not valid JSON: {exc}") from exc
+    if not isinstance(profile, dict) or "defaultAction" not in profile or "syscalls" not in profile:
+        raise ValueError(
+            f"sandbox_seccomp_profile {spec!r} is not a seccomp profile "
+            "(needs 'defaultAction' and 'syscalls')"
+        )
+    return json.dumps(profile, separators=(",", ":"))
 
 
 def jail_kwargs(config: JailConfig, *, scan_id: str, sandbox_id: str) -> dict[str, Any]:
@@ -198,6 +256,9 @@ def jail_kwargs(config: JailConfig, *, scan_id: str, sandbox_id: str) -> dict[st
     Kept as one pure function so the unit tests can assert every flag without Docker.
     """
     tmp_mb = max(16, config.workspace_mb // 2)
+    security_opt = ["no-new-privileges:true"]
+    if config.seccomp_profile is not None:
+        security_opt.append(f"seccomp={config.seccomp_profile}")
     return {
         "image": config.image,
         "command": ["sleep", "infinity"],
@@ -211,7 +272,7 @@ def jail_kwargs(config: JailConfig, *, scan_id: str, sandbox_id: str) -> dict[st
         "network_mode": "none",
         "read_only": True,
         "cap_drop": ["ALL"],
-        "security_opt": ["no-new-privileges:true"],
+        "security_opt": security_opt,
         "privileged": False,
         "tmpfs": {
             SANDBOX_WORKSPACE: (
@@ -300,13 +361,15 @@ class Sandbox:
     """One scan's jailed container plus the clean snapshot it can be reset to.
 
     All operations are serialized per sandbox (``reset`` while a ``run`` is streaming
-    would be chaos); different sandboxes run fully in parallel.
+    would be chaos); different sandboxes run fully in parallel. The snapshot is a
+    validated archive **on disk** (:class:`~ono.executor.archive.Snapshot`); it is
+    streamed into the jail on every (re)start and deleted with the sandbox.
     """
 
     manager: SandboxManager
     sandbox_id: str
     scan_id: str
-    snapshot: bytes = field(repr=False)
+    snapshot: Snapshot = field(repr=False)
     created_at: datetime
     status: SandboxStatus = "dead"
     container_id: str | None = None
@@ -352,21 +415,26 @@ class Sandbox:
         self.container_id = str(container.id)
         self.status = "running"
         try:
-            outcome = self._exec(
-                [
-                    "tar",
-                    "-xz",
-                    "--no-same-owner",
-                    "--no-same-permissions",
-                    "-C",
-                    SANDBOX_WORKSPACE,
-                    "-f",
-                    "-",
-                ],
-                stdin=self.snapshot,
-                timeout_s=_EXTRACT_TIMEOUT_S,
-                cap_bytes=_GUEST_OVERHEAD_BYTES,
-            )
+            try:
+                archive = self.snapshot.open()
+            except OSError as exc:
+                raise SandboxError(f"workspace snapshot is missing: {exc}") from exc
+            with archive:
+                outcome = self._exec(
+                    [
+                        "tar",
+                        "-xz",
+                        "--no-same-owner",
+                        "--no-same-permissions",
+                        "-C",
+                        SANDBOX_WORKSPACE,
+                        "-f",
+                        "-",
+                    ],
+                    stdin=archive,
+                    timeout_s=_EXTRACT_TIMEOUT_S,
+                    cap_bytes=_GUEST_OVERHEAD_BYTES,
+                )
             if outcome.exit_code != 0:
                 raise SandboxError(
                     f"workspace extraction failed (exit {outcome.exit_code}): "
@@ -417,6 +485,7 @@ class Sandbox:
         self.status = "destroyed"  # refuses any operation that starts from here on
         self._remove_container()
         self.manager._forget(self)
+        self.snapshot.remove()
 
     def reset(self) -> SandboxInfo:
         """Back to the clean snapshot: destroy + recreate the container (revives a dead one too)."""
@@ -445,11 +514,15 @@ class Sandbox:
         self,
         cmd: list[str],
         *,
-        stdin: bytes | None = None,
+        stdin: bytes | IO[bytes] | None = None,
         timeout_s: float,
         cap_bytes: int,
     ) -> _ExecOutcome:
-        """Run ``cmd`` inside the jail as the sandbox user with a hard deadline and output cap."""
+        """Run ``cmd`` inside the jail as the sandbox user with a hard deadline and output cap.
+
+        ``stdin`` may be a byte string or an open binary file; a file is streamed in
+        :data:`~ono.executor.archive.SPOOL_CHUNK_BYTES` pieces, never loaded whole.
+        """
         cid = self._require_running()
         api = self.manager.client.api
         deadline = time.monotonic() + timeout_s + _EXEC_GRACE_S
@@ -476,8 +549,7 @@ class Sandbox:
         truncated = timed_out = False
         try:
             if stdin is not None:
-                raw.settimeout(max(0.1, deadline - time.monotonic()))
-                raw.sendall(stdin)
+                _send_stdin(raw, stdin, deadline)
                 raw.shutdown(socket.SHUT_WR)
             for stream_type, payload in _iter_frames(raw, deadline):
                 buf = stdout if stream_type == 1 else stderr
@@ -647,12 +719,7 @@ class Sandbox:
     def grep(
         self, pattern: str, path: str = ".", *, ignore_case: bool = False, max_matches: int = 200
     ) -> GrepResult:
-        if not pattern or len(pattern) > 512 or "\x00" in pattern:
-            raise SandboxPathError("pattern must be 1-512 characters without NUL")
-        try:
-            re.compile(pattern)
-        except re.error as exc:
-            raise SandboxPathError(f"invalid regular expression: {exc}") from exc
+        check_grep_pattern(pattern)
         rel = validate_rel_path(path, allow_root=True)
         with self._lock:
             result = self._guest(
@@ -769,6 +836,44 @@ def _last_line(text: str) -> str:
     return ""
 
 
+def _send_stdin(raw: Any, stdin: bytes | IO[bytes], deadline: float) -> None:
+    """Feed ``stdin`` to the exec socket; files go chunk by chunk under the deadline."""
+    if isinstance(stdin, bytes):
+        raw.settimeout(max(0.1, deadline - time.monotonic()))
+        raw.sendall(stdin)
+        return
+    while True:
+        chunk = stdin.read(SPOOL_CHUNK_BYTES)
+        if not chunk:
+            return
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise TimeoutError("exec stdin deadline exceeded")
+        raw.settimeout(left)
+        raw.sendall(chunk)
+
+
+MAX_GREP_PATTERN_CHARS = 512
+
+
+def check_grep_pattern(pattern: str) -> None:
+    """Trusted-side check of a user regex: shape and *syntax* only, never a match.
+
+    This is the one place the Executor process touches the pattern. ``re.compile`` is
+    a parse (linear in the pattern, bounded by the 512-character cap) and gives the
+    caller a fast 422 for a malformed expression; the compiled object is discarded.
+    The pattern is only ever *executed* inside the jail (``_guest.op_grep``), where a
+    catastrophic-backtracking regex can burn nothing but that sandbox's own budget:
+    the guest timeout, its CPU quota and its serialised operation lock (issue #99).
+    """
+    if not pattern or len(pattern) > MAX_GREP_PATTERN_CHARS or "\x00" in pattern:
+        raise SandboxPathError(f"pattern must be 1-{MAX_GREP_PATTERN_CHARS} characters without NUL")
+    try:
+        re.compile(pattern)
+    except (re.error, OverflowError, RecursionError) as exc:
+        raise SandboxPathError(f"invalid regular expression: {exc}") from exc
+
+
 def _close_exec_socket(sock: Any, raw: Any) -> None:
     """Release a hijacked exec connection cleanly.
 
@@ -824,6 +929,31 @@ class SandboxManager:
         self._pulled: set[str] = set()
         self._sweeper: threading.Thread | None = None
         self._stop = threading.Event()
+        self._snapshot_dir: Path | None = None
+        self._owns_snapshot_dir = False
+
+    # -- snapshots ----------------------------------------------------------------
+    @property
+    def snapshot_dir(self) -> Path:
+        """Directory holding the on-disk snapshots (created on first use, mode 0700).
+
+        Uploads are spooled straight into it so a validated upload becomes a snapshot
+        by rename - the archive bytes are never held in memory and never copied.
+        """
+        with self._lock:
+            if self._snapshot_dir is None:
+                if self.config.snapshot_dir is not None:
+                    self._snapshot_dir = self.config.snapshot_dir
+                    self._snapshot_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+                else:
+                    self._snapshot_dir = Path(tempfile.mkdtemp(prefix="ono-snapshots-"))
+                    self._owns_snapshot_dir = True
+            return self._snapshot_dir
+
+    def snapshot_bytes(self) -> int:
+        """Compressed bytes retained on disk for the live sandboxes (bounded by
+        ``max_active * max_archive_bytes``; none of it is resident in this process)."""
+        return sum(s.snapshot.size_bytes for s in self.active())
 
     # -- docker client ----------------------------------------------------------
     @property
@@ -879,34 +1009,55 @@ class SandboxManager:
             raise SandboxPathError(str(exc)) from exc
         return self.create_from_archive(scan_id, archive)
 
-    def create_from_archive(self, scan_id: str, archive: bytes) -> Sandbox:
-        """Start a jail from a gzipped tar of the workspace (validated first)."""
+    def create_from_archive(self, scan_id: str, archive: bytes | Path) -> Sandbox:
+        """Start a jail from a gzipped tar of the workspace (validated first).
+
+        ``archive`` is either the bytes (small, test/CLI convenience: they are written
+        to the snapshot directory first) or - the service path - a file the caller
+        has already spooled there. **The manager takes ownership of that file**: it is
+        renamed to the sandbox's snapshot on success and deleted on any failure.
+        """
         if not _SCAN_ID_RE.match(scan_id):
             raise SandboxPathError("scan_id must match " + SCAN_ID_PATTERN)
-        if len(archive) > self.config.max_archive_bytes:
-            raise SandboxPathError(f"archive is larger than {self.config.max_archive_bytes} bytes")
+        sandbox_id = f"sbx_{uuid.uuid4().hex[:12]}"
+        path = self.snapshot_dir / f"{sandbox_id}.tar.gz"
         try:
-            validate_archive(archive, max_bytes=self.config.max_archive_bytes)
+            if isinstance(archive, bytes):
+                if len(archive) > self.config.max_archive_bytes:
+                    raise ArchiveError(
+                        f"archive is larger than {self.config.max_archive_bytes} bytes"
+                    )
+                path.write_bytes(archive)
+            else:
+                shutil.move(archive, path)  # a rename when spooled into snapshot_dir
+            # Validation is the only way to obtain a Snapshot: nothing below extracts
+            # anything that did not pass it (issue #97).
+            snapshot = Snapshot.validate(path, max_bytes=self.config.max_archive_bytes)
         except ArchiveError as exc:
+            _unlink_quietly(path)
             raise SandboxPathError(str(exc)) from exc
+        except OSError as exc:
+            _unlink_quietly(path)
+            raise SandboxError(f"cannot store workspace snapshot: {exc}") from exc
 
         sandbox = Sandbox(
             manager=self,
-            sandbox_id=f"sbx_{uuid.uuid4().hex[:12]}",
+            sandbox_id=sandbox_id,
             scan_id=scan_id,
-            snapshot=archive,
+            snapshot=snapshot,
             created_at=datetime.now(tz=UTC),
         )
-        with self._lock:  # register first so concurrent creates count against the limit
-            if len(self._sandboxes) >= self.config.max_active:
-                raise SandboxLimitError(
-                    f"too many live sandboxes ({self.config.max_active}); destroy one first"
-                )
-            self._sandboxes[sandbox.sandbox_id] = sandbox
         try:
+            with self._lock:  # register first so concurrent creates count against the limit
+                if len(self._sandboxes) >= self.config.max_active:
+                    raise SandboxLimitError(
+                        f"too many live sandboxes ({self.config.max_active}); destroy one first"
+                    )
+                self._sandboxes[sandbox.sandbox_id] = sandbox
             sandbox._start_container()
         except BaseException:
             self._forget(sandbox)
+            snapshot.remove()
             raise
         return sandbox
 
@@ -1000,6 +1151,16 @@ class SandboxManager:
             self._sweeper.join(timeout=5)
             self._sweeper = None
         self.destroy_all()
+        with self._lock:
+            snapshot_dir, owned = self._snapshot_dir, self._owns_snapshot_dir
+            self._snapshot_dir, self._owns_snapshot_dir = None, False
+        if snapshot_dir is not None and owned:
+            shutil.rmtree(snapshot_dir, ignore_errors=True)
+
+
+def _unlink_quietly(path: Path) -> None:
+    with contextlib.suppress(OSError):
+        path.unlink()
 
 
 def _container_created_epoch(container: Any) -> float | None:

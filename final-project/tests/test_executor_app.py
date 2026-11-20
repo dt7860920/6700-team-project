@@ -6,9 +6,13 @@ exception mapping all live here. Real containers: ``test_executor_docker.py``.
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import gzip
-from collections.abc import Iterator
+import io
+import random
+import tarfile
+from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 
 import httpx
@@ -100,7 +104,7 @@ def test_token_is_secret_in_settings() -> None:
 def test_health_needs_no_auth(api: TestClient) -> None:
     r = api.get("/health")
     assert r.status_code == 200
-    assert r.json() == {"status": "ok", "docker": True, "active_sandboxes": 0}
+    assert r.json() == {"status": "ok", "docker": True, "active_sandboxes": 0, "snapshot_bytes": 0}
 
 
 @pytest.mark.parametrize(
@@ -169,6 +173,134 @@ def test_create_bounds_the_upload(api: TestClient) -> None:
     r = api.post("/sandboxes", params={"scan_id": "scn_x"}, content=bomb, headers=AUTH)
     assert r.status_code == 201  # fixture repo is tiny; sanity
     api.delete(f"/sandboxes/{r.json()['sandbox_id']}", headers=AUTH)
+
+
+def test_rejected_or_failed_uploads_leave_no_spool_file(
+    api: TestClient, archive: bytes, fake: FakeDocker, manager: SandboxManager
+) -> None:
+    too_big = gzip.compress(b"\0" * 1_100_000, compresslevel=0)
+    api.post("/sandboxes", params={"scan_id": "scn_x"}, content=too_big, headers=AUTH)
+    api.post("/sandboxes", params={"scan_id": "scn_x"}, content=b"not a tar", headers=AUTH)
+    fake.tar_fails = True
+    r = api.post("/sandboxes", params={"scan_id": "scn_x"}, content=archive, headers=AUTH)
+    assert r.status_code == 500
+    assert list(manager.snapshot_dir.iterdir()) == [], "every failure path must unlink its file"
+    fake.tar_fails = False
+    sid = create(api, archive)
+    assert [p.name for p in manager.snapshot_dir.iterdir()] == [f"{sid}.tar.gz"]
+    assert api.get("/health").json()["snapshot_bytes"] == len(archive)
+    api.delete(f"/sandboxes/{sid}", headers=AUTH)
+    assert list(manager.snapshot_dir.iterdir()) == []
+
+
+async def test_upload_is_streamed_to_disk_not_held_in_memory(fake: FakeDocker) -> None:
+    """Issue #96: a 6 MB upload must not cost the Executor 6 MB (let alone 2x) of RAM.
+
+    The body is generated chunk by chunk through a real ASGI transport, the fake's own
+    stdin spool is a temp file, and tracemalloc measures the *peak* allocated during
+    the request: with the old ``b"".join(chunks)`` buffering this sat at >= 12 MB.
+    """
+    import gc
+    import tracemalloc
+
+    settings = Settings(_env_file=None, executor_token=SecretStr(TOKEN), max_clone_mb=16)
+    manager = SandboxManager(JailConfig.from_settings(settings), fake)
+    app = create_executor_app(settings, manager)
+    body = _incompressible_archive(6_000_000)  # random payload: gzip ~= 6 MB
+    assert len(body) > 5_000_000
+
+    async def chunks() -> AsyncIterator[bytes]:
+        for i in range(0, len(body), 64 * 1024):
+            yield body[i : i + 64 * 1024]
+
+    gc.collect()
+    transport = httpx.ASGITransport(app=app)  # type: ignore[arg-type]
+    async with httpx.AsyncClient(transport=transport, base_url="http://executor") as client:
+        tracemalloc.start()
+        try:
+            r = await client.post(
+                "/sandboxes",
+                params={"scan_id": "scn_stream"},
+                content=chunks(),
+                headers={**AUTH, "Content-Type": "application/gzip"},
+            )
+            _current, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+    assert r.status_code == 201, r.text
+    sandbox = manager.active()[0]
+    assert peak < 1_500_000, f"peak {peak} bytes for a {len(body)}-byte upload"
+    assert sandbox.snapshot.size_bytes == len(body) and sandbox.snapshot.path.is_file()
+    assert fake.exec_log[0].cmd[0] == "tar" and fake.exec_log[0].stdin_bytes == len(body)
+    manager.close()
+    assert not sandbox.snapshot.path.exists()
+
+
+def test_json_routes_have_an_explicit_body_cap(archive: bytes, fake: FakeDocker) -> None:
+    """Issue #98: /run, /apply_patch, ... are byte-capped before pydantic ever parses them."""
+    settings = Settings(
+        _env_file=None, executor_token=SecretStr(TOKEN), max_clone_mb=3, executor_max_body_mb=2
+    )
+    cap = settings.executor_max_body_mb * 1_000_000
+    manager = SandboxManager(JailConfig.from_settings(settings), fake)
+    api = TestClient(create_executor_app(settings, manager))
+    sid = create(api, archive)
+    huge = b'{"cmd": "' + b"x" * (3 * cap) + b'"}'
+    # 1. a declared Content-Length above the cap is refused without reading the body
+    r = api.post(f"/sandboxes/{sid}/run", content=huge, headers={**AUTH, **_JSON})
+    assert r.status_code == 413 and "larger than" in r.json()["detail"]
+    # 2. a chunked body (no Content-Length) is cut off as soon as it crosses the cap.
+    #    (Starlette's TestClient pre-reads iterator bodies, so this goes through a real
+    #    streaming ASGI transport that delivers one http.request message per chunk.)
+    chunk_count = 0
+
+    async def chunked() -> AsyncIterator[bytes]:
+        nonlocal chunk_count
+        for i in range(0, len(huge), 1 << 20):
+            chunk_count += 1
+            yield huge[i : i + (1 << 20)]
+
+    async def post_chunked() -> httpx.Response:
+        transport = httpx.ASGITransport(app=api.app)  # type: ignore[arg-type]
+        async with httpx.AsyncClient(transport=transport, base_url="http://executor") as c:
+            return await c.post(
+                f"/sandboxes/{sid}/apply_patch", content=chunked(), headers={**AUTH, **_JSON}
+            )
+
+    r = asyncio.run(post_chunked())
+    assert r.status_code == 413 and "larger than" in r.json()["detail"]
+    assert chunk_count <= cap // (1 << 20) + 2, "the cap must stop the read, not the parser"
+    # 3. the cap applies to every non-upload route, authenticated or not
+    r = api.post("/sandboxes/sbx_nope/tree", content=huge, headers=_JSON)
+    assert r.status_code == 413
+    # 4. legitimate bodies up to pydantic's own limits still go through
+    diff = "--- a/nope\n+++ b/nope\n@@ -1 +1 @@\n-a\n+" + "b" * 1_900_000 + "\n"
+    r = api.post(f"/sandboxes/{sid}/apply_patch", json={"diff": diff}, headers=AUTH)
+    assert r.status_code == 200 and r.json()["applied"] is False
+    # 5. the archive upload is exempt - it keeps its own streaming cap (max_clone_mb = 3 MB)
+    big_archive = _incompressible_archive(2_500_000)  # > the 2 MB body cap, < max_clone_mb
+    r = api.post("/sandboxes", params={"scan_id": "scn_y"}, content=big_archive, headers=AUTH)
+    assert r.status_code == 201, r.text
+    r = api.post(
+        "/sandboxes", params={"scan_id": "scn_z"}, content=_incompressible_archive(3_500_000)
+    )
+    assert r.status_code in (401, 413)  # its own cap (or auth) - never the JSON body cap
+    for s in api.get("/sandboxes", headers=AUTH).json():
+        api.delete(f"/sandboxes/{s['sandbox_id']}", headers=AUTH)
+    manager.close()
+
+
+def _incompressible_archive(size: int) -> bytes:
+    payload = random.Random(size).randbytes(size)
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz", compresslevel=1) as tar:
+        info = tarfile.TarInfo("blob.bin")
+        info.size = len(payload)
+        tar.addfile(info, io.BytesIO(payload))
+    return buf.getvalue()
+
+
+_JSON = {"Content-Type": "application/json"}
 
 
 def test_full_operation_flow(api: TestClient, archive: bytes, fake: FakeDocker) -> None:
