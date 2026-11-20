@@ -24,6 +24,7 @@ from ono.config import Settings
 from ono.errors import PipelineError
 from ono.executor.client import ExecutorClient
 from ono.models import ScanOptions, ScanRequest
+from ono.progress import RecordingProgress
 from ono.service import ScanService
 from ono.store import InMemoryScanStore
 from ono.targets import Target, TargetRegistry, get_registry
@@ -432,3 +433,34 @@ def test_stages_outside_run_fail_loudly(repo: Target, workspace: Path) -> None:
     analyzer = _analyzer(_settings(workspace), ScriptedModel())
     with pytest.raises(RuntimeError, match="must run via run"):
         analyzer.sast_shortlist(repo, ScanOptions())
+
+
+def test_degraded_sast_fallback_on_non_python_target_is_reported(
+    tmp_path: Path, workspace: Path
+) -> None:
+    """Issue #101: Semgrep down + a JS target must not read as a clean scan."""
+    source = tmp_path / "js-src"
+    source.mkdir()
+    # Inert JS: no entry point/sink, so the threat-map adds no candidate and this
+    # test isolates the #101 degraded-SAST signal (Semgrep down, JS not covered by
+    # the Python-only regex fallback) rather than the #90 threat-mapping path.
+    (source / "util.js").write_text("const version = '1.0.0';\nmodule.exports = { version };\n")
+    js_repo = Target(
+        target_id="fixture-js",
+        name="js",
+        kind="repo",
+        languages=["javascript"],
+        source=str(source),
+        snapshot="fixture",
+    )
+    model = ScriptedModel()
+    analyzer = _analyzer(_settings(workspace), model)
+    progress = RecordingProgress()
+    result = analyzer.run("scn_js", js_repo, ScanOptions(), progress=progress)
+
+    assert result.findings == [] and result.candidate_count == 0
+    degraded = [m for m in progress.steps if m.startswith("Static analysis degraded: ")]
+    assert len(degraded) == 1
+    assert "javascript source was not analyzed" in degraded[0]
+    assert degraded[0].endswith("results are incomplete")
+    assert model.n_calls == 0  # nothing to analyze; the signal is what the scan carries
