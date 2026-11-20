@@ -1,0 +1,79 @@
+# OPTIONAL override: run the Executor WITHOUT the raw Docker socket (issue #92 / H1).
+#
+#   docker compose -f compose.yml -f compose.socket-proxy.yml up -d --build
+#   make compose-up-proxied                       # the same thing
+#
+# The default compose.yml is unchanged by this file: it only applies when you pass it
+# with a second -f. What it changes:
+#
+#   * a `docker-socket-proxy` service (HAProxy in front of /var/run/docker.sock, mounted
+#     read-only) that forwards ONLY the API families the Executor needs - containers,
+#     exec, images, start, and the POST/DELETE verbs on them - and answers 403 to
+#     everything else (volumes, networks, build, swarm, system, plugins, ...);
+#   * the Executor reaches the daemon over `DOCKER_HOST=tcp://docker-socket-proxy:2375`
+#     on a dedicated internal network, has NO socket mount (`volumes: !reset []`), and
+#     therefore no longer needs root: it runs as the image's `ono` user.
+#
+# This shrinks the blast radius of an Executor compromise from "root on the host" to
+# "whatever those API calls allow" (still: run arbitrary containers - the proxy is a
+# meaningful reduction, not a sandbox). The jails it spawns are unchanged.
+#
+# VALIDATE BEFORE RELYING ON IT. The allow-list below was checked against the whole
+# real-jail test-suite via the proxy (see docs/executor-hardening.md for the exact
+# commands) on Docker Desktop; re-run that check on your daemon/version, and watch the
+# Executor logs for 403s from the proxy on first use.
+
+services:
+  docker-socket-proxy:
+    image: tecnativa/docker-socket-proxy:0.3.0
+    container_name: ono-docker-socket-proxy
+    environment:
+      LOG_LEVEL: warning
+      # --- what the Executor needs (see src/ono/executor/sandbox.py) -----------------
+      CONTAINERS: "1"      # create / inspect / list / remove (DELETE) the jails
+      EXEC: "1"            # exec create / start (hijacked stream) / inspect
+      IMAGES: "1"          # inspect + pull the sandbox image
+      POST: "1"            # non-GET verbs on the allowed paths (create, exec, remove)
+      ALLOW_START: "1"     # POST /containers/{id}/start
+      # --- everything else stays at the proxy's default of 0 (denied) -----------------
+      ALLOW_STOP: "0"
+      ALLOW_RESTARTS: "0"
+      VOLUMES: "0"
+      NETWORKS: "0"
+      BUILD: "0"
+      COMMIT: "0"
+      SWARM: "0"
+      SYSTEM: "0"
+      INFO: "0"
+      PLUGINS: "0"
+      SECRETS: "0"
+      CONFIGS: "0"
+      EVENTS: "0"
+      PING: "1"            # GET /_ping  - the Executor's /health
+      VERSION: "1"         # GET /version - docker-py's API-version negotiation
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro   # the ONE place the socket appears now
+    networks:
+      - docker-api         # reachable only by the Executor; nothing published
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE   # haproxy binds :2375 and drops to its own user
+
+  executor:
+    environment:
+      DOCKER_HOST: tcp://docker-socket-proxy:2375
+    volumes: !reset []     # no raw socket mount any more
+    user: ono              # ... so the Executor need not be root inside its container
+    depends_on:
+      - docker-socket-proxy
+    networks:
+      - internal
+      - docker-api
+
+networks:
+  docker-api:
+    internal: true         # executor <-> proxy only; no route anywhere else
