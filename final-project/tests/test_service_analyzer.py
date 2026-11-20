@@ -441,7 +441,10 @@ def test_degraded_sast_fallback_on_non_python_target_is_reported(
     """Issue #101: Semgrep down + a JS target must not read as a clean scan."""
     source = tmp_path / "js-src"
     source.mkdir()
-    (source / "server.js").write_text("app.get('/', (req, res) => eval(req.query.q));\n")
+    # Inert JS: no entry point/sink, so the threat-map adds no candidate and this
+    # test isolates the #101 degraded-SAST signal (Semgrep down, JS not covered by
+    # the Python-only regex fallback) rather than the #90 threat-mapping path.
+    (source / "util.js").write_text("const version = '1.0.0';\nmodule.exports = { version };\n")
     js_repo = Target(
         target_id="fixture-js",
         name="js",
