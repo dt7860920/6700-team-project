@@ -363,6 +363,15 @@ class Settings(BaseSettings):
         "inside the Compose internal network.",
     )
     executor_port: int = Field(default=8081, ge=1, le=65535, description="Executor bind port.")
+    executor_max_body_mb: int = Field(
+        default=16,
+        ge=1,
+        le=256,
+        description=(
+            "Request-body cap (MB) on every Executor route except the archive upload, which "
+            "is bounded by max_clone_mb. Larger bodies get 413 before they are parsed."
+        ),
+    )
     sandbox_image: str = Field(
         default="python:3.13-slim",
         description="Image the jailed target containers start from (pulled if missing).",
@@ -405,6 +414,26 @@ class Settings(BaseSettings):
     )
     sandbox_max_active: int = Field(
         default=8, ge=1, le=64, description="Max concurrently live sandboxes on this Executor."
+    )
+    sandbox_snapshot_dir: Path | None = Field(
+        default=None,
+        description=(
+            "Directory where the Executor keeps each live sandbox's workspace archive (the "
+            "reset() snapshot) ON DISK instead of in memory. None = a private directory under "
+            "the system temp dir. Retained size is bounded by sandbox_max_active x max_clone_mb; "
+            "in Compose /tmp is a tmpfs, so point this at a volume for real disk backing."
+        ),
+    )
+    sandbox_seccomp_profile: str | None = Field(
+        default="hardened",
+        description=(
+            "Seccomp profile for the jailed containers: 'hardened' = the profile shipped with "
+            "ONO (Docker's default minus ptrace, personality, modify_ldt, Linux AIO, SysV IPC, "
+            "POSIX message queues and non-UNIX/INET socket families), 'docker-default' (or "
+            "empty) = add nothing and keep the daemon's built-in profile, anything else = path "
+            "to a custom profile JSON. Validate a custom profile with "
+            "`ONO_DOCKER_TESTS=1 pytest -m docker` before relying on it."
+        ),
     )
 
     @model_validator(mode="after")

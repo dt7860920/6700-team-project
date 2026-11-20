@@ -7,11 +7,16 @@ error mapping, teardown-on-failure, the sweeper, and the trusted-side validation
 
 from __future__ import annotations
 
+import hashlib
 import io
+import json
+import re
 import struct
 import tarfile
 import time
+import types
 from pathlib import Path
+from typing import Any
 
 import pytest
 import requests
@@ -19,12 +24,15 @@ import requests
 from fakedocker import FakeDocker, FakeRaw, api_error, frame
 from ono.config import Settings
 from ono.executor import archive
-from ono.executor.archive import ArchiveError, pack_workspace, validate_archive
+from ono.executor import sandbox as sandbox_module
+from ono.executor.archive import ArchiveError, Snapshot, pack_workspace, validate_archive
 from ono.executor.sandbox import (
     KEEPER_UID,
     LABEL_CREATED,
     LABEL_SANDBOX,
     LABEL_SCAN,
+    SECCOMP_DOCKER_DEFAULT,
+    SECCOMP_HARDENED,
     DockerUnavailableError,
     JailConfig,
     Sandbox,
@@ -37,7 +45,9 @@ from ono.executor.sandbox import (
     _container_created_epoch,
     _iter_frames,
     _recv_exact,
+    check_grep_pattern,
     jail_kwargs,
+    load_seccomp_profile,
     validate_rel_path,
 )
 
@@ -103,6 +113,8 @@ def test_jail_config_from_settings() -> None:
         sandbox_workspace_mb=64,
         sandbox_max_active=3,
         max_clone_mb=10,
+        sandbox_snapshot_dir=Path("/var/lib/ono/snapshots"),
+        sandbox_seccomp_profile="docker-default",
     )
     cfg = JailConfig.from_settings(s)
     assert cfg == JailConfig(
@@ -116,7 +128,160 @@ def test_jail_config_from_settings() -> None:
         workspace_mb=64,
         max_active=3,
         max_archive_bytes=10_000_000,
+        snapshot_dir=Path("/var/lib/ono/snapshots"),
+        seccomp_profile=None,
     )
+
+
+def test_jail_kwargs_add_the_seccomp_profile_when_configured() -> None:
+    """Issue #95: the profile JSON rides in security_opt; no-new-privileges always stays."""
+    plain = jail_kwargs(JailConfig(), scan_id="s", sandbox_id="x")
+    assert plain["security_opt"] == ["no-new-privileges:true"]
+    hardened = load_seccomp_profile(SECCOMP_HARDENED)
+    assert hardened is not None
+    kw = jail_kwargs(JailConfig(seccomp_profile=hardened), scan_id="s", sandbox_id="x")
+    assert kw["security_opt"][0] == "no-new-privileges:true"
+    assert kw["security_opt"][1] == f"seccomp={hardened}"
+    assert json.loads(kw["security_opt"][1].removeprefix("seccomp="))["defaultAction"]
+
+
+def test_load_seccomp_profile_resolution(tmp_path: Path) -> None:
+    for keep_default in (None, "", SECCOMP_DOCKER_DEFAULT):
+        assert load_seccomp_profile(keep_default) is None
+    custom = tmp_path / "custom.json"
+    custom.write_text('{"defaultAction": "SCMP_ACT_ERRNO", "syscalls": []}')
+    assert load_seccomp_profile(str(custom)) == '{"defaultAction":"SCMP_ACT_ERRNO","syscalls":[]}'
+    with pytest.raises(ValueError, match="cannot be read"):
+        load_seccomp_profile(str(tmp_path / "missing.json"))
+    custom.write_text("{not json")
+    with pytest.raises(ValueError, match="not valid JSON"):
+        load_seccomp_profile(str(custom))
+    custom.write_text('{"foo": 1}')
+    with pytest.raises(ValueError, match="not a seccomp profile"):
+        load_seccomp_profile(str(custom))
+    assert JailConfig.from_settings(
+        Settings(_env_file=None)
+    ).seccomp_profile == load_seccomp_profile(Settings(_env_file=None).sandbox_seccomp_profile)
+
+
+def test_hardened_seccomp_profile_shape() -> None:
+    """The shipped profile is Docker's default minus specific groups - never a free-for-all."""
+    text = load_seccomp_profile(SECCOMP_HARDENED)
+    assert text is not None
+    profile = json.loads(text)
+    assert profile["defaultAction"] == "SCMP_ACT_ERRNO" and profile["defaultErrnoRet"] == 1
+    assert {a["architecture"] for a in profile["archMap"]} >= {
+        "SCMP_ARCH_X86_64",
+        "SCMP_ARCH_AARCH64",
+    }
+    rules = profile["syscalls"]
+    # allowed without needing a capability (argument-filtered rules such as clone count)
+    allowed_unconditionally = {
+        name
+        for r in rules
+        if r["action"] == "SCMP_ACT_ALLOW" and not r.get("includes")
+        for name in r["names"]
+    }
+    # what python3 -I -S, tar -xz, sh, timeout and a test runner actually need
+    for needed in (
+        "execve",
+        "openat",
+        "read",
+        "write",
+        "close",
+        "mmap",
+        "mprotect",
+        "munmap",
+        "brk",
+        "futex",
+        "clone",
+        "fork",
+        "vfork",
+        "wait4",
+        "exit_group",
+        "rt_sigaction",
+        "pipe2",
+        "dup2",
+        "fcntl",
+        "getdents64",
+        "fstat",
+        "newfstatat",
+        "lseek",
+        "ioctl",
+        "kill",
+        "tgkill",
+        "getrandom",
+        "rseq",
+        "set_robust_list",
+        "prlimit64",
+        "utimensat",
+        "fchmod",
+        "fchown",
+        "mkdirat",
+        "unlinkat",
+        "renameat",
+        "symlinkat",
+        "readlinkat",
+        "socketpair",
+        "epoll_create1",
+        "poll",
+        "nanosleep",
+        "clock_gettime",
+        "sched_yield",
+        "membarrier",
+        "memfd_create",
+        "madvise",
+        "sysinfo",
+        "uname",
+        "setsid",
+        "setpgid",
+    ):
+        assert needed in allowed_unconditionally, needed
+    # what the jail does not need and no longer gets
+    for dropped in (
+        "ptrace",
+        "process_vm_readv",
+        "process_vm_writev",
+        "personality",
+        "modify_ldt",
+        "io_setup",
+        "io_submit",
+        "io_uring_setup",
+        "io_uring_enter",
+        "shmget",
+        "shmat",
+        "msgget",
+        "semget",
+        "mq_open",
+        "memfd_secret",
+        "name_to_handle_at",
+        "open_by_handle_at",
+        "fanotify_mark",
+        "vmsplice",
+        "remap_file_pages",
+        "socketcall",
+        "bpf",
+        "mount",
+        "umount2",
+        "unshare",
+        "setns",
+        "pivot_root",
+        "keyctl",
+        "add_key",
+        "kexec_load",
+        "reboot",
+        "init_module",
+        "perf_event_open",
+        "userfaultfd",
+    ):
+        assert dropped not in allowed_unconditionally, dropped
+    socket_rules = [r for r in rules if r["names"] == ["socket"]]
+    assert all(r.get("args") for r in socket_rules), "no unconditional socket() rule"
+    assert sorted(r["args"][0]["value"] for r in socket_rules) == [1, 2, 10]  # UNIX, INET, INET6
+    assert all(r["args"][0]["op"] == "SCMP_CMP_EQ" for r in socket_rules)
+    # Docker's own default: every capability-gated rule we did not touch is still there
+    caps_gated = {c for r in rules for c in r.get("includes", {}).get("caps", [])}
+    assert {"CAP_SYS_ADMIN", "CAP_SYS_PTRACE", "CAP_SYS_MODULE", "CAP_SYS_BOOT"} <= caps_gated
 
 
 # ---------------------------------------------------------------------------
@@ -215,6 +380,196 @@ def test_docker_unreachable_maps_to_unavailable(manager: SandboxManager, fake: F
     assert manager.active() == []
     fake.ping_ok = False
     assert manager.ping() is False
+
+
+# ---------------------------------------------------------------------------
+# Snapshots live on disk (issue #96)
+# ---------------------------------------------------------------------------
+
+
+def test_snapshot_is_kept_on_disk_and_removed_with_the_sandbox(
+    manager: SandboxManager, sandbox: Sandbox
+) -> None:
+    snap = sandbox.snapshot
+    assert isinstance(snap, Snapshot) and snap.path.parent == manager.snapshot_dir
+    assert snap.path.is_file() and snap.path.stat().st_size == snap.size_bytes > 0
+    assert snap.expanded_bytes > snap.size_bytes  # the fixture repo compresses
+    assert manager.snapshot_bytes() == snap.size_bytes
+    # nothing on the Sandbox object references the archive bytes
+    assert not any(isinstance(v, bytes | bytearray) for v in vars(sandbox).values())
+    sandbox.reset()  # streamed back in from the same file
+    assert sandbox.read_file("README.md").content and snap.path.is_file()
+    sandbox.destroy()
+    assert not snap.path.exists() and manager.snapshot_bytes() == 0
+
+
+def test_reset_without_its_snapshot_file_fails_cleanly(sandbox: Sandbox, fake: FakeDocker) -> None:
+    sandbox.snapshot.path.unlink()
+    with pytest.raises(SandboxError, match="snapshot is missing"):
+        sandbox.reset()
+    assert sandbox.status == "dead" and not fake.live  # no half-made jail left behind
+
+
+def test_manager_close_removes_its_own_snapshot_dir(fake: FakeDocker, tmp_path: Path) -> None:
+    owned = SandboxManager(JailConfig(), fake)
+    sbx = owned.create("scn_tmp", FIXTURE_REPO)
+    d = owned.snapshot_dir
+    assert d.is_dir() and (d / f"{sbx.sandbox_id}.tar.gz").is_file()
+    owned.close()
+    assert not d.exists()
+    # an operator-provided directory is used as-is and not deleted on close
+    given = SandboxManager(JailConfig(snapshot_dir=tmp_path / "snaps"), fake)
+    sbx = given.create("scn_given", FIXTURE_REPO)
+    assert sbx.snapshot.path.parent == tmp_path / "snaps"
+    given.close()
+    assert (tmp_path / "snaps").is_dir() and list((tmp_path / "snaps").iterdir()) == []
+
+
+def test_create_from_archive_takes_over_a_spooled_file(
+    manager: SandboxManager, fake: FakeDocker, tmp_path: Path
+) -> None:
+    good = manager.snapshot_dir / "upload-ok.tar.gz"
+    good.write_bytes(pack_workspace(FIXTURE_REPO, max_bytes=10**7))
+    sbx = manager.create_from_archive("scn_file", good)
+    assert not good.exists() and sbx.snapshot.path.name == f"{sbx.sandbox_id}.tar.gz"
+    bad = manager.snapshot_dir / "upload-bad.tar.gz"
+    bad.write_bytes(b"garbage")
+    with pytest.raises(SandboxPathError, match="not a valid gzipped tar"):
+        manager.create_from_archive("scn_bad", bad)
+    assert not bad.exists(), "a rejected upload is deleted, not left on disk"
+    sbx.destroy()
+    assert list(manager.snapshot_dir.iterdir()) == []
+
+
+# ---------------------------------------------------------------------------
+# Every extraction goes through validate_archive (issue #97)
+# ---------------------------------------------------------------------------
+
+
+def _tar_with(name: str, typ: bytes = tarfile.REGTYPE, linkname: str = "") -> bytes:
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        info = tarfile.TarInfo(name)
+        info.type = typ
+        info.size = 0
+        info.linkname = linkname
+        tar.addfile(info)
+    return buf.getvalue()
+
+
+CRAFTED = {
+    "zip-slip": _tar_with("../../etc/cron.d/pwn"),
+    "dotdot-mid": _tar_with("app/../../../etc/passwd"),
+    "absolute": _tar_with("/etc/passwd"),
+    "symlink": _tar_with("evil", tarfile.SYMTYPE, "/etc/passwd"),
+    "hardlink": _tar_with("evil", tarfile.LNKTYPE, "/etc/passwd"),
+    "device": _tar_with("sda", tarfile.BLKTYPE),
+    "backslash": _tar_with("..\\..\\x"),
+}
+
+
+def test_no_extraction_path_bypasses_validate_archive(
+    manager: SandboxManager, fake: FakeDocker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every byte that reaches in-jail ``tar`` must have passed validate_archive first.
+
+    Spy on the validator, drive all three ways an archive enters a jail (``create``,
+    ``create_from_archive``, ``reset``), and check that the digest of every tar exec's
+    stdin is one the validator saw and accepted - and that crafted archives never
+    reach ``containers.run`` at all.
+    """
+    accepted: set[str] = set()
+    real = archive.validate_archive
+
+    def spy(source: Any, **kw: Any) -> int:
+        result = real(source, **kw)  # raises for bad archives -> nothing is recorded
+        data = source.read_bytes() if isinstance(source, Path) else source
+        accepted.add(hashlib.sha256(data).hexdigest())
+        return result
+
+    monkeypatch.setattr(archive, "validate_archive", spy)
+    for name, crafted in CRAFTED.items():
+        with pytest.raises(SandboxPathError):
+            manager.create_from_archive("scn_crafted", crafted)
+        assert fake.run_calls == [] and fake.exec_log == [], name
+    assert list(manager.snapshot_dir.iterdir()) == []
+
+    a = manager.create("scn_dir", FIXTURE_REPO)
+    b = manager.create_from_archive("scn_bytes", pack_workspace(FIXTURE_REPO, max_bytes=10**7))
+    a.reset()
+    b.reset()
+    tar_execs = [e for e in fake.exec_log if e.cmd[0] == "tar"]
+    assert len(tar_execs) == 4 and accepted
+    for e in tar_execs:
+        assert e.stdin_sha256 in accepted, "tar received bytes validate_archive never accepted"
+        assert "-P" not in e.cmd and "--absolute-names" not in e.cmd
+        assert "--no-same-owner" in e.cmd and "--no-same-permissions" in e.cmd
+    # the type-level lock: a Sandbox only ever holds a Snapshot, which only validate() makes
+    assert isinstance(a.snapshot, Snapshot) and isinstance(b.snapshot, Snapshot)
+    assert Sandbox.__dataclass_fields__["snapshot"].type == "Snapshot"
+
+
+@pytest.mark.parametrize("name", list(CRAFTED))
+def test_snapshot_validate_rejects_crafted_archives(name: str, tmp_path: Path) -> None:
+    path = tmp_path / "x.tar.gz"
+    path.write_bytes(CRAFTED[name])
+    with pytest.raises(ArchiveError):
+        Snapshot.validate(path, max_bytes=10**6)
+    path.write_bytes(b"")
+    with pytest.raises(ArchiveError, match="empty"):
+        Snapshot.validate(path, max_bytes=10**6)
+    with pytest.raises(ArchiveError, match="cannot read"):
+        Snapshot.validate(tmp_path / "missing", max_bytes=10**6)
+
+
+# ---------------------------------------------------------------------------
+# The user regex is never executed on the host (issue #99)
+# ---------------------------------------------------------------------------
+
+REDOS_PATTERNS = [
+    r"(a+)+$",
+    r"(a|aa)+$",
+    r"(\w+\s*)+$",
+    r"^(([a-z])+.)+[A-Z]([a-z])+$",
+    r"(x+x+)+y",
+    "(" * 50 + "a" + ")" * 50 + "+",
+    r"(?:a{1,100}){1,100}b",
+    "a" * 512,
+    "[" + "a-z" * 100 + "]+",
+    "|".join(["abc"] * 100),
+]
+
+
+@pytest.mark.parametrize("pattern", REDOS_PATTERNS)
+def test_host_only_parses_the_pattern_and_fast(pattern: str) -> None:
+    t0 = time.perf_counter()
+    check_grep_pattern(pattern)  # compile = parse; bounded by the 512-char cap
+    assert time.perf_counter() - t0 < 0.5
+
+
+def test_host_never_matches_the_user_pattern(
+    sandbox: Sandbox, fake: FakeDocker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The compiled object the host builds for syntax checking must never be *used*."""
+
+    class Armed:
+        def __getattr__(self, name: str) -> Any:
+            raise AssertionError(f"host executed the user regex: .{name}()")
+
+    def compile_spy(pattern: str, flags: int = 0) -> Armed:
+        re.compile(pattern, flags)  # real syntax check
+        return Armed()
+
+    stub = types.SimpleNamespace(compile=compile_spy, error=re.error, sub=re.sub)
+    monkeypatch.setattr(sandbox_module, "re", stub)
+    hits = sandbox.grep(r"(\w+\s*)+os\.system")  # ReDoS-shaped, executed only in the jail
+    assert "app/views.py" in {m.file for m in hits.matches}
+    with pytest.raises(SandboxPathError, match="regular expression"):
+        sandbox.grep("(")
+    with pytest.raises(SandboxPathError):
+        sandbox.grep("x" * 513)
+    with pytest.raises(SandboxPathError):
+        sandbox.grep("a\x00b")
 
 
 # ---------------------------------------------------------------------------

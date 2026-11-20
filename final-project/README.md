@@ -223,6 +223,7 @@ All configuration is read by `ono.config.Settings` (pydantic-settings) from envi
 | `EXECUTOR_URL` | `http://127.0.0.1:8081` | Where the app reaches the Executor (`http://executor:8081` under Compose) |
 | `EXECUTOR_TOKEN` | — | `SecretStr`, ≥16 chars. **Required by the Executor** (it refuses to start without it) **and by `MODEL_BACKEND=service`** (the agents read code only through the sandbox); sent as `Authorization: Bearer` |
 | `EXECUTOR_HOST` / `EXECUTOR_PORT` | `127.0.0.1` / `8081` | Executor bind address. Loopback by default; `0.0.0.0` only inside the Compose internal network. Never published |
+| `EXECUTOR_MAX_BODY_MB` | `16` | 1–256. Byte cap on every Executor request body except the archive upload (which `MAX_CLONE_MB` bounds); larger bodies get 413 before parsing |
 | `SANDBOX_IMAGE` | `python:3.13-slim` | Base image of the jailed target containers (pulled if missing) |
 | `SANDBOX_MEM_MB` | `1024` | 64–65536. Memory limit per jail, swap disabled; the tmpfs workspace counts against it |
 | `SANDBOX_CPUS` | `1.0` | 0.1–64. CPU quota per jail |
@@ -232,6 +233,8 @@ All configuration is read by `ono.config.Settings` (pydantic-settings) from envi
 | `SANDBOX_OUTPUT_CAP_BYTES` | `1000000` | 1 KB–50 MB. Per-stream cap on captured stdout/stderr and on file reads |
 | `SANDBOX_WORKSPACE_MB` | `512` | 16–16384. Size of the writable tmpfs holding the workspace (`/tmp` gets half) |
 | `SANDBOX_MAX_ACTIVE` | `8` | 1–64. Max concurrently live jails per Executor |
+| `SANDBOX_SNAPSHOT_DIR` | — | Where the Executor keeps each live jail's workspace archive (the `reset()` snapshot) **on disk** instead of in memory; default = a private temp dir. Retained bytes ≤ `SANDBOX_MAX_ACTIVE × MAX_CLONE_MB`, reported as `snapshot_bytes` by the Executor's `/health` |
+| `SANDBOX_SECCOMP_PROFILE` | `hardened` | Seccomp profile for the jails: `hardened` = the shipped profile (Docker's default minus ptrace, personality, Linux AIO, SysV IPC, message queues, non-UNIX/INET socket families), `docker-default` = the daemon's built-in profile, or a path to a custom profile JSON |
 
 The ingest/SAST/agent settings apply to the `service` backend (`mock` never clones, runs Semgrep, calls a model or opens a sandbox). Semgrep runs on the host with a scrubbed environment (only `PATH`/`HOME`/locale/proxy/CA variables and `SEMGREP_*` pass through; metrics and version checks are off), but **`p/...` rulesets are downloaded from the Semgrep registry on first use** — for an air-gapped deployment set `SAST_RULESET` to local rule files. If Semgrep is unavailable or crashes, the built-in regex fallback covers **Python only**: on a JavaScript/Java/Go/Ruby/PHP target the scan reports `Static analysis degraded: … results are incomplete` in its activity log rather than presenting an empty shortlist as a clean result. The `EXECUTOR_URL` / `EXECUTOR_TOKEN` pair is how the app reaches the Executor service; the `SANDBOX_*` settings configure the jails the Executor spawns. Upper bound on model calls per scan: `MAX_CANDIDATES × (ANALYST_MAX_STEPS + 1 if PLANNER_ENABLED)` — 180 with the defaults — and the orchestrator enforces it as a hard counter.
 
