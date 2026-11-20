@@ -288,7 +288,11 @@ def test_clean_snippet_makes_no_model_call_and_opens_no_sandbox(
         "s", snippet, ScanOptions(snippet="print('hello')\n")
     )
     assert result.findings == [] and model.n_calls == 0 and executor.events == []
-    assert result.stages[2].summary.startswith("REPORT none")
+    assert result.candidate_count == 0
+    assert "no candidates" in result.summary
+    assert "model analysis and verification were skipped" in result.summary
+    assert [stage.status for stage in result.stages[2:]] == ["skipped"] * 3
+    assert all("no candidates from static analysis" in stage.summary for stage in result.stages[2:])
 
 
 # -- Failure modes: clear, never silent ------------------------------------------------

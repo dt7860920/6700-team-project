@@ -8,6 +8,18 @@
 # `MODEL_BACKEND=local`, talking to a vLLM process on the same box that is
 # never published outside the host. Only port 8080 is ever exposed.
 
+# ---- Frontend build: compile the React SPA to static assets ----------------
+# Vite writes to ../src/ono/webui/static (see frontend/vite.config.ts), so with
+# WORKDIR /app/frontend the output lands at /app/src/ono/webui/static, matching
+# the repo layout. The final image copies just that directory.
+FROM node:20-bookworm-slim AS frontend
+WORKDIR /app/frontend
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci
+COPY frontend/ ./
+RUN npm run build
+
+# ---- Application image ------------------------------------------------------
 FROM ghcr.io/astral-sh/uv:python3.13-bookworm-slim AS base
 
 ENV UV_COMPILE_BYTECODE=1 \
@@ -32,6 +44,8 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # 2. Then copy the source and install the project itself.
 COPY README.md ./
 COPY src/ ./src/
+# The built React SPA (served at /ui when ui_backend=spa) from the frontend stage.
+COPY --from=frontend /app/src/ono/webui/static ./src/ono/webui/static
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --locked --no-dev
 

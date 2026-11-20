@@ -29,3 +29,8 @@ flagged/
 .vscode/
 .idea/
 .DS_Store
+
+# Built React SPA (produced by `npm run build` in frontend/)
+src/ono/webui/static/
+frontend/node_modules/
+frontend/dist/

@@ -1,4 +1,7 @@
 .venv/
+frontend/node_modules/
+frontend/dist/
+src/ono/webui/static/
 .git/
 .github/
 .env

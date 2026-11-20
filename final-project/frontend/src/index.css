@@ -1,0 +1,44 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html {
+    color-scheme: light;
+  }
+  body {
+    @apply bg-paper text-body antialiased;
+    margin: 0;
+    font-family: "Hanken Grotesk", ui-sans-serif, system-ui, -apple-system, sans-serif;
+  }
+  h1,
+  h2,
+  h3 {
+    @apply font-serif text-ink;
+  }
+}
+
+@layer components {
+  /* Small meta label — sentence case, muted (not the old console eyebrow). */
+  .eyebrow {
+    @apply text-xs font-medium uppercase tracking-wide text-faint;
+  }
+  .badge {
+    @apply inline-flex items-center gap-1 rounded-full border border-border bg-card px-2.5 py-0.5 text-xs font-medium;
+  }
+  .card {
+    @apply rounded-2xl border border-border bg-card p-5 shadow-card;
+  }
+  .btn {
+    @apply inline-flex items-center justify-center gap-2 rounded-xl px-4 py-2 text-sm font-medium transition disabled:cursor-not-allowed disabled:opacity-50;
+  }
+  .btn-primary {
+    @apply btn bg-claydeep text-white hover:bg-clay;
+  }
+  .btn-soft {
+    @apply btn border border-border bg-sand text-body hover:bg-border/60;
+  }
+  .btn-ghost {
+    @apply btn border border-border bg-card text-muted hover:border-border2 hover:text-ink;
+  }
+}

@@ -10,9 +10,9 @@ from __future__ import annotations
 
 import hashlib
 from datetime import UTC, datetime
-from typing import Annotated, Literal
+from typing import Annotated, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 Severity = Literal["low", "medium", "high", "critical"]
 ScanStatus = Literal["queued", "running", "done", "failed"]
@@ -72,11 +72,12 @@ class ScanOptions(BaseModel):
 
 
 class ScanRequest(BaseModel):
-    """Body of ``POST /scans``. The target is named by id, never by URL."""
+    """Body of ``POST /scans`` for a configured target or checked public repo."""
 
     model_config = ConfigDict(extra="forbid")
 
-    target_id: str = Field(
+    target_id: str | None = Field(
+        default=None,
         min_length=1,
         max_length=64,
         pattern=r"^[a-z0-9][a-z0-9._-]*$",
@@ -85,7 +86,45 @@ class ScanRequest(BaseModel):
         ),
         examples=["pygoat"],
     )
+    repo_url: str | None = Field(
+        default=None,
+        max_length=2048,
+        description="HTTPS URL of a public github.com repository; private repos are not accepted.",
+    )
+    authorized_to_scan: bool = Field(
+        default=False,
+        description="User confirmation required when repo_url is supplied.",
+    )
     options: ScanOptions = Field(default_factory=ScanOptions)
+
+    @model_validator(mode="after")
+    def validate_source(self) -> Self:
+        if (self.target_id is None) == (self.repo_url is None):
+            raise ValueError("provide exactly one of target_id or repo_url")
+        if self.repo_url is not None:
+            if not self.authorized_to_scan:
+                raise ValueError("confirm that you are allowed to scan this public repository")
+            if self.options.snippet is not None:
+                raise ValueError("snippet code cannot be combined with a repository URL")
+        return self
+
+
+class SourceCheckRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    repo_url: str = Field(min_length=1, max_length=2048)
+
+
+class SourceCheckResponse(BaseModel):
+    repository: str
+    canonical_url: str
+    default_branch: str
+    size_mb: float
+    languages: list[str]
+    supported_languages: list[str]
+    unsupported_languages: list[str]
+    scan_ready: bool
+    message: str
 
 
 # ---------------------------------------------------------------------------
@@ -175,6 +214,9 @@ class Scan(BaseModel):
 
     scan_id: str = Field(examples=["scn_6f1d9c0a2b4e"])
     target_id: str
+    target_name: str | None = Field(
+        default=None, description="Display name for the selected source."
+    )
     status: ScanStatus
     model_backend: str
     created_at: datetime

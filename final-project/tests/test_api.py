@@ -10,10 +10,12 @@ import time
 from typing import Any
 
 import httpx
+import pytest
 from fastapi.testclient import TestClient
 
 from ono.api import create_app
 from ono.config import Settings
+from ono.webui import spa_built
 
 TERMINAL = {"done", "failed"}
 
@@ -178,8 +180,17 @@ def test_openapi_documents_the_endpoints(client: TestClient) -> None:
     assert client.get("/docs").status_code == 200
 
 
-def test_ui_mounted_and_root_redirects() -> None:
-    app = create_app(Settings(_env_file=None), mount_ui=True)
+def test_root_redirects_to_docs_without_ui() -> None:
+    app = create_app(Settings(_env_file=None), mount_ui=False)
+    with TestClient(app) as c:
+        root = c.get("/", follow_redirects=False)
+        assert root.status_code in (302, 307)
+        assert root.headers["location"] == "/docs"
+        assert c.get("/ui/").status_code == 404
+
+
+def test_gradio_ui_mounts() -> None:
+    app = create_app(Settings(_env_file=None, ui_backend="gradio"), mount_ui=True)
     with TestClient(app) as c:
         root = c.get("/", follow_redirects=False)
         assert root.status_code in (302, 307)
@@ -187,6 +198,18 @@ def test_ui_mounted_and_root_redirects() -> None:
         ui = c.get("/ui/")
         assert ui.status_code == 200
         assert "gradio" in ui.text.lower()
+
+
+@pytest.mark.skipif(not spa_built(), reason="SPA not built (run `npm run build` in frontend/)")
+def test_spa_ui_mounts() -> None:
+    app = create_app(Settings(_env_file=None, ui_backend="spa"), mount_ui=True)
+    with TestClient(app) as c:
+        root = c.get("/", follow_redirects=False)
+        assert root.status_code in (302, 307)
+        assert root.headers["location"] == "/ui"
+        ui = c.get("/ui/")
+        assert ui.status_code == 200
+        assert 'id="root"' in ui.text  # the React mount point
 
 
 async def test_async_client_health(app: object) -> None:

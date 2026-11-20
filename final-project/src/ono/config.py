@@ -33,6 +33,14 @@ ModelBackend = Literal["mock", "local", "service"]
 AgentToolProtocol = Literal["auto", "native", "text"]
 """How agent tools are presented to the model (see ``Settings.agent_tool_protocol``)."""
 
+UIBackend = Literal["spa", "gradio", "none"]
+"""Which analyst UI to mount at ``/ui``.
+
+* ``spa``    - the React single-page app built to ``ono/webui/static`` (default).
+* ``gradio`` - the legacy Gradio UI (kept while the SPA is being verified).
+* ``none``   - no UI; ``/`` redirects to ``/docs`` (useful for API-only deployments).
+"""
+
 
 class Settings(BaseSettings):
     """Runtime settings, loaded from the environment / ``.env``.
@@ -73,6 +81,18 @@ class Settings(BaseSettings):
         default=None,
         description="API key for the model endpoint. Never logged or returned by the API.",
     )
+    github_oauth_client_id: str | None = Field(
+        default=None,
+        description="GitHub OAuth App client id for connecting an account (read:user only).",
+    )
+    github_oauth_client_secret: SecretStr | None = Field(
+        default=None,
+        description="GitHub OAuth App secret; never logged or returned by the API.",
+    )
+    github_oauth_callback_url: str | None = Field(
+        default=None,
+        description="Exact OAuth callback URL registered with GitHub.",
+    )
 
     max_verifier_retries: int = Field(
         default=3,
@@ -97,6 +117,10 @@ class Settings(BaseSettings):
         ge=0,
         le=100,
         description="Scans that may wait for a worker before POST /scans answers 429 (busy).",
+    )
+    ui_backend: UIBackend = Field(
+        default="spa",
+        description="UI mounted at /ui: the React SPA, the legacy Gradio UI, or none.",
     )
     ui_poll_interval_s: float = Field(
         default=1.0,
