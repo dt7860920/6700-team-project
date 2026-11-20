@@ -129,7 +129,7 @@ def test_scan_through_the_mock_backend_populates_the_metrics(client: TestClient)
     assert value(table, "ono_findings_total", rung="5", severity="critical") >= 1.0
     assert {lbl["severity"] for _, lbl, _ in findings} <= {"low", "medium", "high", "critical"}
 
-    # The mock verifier drops nothing and never passes a finding through without a verdict.
+    # The mock's findings are all proven, so none counts as a failed or skipped verification.
     assert value(table, "ono_verifier_results_total", result="pass") >= 2.0
     assert value(table, "ono_verifier_results_total", result="fail") == 0.0
     assert value(table, "ono_verifier_results_total", result="skip") == 0.0

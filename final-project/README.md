@@ -10,7 +10,7 @@ Team: Sazan Khalid · Kenedy Ducheine · Junyi Tang · Jeffrey Pinarchick
 | Live app (Jetstream2) | [http://149.165.154.219:8080/ui/](http://149.165.154.219:8080/ui/), running the `service` backend with `qwen2.5-coder:7b` |
 | API docs (OpenAPI) | [http://149.165.154.219:8080/docs](http://149.165.154.219:8080/docs) |
 | Repository | [`dt7860920/6700-team-project`](https://github.com/dt7860920/6700-team-project), in `final-project/` |
-| Design docs | [Project plan](docs/plan.md) · [Deliverable 2 write-up](docs/deliverable2.md) · [Access control and TLS](docs/auth.md) |
+| Design docs | [Project plan](docs/plan.md) · [Deliverable 2 write-up](docs/deliverable2.md) · [Access control and TLS](docs/auth.md) · [Executor deployment hardening](docs/executor-hardening.md) |
 
 > **Status.** The API, configuration, container, and analyst UI are real and deployable. The default **analyzer is mocked** (`MODEL_BACKEND=mock`): it is shaped exactly like the production pipeline — `ingest → SAST shortlist → plan → analyze → verify` — but returns deterministic, representative findings instead of calling a model, so its `rung`, `verified`, and line-number values are illustrative. `MODEL_BACKEND=service` runs the real pipeline up to and including **detection** (Deliverable 3, step 3b-1): real ingest, Semgrep shortlist, and a planner + analyst agent loop that reads the target only through the jailed sandbox Executor. The verifier and fixer agent are not built yet, so real findings come back `verified=false` at rung 1 or 2 with no patch. `MODEL_BACKEND=local` is not implemented yet. See [Where the real pipeline slots in](#where-the-real-pipeline-slots-in).
 
@@ -222,7 +222,7 @@ All configuration is read by `ono.config.Settings` (pydantic-settings) from envi
 | `UI_POLL_INTERVAL_S` | `1.0` | 0.2–10. How often the UI refreshes a running scan's status card |
 | `UI_POLL_TIMEOUT_S` | `3600` | 30–86400. How long the UI keeps watching one scan (the scan itself continues; "Look up a scan by id" picks it up again) |
 | `WORKSPACE_DIR` | `.ono-workspace` | Per-scan clone workspaces (`<dir>/<scan_id>/`), removed when each scan ends. Must be writable; the image sets `/tmp/ono-workspace` |
-| `SAST_RULESET` | `p/owasp-top-ten` | Comma-separated Semgrep `--config` values (registry packs or local rule files). A language pack (`p/python`, `p/javascript`, …) is appended per target language. Empty = skip Semgrep, regex scanner only |
+| `SAST_RULESET` | `p/owasp-top-ten` | Comma-separated Semgrep `--config` values (registry packs or local rule files). A language pack (`p/python`, `p/javascript`, …) is appended per target language. **Registry names (`p/...`) are fetched from semgrep.dev at scan time** (then cached), so the SAST stage is not air-gapped by default; point this at a local rules file/directory for fully offline operation. Empty = skip Semgrep, regex scanner only (Python only) |
 | `MAX_CANDIDATES` | `20` | 1–200. Cap on SAST candidates kept per scan — and therefore on model calls |
 | `CONTEXT_LINES` | `25` | 5–200. Lines of code shown to the model on each side of a candidate sink |
 | `CLONE_TIMEOUT_S` | `120` | 5–1800. Hard timeout for the shallow `git clone` |
@@ -237,6 +237,7 @@ All configuration is read by `ono.config.Settings` (pydantic-settings) from envi
 | `EXECUTOR_URL` | `http://127.0.0.1:8081` | Where the app reaches the Executor (`http://executor:8081` under Compose) |
 | `EXECUTOR_TOKEN` | — | `SecretStr`, ≥16 chars. **Required by the Executor** (it refuses to start without it) **and by `MODEL_BACKEND=service`** (the agents read code only through the sandbox); sent as `Authorization: Bearer` |
 | `EXECUTOR_HOST` / `EXECUTOR_PORT` | `127.0.0.1` / `8081` | Executor bind address. Loopback by default; `0.0.0.0` only inside the Compose internal network. Never published |
+| `EXECUTOR_MAX_BODY_MB` | `16` | 1–256. Byte cap on every Executor request body except the archive upload (which `MAX_CLONE_MB` bounds); larger bodies get 413 before parsing |
 | `SANDBOX_IMAGE` | `python:3.13-slim` | Base image of the jailed target containers (pulled if missing) |
 | `SANDBOX_MEM_MB` | `1024` | 64–65536. Memory limit per jail, swap disabled; the tmpfs workspace counts against it |
 | `SANDBOX_CPUS` | `1.0` | 0.1–64. CPU quota per jail |
@@ -246,8 +247,10 @@ All configuration is read by `ono.config.Settings` (pydantic-settings) from envi
 | `SANDBOX_OUTPUT_CAP_BYTES` | `1000000` | 1 KB–50 MB. Per-stream cap on captured stdout/stderr and on file reads |
 | `SANDBOX_WORKSPACE_MB` | `512` | 16–16384. Size of the writable tmpfs holding the workspace (`/tmp` gets half) |
 | `SANDBOX_MAX_ACTIVE` | `8` | 1–64. Max concurrently live jails per Executor |
+| `SANDBOX_SNAPSHOT_DIR` | — | Where the Executor keeps each live jail's workspace archive (the `reset()` snapshot) **on disk** instead of in memory; default = a private temp dir. Retained bytes ≤ `SANDBOX_MAX_ACTIVE × MAX_CLONE_MB`, reported as `snapshot_bytes` by the Executor's `/health` |
+| `SANDBOX_SECCOMP_PROFILE` | `hardened` | Seccomp profile for the jails: `hardened` = the shipped profile (Docker's default minus ptrace, personality, Linux AIO, SysV IPC, message queues, non-UNIX/INET socket families), `docker-default` = the daemon's built-in profile, or a path to a custom profile JSON |
 
-The ingest/SAST/agent settings apply to the `service` backend (`mock` never clones, runs Semgrep, calls a model or opens a sandbox). The `EXECUTOR_URL` / `EXECUTOR_TOKEN` pair is how the app reaches the Executor service; the `SANDBOX_*` settings configure the jails the Executor spawns. Upper bound on model calls per scan: `MAX_CANDIDATES × (ANALYST_MAX_STEPS + 1 if PLANNER_ENABLED)` — 180 with the defaults — and the orchestrator enforces it as a hard counter.
+The ingest/SAST/agent settings apply to the `service` backend (`mock` never clones, runs Semgrep, calls a model or opens a sandbox). Semgrep runs on the host with a scrubbed environment (only `PATH`/`HOME`/locale/proxy/CA variables and `SEMGREP_*` pass through; metrics and version checks are off), but **`p/...` rulesets are downloaded from the Semgrep registry on first use** — for an air-gapped deployment set `SAST_RULESET` to local rule files. If Semgrep is unavailable or crashes, the built-in regex fallback covers **Python only**: on a JavaScript/Java/Go/Ruby/PHP target the scan reports `Static analysis degraded: … results are incomplete` in its activity log rather than presenting an empty shortlist as a clean result. The `EXECUTOR_URL` / `EXECUTOR_TOKEN` pair is how the app reaches the Executor service; the `SANDBOX_*` settings configure the jails the Executor spawns. Upper bound on model calls per scan: `MAX_CANDIDATES × (ANALYST_MAX_STEPS + 1 if PLANNER_ENABLED)` — 180 with the defaults — and the orchestrator enforces it as a hard counter.
 
 The **configured target allowlist** lives in [`src/ono/targets.yaml`](src/ono/targets.yaml) and is loaded into an exact mapping (`TargetRegistry`). User-selected repositories are a narrow exception: only HTTPS GitHub owner/repository URLs are accepted, GitHub must confirm they are public and within the size limit, and each scan gets a generated target id. Three cloneable examples ship: `pygoat`, `juice-shop`, and `vulpy`.
 
@@ -372,7 +375,7 @@ The `.pipeline` array shows each stage's status and timing; the `analyze` summar
 
 Rung 3/4 output ("the PoC reaches the sink", "the patch applies and the tests still pass") means **running untrusted target code**. That happens only inside the **Executor**: a separate, internal-only, token-authenticated FastAPI service (`ono.executor.app`, container C in `compose.yml`) that spins up **one ephemeral, jailed Docker container per scan**, runs operations against it over `docker exec`, and destroys it afterwards (on `DELETE`, on Executor shutdown, or when the TTL sweeper finds it).
 
-**Trust boundary.** The Executor is *privileged* — it mounts the host Docker socket, which is equivalent to root on the host — so it is kept tiny and audited, never published (Compose puts it on an `internal: true` network with no `ports:`), and runs nothing untrusted itself. The **target containers it spawns are the untrusted, jailed ones**:
+**Trust boundary.** The Executor is *privileged* — it mounts the host Docker socket, which is equivalent to root on the host — so it is kept tiny and audited, never published (Compose puts it on an `internal: true` network with no `ports:`), and runs nothing untrusted itself. Operators who want a smaller blast radius have an **optional** override that puts a read-limited docker-socket-proxy in front of the daemon and lets the Executor drop root (`make compose-up-proxied`), plus guidance on `userns-remap` and token rotation, in [`docs/executor-hardening.md`](docs/executor-hardening.md). The **target containers it spawns are the untrusted, jailed ones**:
 
 | Jail flag | Why |
 |---|---|

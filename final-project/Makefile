@@ -1,4 +1,4 @@
-.PHONY: install dev executor lint format typecheck test test-docker check smoke-ci smoke-live docker-build docker-run compose-up compose-down compose-up-tls compose-down-tls observability-up observability-down
+.PHONY: install dev executor lint format typecheck test test-docker check smoke-ci smoke-live docker-build docker-run compose-up compose-down compose-up-tls compose-down-tls compose-up-proxied compose-down-proxied observability-up observability-down
 
 install:          ## Install runtime + dev dependencies
 	uv sync --frozen
@@ -51,6 +51,12 @@ compose-up-tls:   ## Base stack + the Caddy TLS front door (needs ONO_DOMAIN in 
 
 compose-down-tls:
 	docker compose --profile tls down
+compose-up-proxied:   ## The stack with the Executor behind a read-limited docker-socket-proxy, no raw socket (see docs/executor-hardening.md)
+	docker compose -f compose.yml -f compose.socket-proxy.yml up -d --build
+
+compose-down-proxied:
+	docker compose -f compose.yml -f compose.socket-proxy.yml down
+
 observability-up:   ## The stack plus Prometheus + Grafana (loopback-only UIs; see observability/README.md)
 	docker compose --profile observability up -d --build
 

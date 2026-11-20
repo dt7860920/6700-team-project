@@ -26,6 +26,10 @@ from fastapi.testclient import TestClient
 from ono.api import create_app
 from ono.config import Settings
 
+# Fixtures under tests/fixtures are sample *target* repositories (the verifier runs their
+# own test suites inside the jail); they must never be collected as part of our own suite.
+collect_ignore_glob = ["fixtures/*"]
+
 # ---------------------------------------------------------------------------
 # Main app fixtures (unchanged)
 # ---------------------------------------------------------------------------
