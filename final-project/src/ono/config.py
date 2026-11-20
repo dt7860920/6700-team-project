@@ -98,7 +98,53 @@ class Settings(BaseSettings):
         default=3,
         ge=1,
         le=5,
-        description="Hard cap on the verifier-in-the-loop self-correction cycle (prevents thrash).",
+        description=(
+            "Hard cap on the verifier-in-the-loop self-correction cycle per finding: how many "
+            "times the prover / fixer may revise after the deterministic checks fail "
+            "(prevents thrash; 'give up -> unverified' is a first-class outcome)."
+        ),
+    )
+
+    # -- Graded verifier (Deliverable 3, step 3b-2) -----------------------------------
+    # The verifier opens its own jail after analysis, runs the prover's read-only PoC under
+    # the sink oracle (rung 3), then applies the fixer's patch and re-checks (rung 4). The
+    # agents only ever propose; every execution is done by deterministic code.
+    verifier_enabled: bool = Field(
+        default=True,
+        description=(
+            "Run the graded verifier on the service/local backends. False = findings stay "
+            "model-asserted (verified=False, rung <= 2) and no PoC or patch is attempted."
+        ),
+    )
+    prover_max_steps: int = Field(
+        default=4,
+        ge=1,
+        le=16,
+        description="Model calls the prover may spend per attempt (reads + the submission).",
+    )
+    fixer_max_steps: int = Field(
+        default=4,
+        ge=1,
+        le=16,
+        description="Model calls the fixer may spend per attempt (reads + the submission).",
+    )
+    verifier_poc_timeout_s: float = Field(
+        default=60.0,
+        ge=1.0,
+        le=3600.0,
+        description="Hard cap on one PoC run under the sink oracle inside the jail.",
+    )
+    verifier_tests_timeout_s: float = Field(
+        default=240.0,
+        ge=1.0,
+        le=3600.0,
+        description="Hard cap on the target's test suite run after a patch.",
+    )
+    verifier_finding_timeout_s: float = Field(
+        default=600.0,
+        ge=10.0,
+        le=7200.0,
+        description="Wall-clock budget for verifying one finding (all attempts together).",
     )
 
     # -- Scan workers + the polling UI -----------------------------------------------
