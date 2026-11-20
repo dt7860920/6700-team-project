@@ -200,7 +200,6 @@ class BaseAnalyzer(ABC):
             note(f"{len(verified)} passed the verifier")
 
         findings = [f for f in verified if f.rung >= options.min_rung][: options.max_findings]
-       
         passed = sum(1 for f in verified if f.verified)
         return AnalysisResult(
             findings=findings,
