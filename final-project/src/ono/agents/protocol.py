@@ -39,13 +39,22 @@ class ParseFailure:
     hint: str
 
 
-def render_action_format() -> str:
-    """The one-paragraph protocol reminder used in prompts and retry hints."""
+_ANALYST_TOOLS_HINT = (
+    "confirm(cwe,title,severity,file,line_start,line_end,trace,confidence,description), "
+    "dismiss(reason)"
+)
+
+
+def render_action_format(terminal: str = _ANALYST_TOOLS_HINT) -> str:
+    """The one-paragraph protocol reminder used in prompts and retry hints.
+
+    ``terminal`` names the role's final-answer tool(s); the read tools are the same for
+    every role.
+    """
     return (
         'Reply with exactly ONE JSON object and nothing else: {"tool": "<name>", "args": {...}}. '
         "Tools: read_lines(path,start,end), read_file(path), grep(pattern[,path]), tree([path]), "
-        "confirm(cwe,title,severity,file,line_start,line_end,trace,confidence,description), "
-        "dismiss(reason)."
+        f"{terminal}."
     )
 
 
@@ -193,7 +202,18 @@ def _action_from(data: dict[str, Any]) -> ToolCall | None:
     return None
 
 
-KNOWN_TOOLS = frozenset({"read_lines", "read_file", "grep", "tree", "confirm", "dismiss"})
+KNOWN_TOOLS = frozenset(
+    {
+        "read_lines",
+        "read_file",
+        "grep",
+        "tree",
+        "confirm",
+        "dismiss",
+        "submit_poc",
+        "submit_patch",
+    }
+)
 
 
 def _looks_like_verdict(data: dict[str, Any]) -> bool:
@@ -217,6 +237,11 @@ _ALIASES = {
     "final": "confirm",
     "reject": "dismiss",
     "safe": "dismiss",
+    "poc": "submit_poc",
+    "submit": "submit_poc",
+    "patch": "submit_patch",
+    "submit_diff": "submit_patch",
+    "diff": "submit_patch",
 }
 
 

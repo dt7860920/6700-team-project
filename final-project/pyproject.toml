@@ -21,6 +21,7 @@ dependencies = [
   "fastapi>=0.115",
   "gradio>=5.0",
   "httpx>=0.27",
+  "prometheus-client>=0.26.0",
   "pydantic>=2.9",
   "pydantic-settings>=2.6",
   "pyyaml>=6.0",
@@ -84,6 +85,9 @@ select = [
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["S101"]
 "scripts/*" = ["T20"]  # smoke scripts are allowed to print
+# The in-jail oracle (like executor/_guest.py) is stdlib-os only on purpose: it is shipped
+# into the sandbox and must stay importable on the image's (possibly older) interpreter.
+"src/ono/verifier/_oracle.py" = ["PTH"]
 
 [tool.mypy]
 python_version = "3.13"

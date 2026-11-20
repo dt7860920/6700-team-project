@@ -124,7 +124,12 @@ class PatchResult(BaseModel):
 class RunRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    cmd: str = Field(min_length=1, max_length=20_000, description="Run with ``sh -c`` in the jail.")
+    # Large enough for the verifier to stage its base64-encoded sink oracle (~25 KB) in one
+    # command; still far below the container shell's ARG_MAX. Only the token-authenticated
+    # verifier calls /run - the analyst's tools are read-only.
+    cmd: str = Field(
+        min_length=1, max_length=300_000, description="Run with ``sh -c`` in the jail."
+    )
     timeout_s: float | None = Field(
         default=None,
         gt=0,

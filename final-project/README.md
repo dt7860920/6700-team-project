@@ -10,7 +10,7 @@ Team: Sazan Khalid · Kenedy Ducheine · Junyi Tang · Jeffrey Pinarchick
 | Live app (Jetstream2) | [http://149.165.154.219:8080/ui/](http://149.165.154.219:8080/ui/), running the `service` backend with `qwen2.5-coder:7b` |
 | API docs (OpenAPI) | [http://149.165.154.219:8080/docs](http://149.165.154.219:8080/docs) |
 | Repository | [`dt7860920/6700-team-project`](https://github.com/dt7860920/6700-team-project), in `final-project/` |
-| Design docs | [Project plan](docs/plan.md) · [Deliverable 2 write-up](docs/deliverable2.md) |
+| Design docs | [Project plan](docs/plan.md) · [Deliverable 2 write-up](docs/deliverable2.md) · [Executor deployment hardening](docs/executor-hardening.md) |
 
 > **Status.** The API, configuration, container, and analyst UI are real and deployable. The default **analyzer is mocked** (`MODEL_BACKEND=mock`): it is shaped exactly like the production pipeline — `ingest → SAST shortlist → plan → analyze → verify` — but returns deterministic, representative findings instead of calling a model, so its `rung`, `verified`, and line-number values are illustrative. `MODEL_BACKEND=service` runs the real pipeline up to and including **detection** (Deliverable 3, step 3b-1): real ingest, Semgrep shortlist, and a planner + analyst agent loop that reads the target only through the jailed sandbox Executor. The verifier and fixer agent are not built yet, so real findings come back `verified=false` at rung 1 or 2 with no patch. `MODEL_BACKEND=local` is not implemented yet. See [Where the real pipeline slots in](#where-the-real-pipeline-slots-in).
 
@@ -114,6 +114,7 @@ Interactive documentation is generated from the code at **`/docs`** (Swagger UI)
 | `GET` | `/scans/{scan_id}/findings` | Findings for a scan (empty until it is `done`) |
 | `GET` | `/findings/{finding_id}` | One finding. `finding_id` is unique per scan; the `fingerprint` field is the same for the same sink across scans, so use it to compare scans |
 | `GET` | `/ui` | Gradio analyst UI (`/` redirects here) — see [The analyst UI](#the-analyst-ui-handoff-surface) |
+| `GET` | `/metrics` | Prometheus text exposition (scan counts/durations, findings by severity/rung/verdict, verifier results, worker-pool gauges, model latency/tokens). Internal: not in the OpenAPI schema, unauthenticated, 404 when `METRICS_ENABLED=false` — see [Observability](#observability-prometheus--grafana-opt-in) |
 
 ```bash
 BASE=http://localhost:8080
@@ -173,6 +174,19 @@ The UI works unchanged on both backends: `mock` finishes in milliseconds (good f
 
 ---
 
+## Observability: Prometheus + Grafana (opt-in)
+
+The app always exposes `GET /metrics` (unless `METRICS_ENABLED=false`): `ono_scans_total{target,status}`, `ono_scan_duration_seconds`, `ono_findings_total{severity,rung,verified}`, `ono_verifier_results_total{result}`, `ono_active_scans` / `ono_queued_scans`, and from the shared model client `ono_model_requests_total{outcome}`, `ono_model_latency_seconds`, `ono_model_tokens_total{kind}` — counts and timings only, never scan ids, paths, code or prompts. An optional Compose **profile** brings up Prometheus (scraping the app every 15 s over the internal network) and Grafana with a provisioned dashboard:
+
+```bash
+docker compose --profile observability up -d --build      # or: make observability-up
+open http://127.0.0.1:3000                                 # Grafana, admin / $GRAFANA_ADMIN_PASSWORD (default admin)
+```
+
+Both UIs bind to the host's **loopback only** — reach them in-box or over an SSH tunnel; port 8080 stays the only published port. Metric definitions, the dashboard's panels and the TTFT caveat are in [`observability/README.md`](observability/README.md).
+
+---
+
 ## Configuration
 
 All configuration is read by `ono.config.Settings` (pydantic-settings) from environment variables or a `.env` file. Three profiles ship: `.env.example.local`, `.env.example.production`, and `.env.example.service` (real model via Ollama, see below). Invalid values fail fast at startup.
@@ -190,6 +204,7 @@ All configuration is read by `ono.config.Settings` (pydantic-settings) from envi
 | `MAX_VERIFIER_RETRIES` | `3` | 1–5. Reserved cap for the verifier self-correction loop, which is not built yet (3b-2) |
 | `MAX_ACTIVE_SCANS` | `2` | 1–16. Scans that run at the same time (background worker threads). Each holds a model session and, on `service`, one sandbox |
 | `MAX_QUEUED_SCANS` | `8` | 0–100. Scans allowed to wait for a worker; beyond this `POST /scans` answers 429 (busy) |
+| `METRICS_ENABLED` | `true` | Expose Prometheus metrics at `GET /metrics` (unauthenticated, meant to be scraped in-box). `false` = no route (404) and nothing is collected |
 | `UI_POLL_INTERVAL_S` | `1.0` | 0.2–10. How often the UI refreshes a running scan's status card |
 | `UI_POLL_TIMEOUT_S` | `3600` | 30–86400. How long the UI keeps watching one scan (the scan itself continues; "Look up a scan by id" picks it up again) |
 | `WORKSPACE_DIR` | `.ono-workspace` | Per-scan clone workspaces (`<dir>/<scan_id>/`), removed when each scan ends. Must be writable; the image sets `/tmp/ono-workspace` |
@@ -250,6 +265,7 @@ final-project/
 │   ├── models.py       Pydantic schemas: ScanRequest, Finding, Scan, ScanResponse, ...
 │   ├── targets.py      TargetRegistry (exact allowlist) + targets.yaml
 │   ├── store.py        ScanStore protocol + in-memory implementation
+│   ├── metrics.py      Prometheus collectors (one registry per app) + the helpers that move them
 │   ├── config.py       Settings (pydantic-settings)
 │   ├── __main__.py     `ono` / `python -m ono` entrypoint (uvicorn)
 │   └── executor/       step 3a: the sandboxed "hands" (separate, internal-only service)
@@ -269,6 +285,7 @@ final-project/
 │   └── test_orchestrator_docker.py  REAL-jail end-to-end run of the detection core, model scripted (`-m docker`)
 ├── scripts/golden_path.py   smoke heartbeat (live server or --in-process)
 ├── docs/               project plan and Deliverable 2 write-up
+├── observability/      opt-in Prometheus scrape config + Grafana provisioning/dashboard (compose profile)
 ├── Dockerfile · compose.yml · .dockerignore
 ├── .env.example.local · .env.example.production · .env.example.service
 └── Makefile · .pre-commit-config.yaml
@@ -339,7 +356,7 @@ The `.pipeline` array shows each stage's status and timing; the `analyze` summar
 
 Rung 3/4 output ("the PoC reaches the sink", "the patch applies and the tests still pass") means **running untrusted target code**. That happens only inside the **Executor**: a separate, internal-only, token-authenticated FastAPI service (`ono.executor.app`, container C in `compose.yml`) that spins up **one ephemeral, jailed Docker container per scan**, runs operations against it over `docker exec`, and destroys it afterwards (on `DELETE`, on Executor shutdown, or when the TTL sweeper finds it).
 
-**Trust boundary.** The Executor is *privileged* — it mounts the host Docker socket, which is equivalent to root on the host — so it is kept tiny and audited, never published (Compose puts it on an `internal: true` network with no `ports:`), and runs nothing untrusted itself. The **target containers it spawns are the untrusted, jailed ones**:
+**Trust boundary.** The Executor is *privileged* — it mounts the host Docker socket, which is equivalent to root on the host — so it is kept tiny and audited, never published (Compose puts it on an `internal: true` network with no `ports:`), and runs nothing untrusted itself. Operators who want a smaller blast radius have an **optional** override that puts a read-limited docker-socket-proxy in front of the daemon and lets the Executor drop root (`make compose-up-proxied`), plus guidance on `userns-remap` and token rotation, in [`docs/executor-hardening.md`](docs/executor-hardening.md). The **target containers it spawns are the untrusted, jailed ones**:
 
 | Jail flag | Why |
 |---|---|

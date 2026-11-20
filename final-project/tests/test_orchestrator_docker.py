@@ -125,6 +125,7 @@ def test_service_analyzer_against_a_real_jail(live_executor: LiveServer, tmp_pat
         workspace_dir=tmp_path / "ws",
         context_lines=5,
         agent_trajectory_dir=tmp_path / "traj",
+        verifier_enabled=False,  # this test covers detection; the verifier has its own docker test
     )
     target = Target(
         target_id="fixture-repo",

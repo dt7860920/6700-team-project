@@ -1,4 +1,4 @@
-.PHONY: install dev executor lint format typecheck test test-docker check smoke-ci smoke-live docker-build docker-run compose-up compose-down
+.PHONY: install dev executor lint format typecheck test test-docker check smoke-ci smoke-live docker-build docker-run compose-up compose-down compose-up-proxied compose-down-proxied observability-up observability-down
 
 install:          ## Install runtime + dev dependencies
 	uv sync --frozen
@@ -45,3 +45,15 @@ compose-up:
 
 compose-down:
 	docker compose down
+
+compose-up-proxied:   ## The stack with the Executor behind a read-limited docker-socket-proxy, no raw socket (see docs/executor-hardening.md)
+	docker compose -f compose.yml -f compose.socket-proxy.yml up -d --build
+
+compose-down-proxied:
+	docker compose -f compose.yml -f compose.socket-proxy.yml down
+
+observability-up:   ## The stack plus Prometheus + Grafana (loopback-only UIs; see observability/README.md)
+	docker compose --profile observability up -d --build
+
+observability-down:
+	docker compose --profile observability down
