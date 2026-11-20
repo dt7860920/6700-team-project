@@ -44,6 +44,7 @@ from ono.agents.model import ChatModel, ModelClient, ModelError
 from ono.config import Settings
 from ono.errors import PipelineError
 from ono.executor.client import ExecutorClient
+from ono.learning import KnowledgeMemory
 from ono.metrics import Metrics
 from ono.models import (
     Finding,
@@ -56,9 +57,11 @@ from ono.models import (
     fingerprint_for,
 )
 from ono.orchestrator import DetectionOrchestrator, DetectionReport, ExecutorProvider
+from ono.planning import ThreatMap, threat_map
 from ono.progress import NullProgress, ProgressSink
 from ono.sast import PATTERN_RULES, Candidate, scan_text
 from ono.targets import Target
+from ono.verifier import GradedVerifier, VerifyReport
 
 __all__ = [
     "AnalysisResult",
@@ -80,9 +83,15 @@ log = logging.getLogger(__name__)
 
 @dataclass(slots=True)
 class Plan:
-    """The adaptive per-target scaffold the planner emits (Fugu-inspired, see plan §1.5)."""
+    """The adaptive per-target scaffold the planner emits (Fugu-inspired, see plan §1.5).
+
+    ``queue`` is the candidate order ``analyze`` walks when the plan stage re-ranked or
+    extended the SAST shortlist (the threat-mapping stage); empty means "the SAST order".
+    """
 
     steps: list[str]
+    queue: list[Candidate] = field(default_factory=list)
+    summary: str = ""
 
 
 @dataclass(slots=True)
@@ -92,7 +101,7 @@ class AnalysisResult:
     findings: list[Finding]
     stages: list[StageResult] = field(default_factory=list)
     # What the verify stage did with the raw findings (feeds ono_verifier_results_total):
-    # a verdict of true, dropped, or passed through without a verdict (see metrics.py).
+    # proven, a verifier check failed, or not attempted (see metrics.VerifierResult).
     verifier_passed: int = 0
     verifier_failed: int = 0
     verifier_skipped: int = 0
@@ -103,7 +112,7 @@ class AnalysisResult:
         n = len(self.findings)
         if self.candidate_count == 0:
             return (
-                "0 findings: static analysis found no candidates; "
+                "0 findings: static analysis and threat mapping found no candidates; "
                 "model analysis and verification were skipped"
             )
         return f"{n} verified finding{'s' if n != 1 else ''}"
@@ -176,38 +185,52 @@ class BaseAnalyzer(ABC):
             candidates = self.sast_shortlist(target, options)
             note(f"{len(candidates)} candidate(s)")
 
-        if not candidates:
-            reason = "no candidates from static analysis"
-            for stage in ("plan", "analyze", "verify"):
+        # The plan stage always runs: the threat map can add reachable sinks the pattern
+        # scanners missed, so an empty SAST shortlist is not yet "nothing to analyze".
+        with self._timed("plan", stages) as note:
+            self.report(f"Planning the investigation of {len(candidates)} candidate(s)")
+            plan = self.plan(target, candidates)
+            note(plan.summary or (" -> ".join(plan.steps) if plan.steps else "no steps"))
+        queue = plan.queue or candidates
+
+        if not queue:
+            reason = "no candidates from static analysis or threat mapping"
+            for stage in ("analyze", "verify"):
                 skipped = StageResult(stage=stage, status="skipped", duration_ms=0, summary=reason)
                 stages.append(skipped)
                 self._progress.stage(skipped)
             return AnalysisResult(findings=[], stages=stages, candidate_count=0)
 
-        with self._timed("plan", stages) as note:
-            self.report(f"Planning the investigation of {len(candidates)} candidate(s)")
-            plan = self.plan(target, candidates)
-            note(" -> ".join(plan.steps) if plan.steps else "no steps")
-
         with self._timed("analyze", stages) as note:
-            self.report(f"Analyzing {len(candidates)} candidate(s)")
-            raw = self.analyze(scan_id, target, candidates, plan)
+            self.report(f"Analyzing {len(queue)} candidate(s)")
+            raw = self.analyze(scan_id, target, queue, plan)
             note(f"{len(raw)} raw finding(s)")
 
         with self._timed("verify", stages) as note:
             self.report(f"Verifying {len(raw)} raw finding(s)")
             verified = self.verify(target, raw)
-            note(f"{len(verified)} passed the verifier")
+            proven = sum(1 for f in verified if f.verified)
+            note(f"{proven} of {len(raw)} proven; {len(verified)} kept")
 
         findings = [f for f in verified if f.rung >= options.min_rung][: options.max_findings]
-        passed = sum(1 for f in verified if f.verified)
+        # The graded verifier keeps every finding and records what stopped it, so the
+        # metric is read from each finding's verdict, not from how many were dropped:
+        # pass = proven; fail = a check failed; skip = the verifier could not attempt it.
+        n_passed = n_failed = n_skipped = 0
+        for f in verified:
+            if f.verified:
+                n_passed += 1
+            elif f.verification and any(c.status == "failed" for c in f.verification.checks):
+                n_failed += 1
+            else:
+                n_skipped += 1
         return AnalysisResult(
             findings=findings,
             stages=stages,
-            candidate_count=len(candidates),
-            verifier_passed=passed,
-            verifier_failed=max(0, len(raw) - len(verified)),
-            verifier_skipped=len(verified) - passed,
+            candidate_count=len(queue),
+            verifier_passed=n_passed,
+            verifier_failed=n_failed,
+            verifier_skipped=n_skipped,
         )
 
     @contextmanager
@@ -245,7 +268,7 @@ class BaseAnalyzer(ABC):
 
     @abstractmethod
     def plan(self, target: Target, candidates: list[Candidate]) -> Plan:
-        """Devise the per-target scaffold the analyst will execute."""
+        """Devise the per-target scaffold; may re-rank / extend the queue via ``Plan.queue``."""
 
     @abstractmethod
     def analyze(
@@ -673,8 +696,10 @@ def _indent_of(line: str) -> str:
 #               with an actionable message before anything is cloned
 #   ingest    - clone / copy / write the target into <workspace_dir>/<scan_id>/ (host)
 #   sast      - Semgrep (regex fallback) over that directory -> bounded Candidate queue
-#   plan      - deterministic: the queue the orchestrator will walk (the LLM planner
-#               runs per candidate inside ``analyze``)
+#   plan      - the threat-mapping stage (ono.planning): entry points + one-hop data flow
+#               over the workspace re-rank the SAST queue by reachability and union in
+#               reachable sinks the scanners missed; deterministic, no model call (the LLM
+#               planner still runs per candidate inside ``analyze``, now with the trace)
 #   analyze   - ``DetectionOrchestrator.detect``: ONE jailed sandbox for the scan, then
 #               per candidate planner -> analyst ReAct loop (read-only sandbox tools) ->
 #               anchored Finding or dismissal. All target-code reads go through the jail.
@@ -684,10 +709,14 @@ def _indent_of(line: str) -> str:
 
 
 class ServiceAnalyzer(BaseAnalyzer):
-    """Planner + analyst agents on a remote OpenAI-compatible endpoint, reading through the jail.
+    """Planner + analyst + graded verifier on a remote OpenAI-compatible endpoint.
 
-    Findings are model-asserted (``verified=False``) and capped at rung 2 (CWE plus an
-    evidence-anchored source->sink trace); nothing is executed or proven until 3b-2.
+    ``analyze`` produces model-asserted findings (rung 1-2, ``verified=False``) through the
+    read-only detection jail; ``verify`` then opens a fresh jail and tries to PROVE each one
+    (rung 3: a read-only PoC reaches the sink; rung 4: a patch applies, the PoC no longer
+    fires and the tests pass) via the bounded prover/fixer self-correction loop. Findings
+    that cannot be proven keep their analyst rung and ``verified=False`` with a
+    :class:`~ono.models.Verification` record; none is ever falsely marked verified.
     """
 
     backend = "service"
@@ -698,6 +727,7 @@ class ServiceAnalyzer(BaseAnalyzer):
         *,
         model: ChatModel | None = None,
         executor: ExecutorProvider | None = None,
+        memory: KnowledgeMemory | None = None,
         metrics: Metrics | None = None,
     ) -> None:
         super().__init__(settings)
@@ -724,7 +754,19 @@ class ServiceAnalyzer(BaseAnalyzer):
             )
         self.executor: ExecutorProvider = executor
         self.orchestrator = DetectionOrchestrator(settings, model=self.model, executor=executor)
+        # The learning loop's knowledge memory (None unless enabled). Persistent across scans.
+        self.memory = memory
+        if self.memory is None and settings.learning_enabled:
+            self.memory = KnowledgeMemory(settings.knowledge_path)
+        # The graded verifier reuses the same model and jail provider (the real ExecutorClient
+        # satisfies both the orchestrator's read-only Protocol and the verifier's mutating one).
+        self.verifier = GradedVerifier(
+            settings, model=self.model, executor=executor, memory=self.memory
+        )
+        self.verifier_active = settings.verifier_enabled
         self.last_report: DetectionReport | None = None
+        self.last_threat_map: ThreatMap | None = None
+        self.last_verify_report: VerifyReport | None = None
         # ``run`` executes all stages on one thread, so the workspace path can travel
         # from ``ingest`` to ``analyze`` in a thread-local without cross-scan leakage.
         self._local = threading.local()
@@ -739,6 +781,7 @@ class ServiceAnalyzer(BaseAnalyzer):
         progress: ProgressSink | None = None,
     ) -> AnalysisResult:
         self._local.workspace = ingest.workspace_path(self.settings.workspace_dir, scan_id)
+        self._local.scan_id = scan_id
         try:
             with self._bound_progress(progress):
                 # Fail fast: an unreachable Executor fails the scan *before* cloning
@@ -758,6 +801,7 @@ class ServiceAnalyzer(BaseAnalyzer):
             # The clone is a copy we never keep: remove it whether or not the run succeeded.
             ingest.cleanup_workspace(self._local.workspace)
             self._local.workspace = None
+            self._local.scan_id = None
 
     def _check_model(self) -> None:
         """Fail before cloning if the model endpoint is down (it used to fail mid-analysis)."""
@@ -808,13 +852,52 @@ class ServiceAnalyzer(BaseAnalyzer):
             len(result.candidates),
             target.target_id,
         )
+        if result.degraded:
+            # Issue #101: a fallback that cannot see the target's languages must not read as
+            # "clean" - say so where the UI shows it (the scan's live activity log) and in
+            # the server log, so an empty or short queue is understood as incomplete.
+            log.warning(
+                "service backend: static analysis degraded for %s - %s",
+                target.target_id,
+                result.degraded,
+            )
+            self.report(f"Static analysis degraded: {result.degraded}")
         return result.candidates
 
     # -- Stage 3 ------------------------------------------------------------
     def plan(self, target: Target, candidates: list[Candidate]) -> Plan:
-        # The target-level plan is the deterministic queue the orchestrator walks. The
-        # LLM *planner agent* runs per candidate inside ``analyze`` (its plan feeds the
-        # analyst directly), so this stage makes no model call.
+        """The threat-mapping stage: a deterministic per-target scaffold, no model call.
+
+        Entry points and one-hop data flow (:func:`ono.planning.threat_map`) re-rank the
+        SAST shortlist so sinks reachable from a real entry point are analyzed first, add
+        reachable sinks the scanners missed, and cap the result at ``max_candidates``. The
+        LLM *planner agent* still runs per candidate inside ``analyze`` - now seeded with the
+        source->sink trace found here.
+        """
+        self.last_threat_map = None
+        if not self.settings.threat_map_enabled:
+            return self._sast_order_plan(candidates)
+        self.report("Threat mapping: entry points, data flow and reachable sinks")
+        try:
+            result = threat_map(
+                self._workspace,
+                candidates,
+                max_candidates=self.settings.max_candidates,
+                deadline_s=self.settings.threat_map_timeout_s,
+            )
+        except Exception as exc:
+            # The threat map improves the queue; it must never cost the scan. Keep the
+            # SAST order and say so in the stage summary.
+            log.exception("service backend: threat map failed; keeping the SAST order")
+            plan = self._sast_order_plan(candidates)
+            plan.summary = f"threat map failed ({type(exc).__name__}: {exc}); SAST order kept"
+            return plan
+        self.last_threat_map = result
+        log.info("service backend: %s", result.summary())
+        return Plan(steps=result.steps(), queue=result.queue, summary=result.summary())
+
+    def _sast_order_plan(self, candidates: list[Candidate]) -> Plan:
+        """The pre-threat-map plan: walk the SAST shortlist in its own order."""
         if not candidates:
             return Plan(steps=["REPORT none (no SAST candidates)"])
         mode = "planner+analyst" if self.settings.planner_enabled else "analyst"
@@ -834,10 +917,33 @@ class ServiceAnalyzer(BaseAnalyzer):
 
     # -- Stage 5 ------------------------------------------------------------
     def verify(self, target: Target, findings: list[Finding]) -> list[Finding]:
-        # TODO(3b-2): the graded verifier (line/symbol exists, PoC reaches the sink, patch
-        # applies, PoC no longer fires, tests pass) with a bounded self-correction loop.
-        # Until then this is a pass-through: findings stay verified=False.
-        return findings
+        """The graded verifier (step 3b-2): prove each finding in a fresh jail.
+
+        Opens one sandbox for the stage (separate from the detection sandbox, which is
+        already torn down), runs the prover's read-only PoC under the sink oracle to lift a
+        finding to rung 3, then the fixer's patch to lift it to rung 4 - a bounded
+        self-correction loop per finding. Returns every finding, annotated: proven ones get
+        ``verified=True`` and a higher rung, the rest keep their analyst rung with a
+        :class:`~ono.models.Verification` record of which check stopped them. Nothing is
+        dropped here; ``min_rung`` filtering happens in the shared pipeline.
+        """
+        if not self.verifier_active or not findings:
+            self.last_verify_report = None
+            return findings
+        report = self.verifier.verify(
+            self._scan_id, self._workspace, findings, progress=self.report
+        )
+        self.last_verify_report = report
+        log.info("service backend: verify %s", report.summary)
+        return report.findings
+
+    @property
+    def _scan_id(self) -> str:
+        scan_id: str | None = getattr(self._local, "scan_id", None)
+        if scan_id is None:
+            msg = "ServiceAnalyzer.verify must run via run(); no scan id is set"
+            raise RuntimeError(msg)
+        return scan_id
 
 
 # ---------------------------------------------------------------------------
