@@ -93,7 +93,7 @@ class AnalysisResult:
     findings: list[Finding]
     stages: list[StageResult] = field(default_factory=list)
     # What the verify stage did with the raw findings (feeds ono_verifier_results_total):
-    # a verdict of true, dropped, or passed through without a verdict (see metrics.py).
+    # proven, a verifier check failed, or not attempted (see metrics.VerifierResult).
     verifier_passed: int = 0
     verifier_failed: int = 0
     verifier_skipped: int = 0
@@ -202,14 +202,24 @@ class BaseAnalyzer(ABC):
             note(f"{proven} of {len(raw)} proven; {len(verified)} kept")
 
         findings = [f for f in verified if f.rung >= options.min_rung][: options.max_findings]
-        passed = sum(1 for f in verified if f.verified)
+        # The graded verifier keeps every finding and records what stopped it, so the
+        # metric is read from each finding's verdict, not from how many were dropped:
+        # pass = proven; fail = a check failed; skip = the verifier could not attempt it.
+        n_passed = n_failed = n_skipped = 0
+        for f in verified:
+            if f.verified:
+                n_passed += 1
+            elif f.verification and any(c.status == "failed" for c in f.verification.checks):
+                n_failed += 1
+            else:
+                n_skipped += 1
         return AnalysisResult(
             findings=findings,
             stages=stages,
             candidate_count=len(candidates),
-            verifier_passed=passed,
-            verifier_failed=max(0, len(raw) - len(verified)),
-            verifier_skipped=len(verified) - passed,
+            verifier_passed=n_passed,
+            verifier_failed=n_failed,
+            verifier_skipped=n_skipped,
         )
 
     @contextmanager
