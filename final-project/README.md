@@ -10,7 +10,7 @@ Team: Sazan Khalid · Kenedy Ducheine · Junyi Tang · Jeffrey Pinarchick
 | Live app (Jetstream2) | [http://149.165.154.219:8080/ui/](http://149.165.154.219:8080/ui/), running the `service` backend with `qwen2.5-coder:7b` |
 | API docs (OpenAPI) | [http://149.165.154.219:8080/docs](http://149.165.154.219:8080/docs) |
 | Repository | [`dt7860920/6700-team-project`](https://github.com/dt7860920/6700-team-project), in `final-project/` |
-| Design docs | [Project plan](docs/plan.md) · [Deliverable 2 write-up](docs/deliverable2.md) |
+| Design docs | [Project plan](docs/plan.md) · [Deliverable 2 write-up](docs/deliverable2.md) · [Access control and TLS](docs/auth.md) |
 
 > **Status.** The API, configuration, container, and analyst UI are real and deployable. The default **analyzer is mocked** (`MODEL_BACKEND=mock`): it is shaped exactly like the production pipeline — `ingest → SAST shortlist → plan → analyze → verify` — but returns deterministic, representative findings instead of calling a model, so its `rung`, `verified`, and line-number values are illustrative. `MODEL_BACKEND=service` runs the real pipeline up to and including **detection** (Deliverable 3, step 3b-1): real ingest, Semgrep shortlist, and a planner + analyst agent loop that reads the target only through the jailed sandbox Executor. The verifier and fixer agent are not built yet, so real findings come back `verified=false` at rung 1 or 2 with no patch. `MODEL_BACKEND=local` is not implemented yet. See [Where the real pipeline slots in](#where-the-real-pipeline-slots-in).
 
@@ -95,7 +95,7 @@ For the real model (`MODEL_BACKEND=service`), start from `.env.example.service` 
 
 From your laptop: `curl http://<FLOATING-IP>:8080/health`. For a deployment running `MODEL_BACKEND=mock`, you can also run `uv run scripts/golden_path.py --base-url http://<FLOATING-IP>:8080`. Don't use it against the `service` backend: it starts a real scan and requires a verified finding with a patch, which that backend can't produce until the verifier and fixer exist.
 
-`compose.yml` defines **two services** and publishes **one port** (8080): the app, and the sandbox **Executor** (see [The sandbox Executor](#the-sandbox-executor-step-3a)) on an `internal: true` network with no `ports:` block. There is deliberately no database in the skeleton — scan state is in-memory. When the findings DB, threat-intel cache, and vLLM join the stack they are added the same way, as internal services *without* `ports:`, so the published surface stays exactly `:8080`.
+`compose.yml` defines **two services** and publishes **one port** (8080): the app, and the sandbox **Executor** (see [The sandbox Executor](#the-sandbox-executor-step-3a)) on an `internal: true` network with no `ports:` block. For HTTPS, the opt-in `tls` profile (`make compose-up-tls`) adds a **Caddy** front door on 80/443 with automatic certificates and HSTS; the app's port is then bound to loopback (`ONO_APP_BIND=127.0.0.1`) so the proxy is the only public listener — see [docs/auth.md](docs/auth.md#tls-with-caddy), including the IP-only (`tls internal`) case for a Jetstream floating IP without DNS. There is deliberately no database in the skeleton — scan state is in-memory. When the findings DB, threat-intel cache, and vLLM join the stack they are added the same way, as internal services *without* `ports:`, so the published surface stays exactly `:8080`.
 
 ---
 
@@ -108,8 +108,12 @@ Interactive documentation is generated from the code at **`/docs`** (Swagger UI)
 | `GET` | `/health` | Liveness → `{"status":"ok"}` |
 | `GET` | `/info` | App name, version, environment, model backend (no secrets) |
 | `GET` | `/targets` | The authorized-target allowlist |
-| `POST` | `/sources/check` | Check that a GitHub URL points to a public repo within the configured size limit and report GitHub-detected languages. |
-| `POST` | `/scans` | Start a scan in the background using an allowlisted `target_id` or public `repo_url` with `authorized_to_scan: true`. **403** for an unknown id; **422** if repository validation fails; **429** if busy. |
+| `POST` | `/sources/check` | Check that a GitHub URL points to a public repo within the configured size limit and report GitHub-detected languages. Per-IP rate limited (**429** + `Retry-After`); needs a session or bearer when `AUTH_REQUIRED=true` (**401**). |
+| `POST` | `/scans` | Start a scan in the background using an allowlisted `target_id` or public `repo_url` with `authorized_to_scan: true`. **401** without a credential when `AUTH_REQUIRED=true`; **403** for an unknown id; **422** if repository validation fails; **429** if rate limited or busy. |
+| `GET` | `/auth/github/login` | "Sign in with GitHub": 302 to GitHub (scope `read:user`) with a CSRF `state` cookie; `?next=/path` returns there afterwards |
+| `GET` | `/auth/github/callback` | The OAuth callback registered with GitHub; exchanges the code server-side, sets the `ono_session` cookie, redirects to `next` |
+| `GET` | `/auth/me` | `{"login": ...}` from the session cookie, or **401** |
+| `POST` | `/auth/logout` | Clears the session cookie (**204**) |
 | `GET` | `/scans/{scan_id}` | The **live** scan record: `status` (`queued → running → done \| failed`), `progress` (what it is doing now), `events` (activity log), `pipeline` (stage results so far), `findings_count`, `message` |
 | `GET` | `/scans/{scan_id}/findings` | Findings for a scan (empty until it is `done`) |
 | `GET` | `/findings/{finding_id}` | One finding. `finding_id` is unique per scan; the `fingerprint` field is the same for the same sink across scans, so use it to compare scans |
@@ -146,6 +150,8 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST $BASE/scans \
      -H 'content-type: application/json' -d '{"target_id": "example.com"}'
 # 403
 ```
+
+**Who may start a scan.** By default nobody needs a credential (`AUTH_REQUIRED=false`, the Deliverable-2 behaviour), but the two routes that spend resources, `POST /scans` and `POST /sources/check`, are always **rate limited per client IP** (`RATE_LIMIT_MAX` per `RATE_LIMIT_WINDOW_S`, 30/min by default; **429** + `Retry-After`). With `AUTH_REQUIRED=true` they additionally need either a **"Sign in with GitHub" session cookie** (identity only, scope `read:user`; the GitHub token is discarded, only the login is kept in our own HMAC-signed, HttpOnly, Secure cookie) or `Authorization: Bearer <AUTH_API_TOKEN>` for automation; otherwise **401**. TLS is terminated by an opt-in Caddy container (`docker compose --profile tls up`). The flow, the exact GitHub OAuth App registration steps, the env vars and the IP-only (`tls internal`) case are in [docs/auth.md](docs/auth.md). *The SPA does not have a "Sign in" button yet - that is a frontend follow-up; the backend contract (`/info` → `auth_required`, 401 → go to `/auth/github/login`) is in place.*
 
 **How a scan runs.** `POST /scans` only checks the allowlist and creates the record; the pipeline runs on a small **background worker pool** (`MAX_ACTIVE_SCANS` threads — a scan does blocking work: `git clone`, Semgrep, Docker, model HTTP calls — so it never touches the event loop). The worker writes into the record as it goes: `status`, a one-line `progress` (`Fetching the target snapshot` → `Static analysis` → `Analyzing candidate 2 of 3 - app/views.py:16` → `Candidate 2 of 3 dismissed: …`), the `events` log, and each `pipeline` stage result as it completes. On failure `status` is `failed` and `message` carries the reason (`analysis pipeline failed: executor unreachable at …`). Up to `MAX_QUEUED_SCANS` scans wait for a worker (`status: "queued"`); beyond that `POST /scans` answers **429** with a `Retry-After` header instead of growing an unbounded backlog of model sessions. `scripts/golden_path.py` shows the submit-then-poll loop in ten lines.
 
@@ -187,6 +193,14 @@ All configuration is read by `ono.config.Settings` (pydantic-settings) from envi
 | `MODEL_NAME` | `Qwen/Qwen2.5-Coder-7B-Instruct` | Informational for `mock`; sent as the `model` field by `service` (e.g. `qwen2.5-coder:7b` for Ollama) |
 | `MODEL_SERVICE_URL` | — | **Required when `MODEL_BACKEND=service`** (startup fails otherwise). OpenAI-compatible base URL, e.g. `http://localhost:11434/v1` |
 | `MODEL_SERVICE_API_KEY` | — | `SecretStr`: never logged, never returned by `/info` |
+| `AUTH_REQUIRED` | `false` | Gate `POST /scans` and `POST /sources/check` behind a GitHub session cookie or the static bearer. Startup fails if `true` without `AUTH_SESSION_SECRET` + the three `GITHUB_OAUTH_*` values, or with `UI_BACKEND=gradio` (it bypasses HTTP). See [docs/auth.md](docs/auth.md) |
+| `AUTH_SESSION_SECRET` | — | `SecretStr`, ≥32 chars (`openssl rand -hex 32`). HMAC key for our own 12-hour session cookie. Required when `AUTH_REQUIRED=true` |
+| `AUTH_API_TOKEN` | — | `SecretStr`, ≥16 chars. Optional static bearer for CI / `curl` / `make smoke-live` (`Authorization: Bearer …`) |
+| `GITHUB_OAUTH_CLIENT_ID` / `_SECRET` / `_CALLBACK_URL` | — | The GitHub OAuth App (scope `read:user`). The callback must be `<origin>/auth/github/callback`, exactly as registered with GitHub; the secret is a `SecretStr` |
+| `COOKIE_SECURE` | `true` | Session/state cookies carry `Secure` (HTTPS only). `false` only for plain-http local dev |
+| `RATE_LIMIT_MAX` / `RATE_LIMIT_WINDOW_S` | `30` / `60` | Requests per client IP per window on the gated routes (token bucket, in-process). `0` disables |
+| `TRUSTED_PROXY` | `false` | `true` only behind the Caddy profile (app port on loopback): the limiter then keys on the right-most `X-Forwarded-For` entry |
+| `ONO_DOMAIN` / `ONO_APP_BIND` | — / `0.0.0.0` | Compose-only (not read by the app): the Caddy site address for `--profile tls`, and the interface the app's `8080` binds to on the host (`127.0.0.1` behind Caddy) |
 | `MAX_VERIFIER_RETRIES` | `3` | 1–5. Reserved cap for the verifier self-correction loop, which is not built yet (3b-2) |
 | `MAX_ACTIVE_SCANS` | `2` | 1–16. Scans that run at the same time (background worker threads). Each holds a model session and, on `service`, one sandbox |
 | `MAX_QUEUED_SCANS` | `8` | 0–100. Scans allowed to wait for a worker; beyond this `POST /scans` answers 429 (busy) |
@@ -230,6 +244,8 @@ The **configured target allowlist** lives in [`src/ono/targets.yaml`](src/ono/ta
 final-project/
 ├── src/ono/
 │   ├── api.py          FastAPI app: documented endpoints + mounted Gradio UI
+│   ├── auth.py         GitHub OAuth sign-in (identity only), session/bearer gate, per-IP rate limiter
+│   ├── github.py       sign_session / verify_session: the HMAC-signed 12 h session token
 │   ├── ui.py           Gradio analyst UI (target picker -> Analyze -> live progress -> finding cards)
 │   ├── service.py      ScanService: allowlist gate -> background worker pool -> live scan record
 │   ├── progress.py     ProgressSink: how the pipeline reports "what I am doing now"
@@ -267,9 +283,9 @@ final-project/
 │   ├── test_agents.py  protocol parsing, tools + ledger, ReAct loop, planner, model wire format, orchestrator
 │   ├── test_executor_docker.py      REAL-container stress tests (`-m docker`; auto-skipped in CI / without a daemon)
 │   └── test_orchestrator_docker.py  REAL-jail end-to-end run of the detection core, model scripted (`-m docker`)
-├── scripts/golden_path.py   smoke heartbeat (live server or --in-process)
-├── docs/               project plan and Deliverable 2 write-up
-├── Dockerfile · compose.yml · .dockerignore
+├── scripts/golden_path.py   smoke heartbeat (live server or --in-process; --api-token for gated deployments)
+├── docs/               project plan, Deliverable 2 write-up, access control + TLS (auth.md)
+├── Dockerfile · compose.yml (+ opt-in `tls` profile) · Caddyfile · .dockerignore
 ├── .env.example.local · .env.example.production · .env.example.service
 └── Makefile · .pre-commit-config.yaml
 ```
