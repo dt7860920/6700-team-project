@@ -39,6 +39,8 @@ from ono.agents.trajectory import Trajectory, TrajectoryWriter
 from ono.config import Settings
 from ono.errors import PipelineError
 from ono.executor.client import ExecutorAuthError, ExecutorError, ExecutorUnavailableError
+from ono.learning.harvest import harvest_report
+from ono.learning.memory import KnowledgeMemory
 from ono.models import Finding, Verification, VerificationCheck
 from ono.progress import ProgressCallback
 from ono.verifier.oracle import OracleResult, SinkOracle, explain, new_canary, oracle_supports
@@ -73,6 +75,7 @@ class VerifyReport:
     model_calls: int = 0
     budget_limit: int = 0
     stopped_early: str = ""
+    harvested: int = 0  # verified solutions written into the knowledge memory
 
     @property
     def summary(self) -> str:
@@ -81,6 +84,8 @@ class VerifyReport:
             f"{self.reachable}/{n} proven reachable (rung 3), {self.fixed} fixed (rung 4); "
             f"{self.model_calls}/{self.budget_limit} model call(s)"
         )
+        if self.harvested:
+            text += f"; harvested {self.harvested} into knowledge memory"
         if self.stopped_early:
             text += f"; stopped early: {self.stopped_early}"
         return text
@@ -117,11 +122,15 @@ class GradedVerifier:
         model: ChatModel,
         executor: ExecutorProvider,
         trajectories: TrajectoryWriter | None = None,
+        memory: KnowledgeMemory | None = None,
     ) -> None:
         self.settings = settings
         self.model = model
         self.executor = executor
         self.trajectories = trajectories or TrajectoryWriter(settings.agent_trajectory_dir)
+        # The knowledge memory (learning loop): seeds the prover with prior verified PoCs and
+        # harvests new ones. None = no learning (the default; behaviour unchanged).
+        self.memory = memory
         self.prover: AgentDefinition = PROVER.with_budget(
             max_steps=settings.prover_max_steps, temperature=settings.agent_temperature
         )
@@ -187,6 +196,8 @@ class GradedVerifier:
             raise PipelineError(f"the model service failed during verify ({exc})") from exc
         report.findings = items
         report.model_calls = budget.used
+        if self.memory is not None:
+            report.harvested = harvest_report(report, self.memory)
         log.info("verifier[%s]: %s", scan_id, report.summary)
         return report
 
@@ -211,11 +222,14 @@ class GradedVerifier:
             )
             return _apply(finding, finding.rung, verified=False, verification=v)
 
-        # Rung 3: prove the sink is reachable with a read-only PoC.
+        # Rung 3: prove the sink is reachable with a read-only PoC. The learning loop seeds the
+        # prover with a prior verified PoC for this sink class, when the memory has one.
+        memory_hint = self.memory.seed_for(finding) if self.memory is not None else ""
+        v.seeded = bool(memory_hint)
         oracle = SinkOracle(sandbox, timeout_s=self.settings.verifier_poc_timeout_s)
         canary = new_canary()
         poc, poc_check = self._prove_reachable(
-            scan_id, finding, window, toolbox, oracle, canary, budget, deadline, v
+            scan_id, finding, window, toolbox, oracle, canary, budget, deadline, v, memory_hint
         )
         v.checks.append(poc_check)
         if poc is None or poc_check.status != "passed":
@@ -245,6 +259,7 @@ class GradedVerifier:
         budget: CallBudget,
         deadline: float,
         v: Verification,
+        memory_hint: str = "",
     ) -> tuple[Poc | None, VerificationCheck]:
         previous: Poc | None = None
         failure = ""
@@ -266,6 +281,7 @@ class GradedVerifier:
                 trajectory=traj,
                 previous=previous,
                 failure=failure,
+                memory_hint=memory_hint,
             )
             v.model_calls += traj.model_calls
             self.trajectories.write(traj)
@@ -276,6 +292,7 @@ class GradedVerifier:
             result = oracle.run(finding, outcome.answer.code, canary)
             if result.fired:
                 v.evidence = result.evidence
+                v.poc_attempts = attempt
                 return outcome.answer, VerificationCheck(
                     name="poc_reaches_sink",
                     status="passed",

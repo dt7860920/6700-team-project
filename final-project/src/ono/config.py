@@ -147,6 +147,34 @@ class Settings(BaseSettings):
         description="Wall-clock budget for verifying one finding (all attempts together).",
     )
 
+    # -- Persistence + the learning loop (Deliverable 3, plan sections 1.5 / 8.6) -----
+    data_dir: Path = Field(
+        default=Path(".ono-data"),
+        description="Directory for durable state (the SQLite scan store and knowledge memory).",
+    )
+    scan_store: Literal["memory", "sqlite"] = Field(
+        default="memory",
+        description=(
+            "Where scans/findings live. 'memory' is lost on restart (default, what tests and "
+            "the mock backend use); 'sqlite' is a durable single file under data_dir."
+        ),
+    )
+    learning_enabled: bool = Field(
+        default=False,
+        description=(
+            "Turn on the frontier-free learning loop: harvest verifier-passed PoCs into a "
+            "persistent knowledge memory and seed the prover with them on later scans. Off by "
+            "default (changes nothing about a single scan); measurable across rounds when on."
+        ),
+    )
+    knowledge_db_path: Path | None = Field(
+        default=None,
+        description=(
+            "Override for the knowledge-memory SQLite file. Defaults to "
+            "<data_dir>/knowledge.sqlite3 when learning is enabled."
+        ),
+    )
+
     # -- Scan workers + the polling UI -----------------------------------------------
     # ``POST /scans`` is asynchronous: the scan runs on a background worker thread and the
     # client polls ``GET /scans/{id}``. Each active scan holds a model session and (on the
@@ -388,6 +416,11 @@ class Settings(BaseSettings):
     @property
     def is_production(self) -> bool:
         return self.environment == "production"
+
+    @property
+    def knowledge_path(self) -> Path:
+        """Where the knowledge memory lives (explicit override, else under data_dir)."""
+        return self.knowledge_db_path or (self.data_dir / "knowledge.sqlite3")
 
 
 @lru_cache(maxsize=1)
