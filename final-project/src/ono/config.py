@@ -162,7 +162,10 @@ class Settings(BaseSettings):
         description=(
             "Comma-separated Semgrep --config values (registry packs or local rule files). "
             "A language pack (p/python, p/javascript, ...) is appended per target language. "
-            "Empty string = skip Semgrep and use the built-in regex scanner."
+            "Registry names (p/...) are fetched from semgrep.dev at scan time and cached, so "
+            "the SAST stage is not air-gapped by default; point this at a local rules file or "
+            "directory for fully offline operation. "
+            "Empty string = skip Semgrep and use the built-in regex scanner (Python only)."
         ),
     )
     max_candidates: int = Field(

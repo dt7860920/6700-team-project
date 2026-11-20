@@ -808,6 +808,16 @@ class ServiceAnalyzer(BaseAnalyzer):
             len(result.candidates),
             target.target_id,
         )
+        if result.degraded:
+            # Issue #101: a fallback that cannot see the target's languages must not read as
+            # "clean" - say so where the UI shows it (the scan's live activity log) and in
+            # the server log, so an empty or short queue is understood as incomplete.
+            log.warning(
+                "service backend: static analysis degraded for %s - %s",
+                target.target_id,
+                result.degraded,
+            )
+            self.report(f"Static analysis degraded: {result.degraded}")
         return result.candidates
 
     # -- Stage 3 ------------------------------------------------------------
