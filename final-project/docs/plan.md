@@ -375,13 +375,15 @@ Three layers, separated by purpose — and **no Postgres required**.
 
 **2 · Live dashboards — Prometheus + Grafana.** A `/metrics` endpoint exposes histograms (request latency, TTFT, tokens/call) and counters (scans, errors, cumulative shadow-cost), plus GPU via DCGM. This is "is it healthy now," not "what did run X cost" (that's layer 1).
 
+*Status: built.* `GET /metrics` (gated by `METRICS_ENABLED`, default on; internal — not in the OpenAPI schema, unauthenticated, scraped in-box on the one published port) exposes `ono_scans_total{target,status}`, `ono_scan_duration_seconds`, `ono_findings_total{severity,rung,verified}`, `ono_verifier_results_total{result=pass|fail|skip}`, `ono_active_scans` / `ono_queued_scans`, and from the shared model client `ono_model_requests_total{outcome}`, `ono_model_latency_seconds` and `ono_model_tokens_total{kind=prompt|completion}` (from the reply's `usage`). TTFT is **not** exposed by the app yet — the client is non-streaming, so there is no first-token instant to measure; until it streams, take TTFT from vLLM's own `/metrics`. Shadow cost is derived in Grafana from the token counters rather than stored twice. The `observability/` directory holds the Prometheus scrape config and a provisioned Grafana dashboard behind the opt-in Compose profile `observability` (`docker compose --profile observability up`); both UIs bind to loopback only, so :8080 stays the only published port.
+
 **3 · Benchmark & cross-loop comparison.** Roll up the JSONL (DuckDB -> small Parquet) to plot the **improvement-across-loops curve** (detection/FP/cost per loop round). W&B (offline mode) is an option for richer dashboards, but the JSONL+DuckDB rollup keeps everything local and is enough.
 
 **Shadow cost model.** We run locally (actual $ ~= 0, just SUs/power), but log what each call *would* cost at a hosted rate: `est_cost_usd = prompt_tokens/1e6 * INPUT_RATE + completion_tokens/1e6 * OUTPUT_RATE`, storing the rate so it stays interpretable.
 
 **Where the numbers come from.** The Ollama/OpenAI response carries token counts (`usage`) and, for Ollama, nanosecond durations. **TTFT needs streaming** — measure wall-clock to the first token chunk; total latency is wall-clock around the call. vLLM additionally exposes a `/metrics` TTFT histogram.
 
-**Settings to add** (`config.py`, all default-safe): `metrics_log_dir`, `cost_input_rate`, `cost_output_rate`, `enable_prometheus`, `enable_metrics_log`. Metrics logging records token *counts* and timings only — **never secrets or full code**.
+**Settings to add** (`config.py`, all default-safe): `metrics_log_dir`, `cost_input_rate`, `cost_output_rate`, `enable_metrics_log`; `enable_prometheus` shipped as `metrics_enabled` (`METRICS_ENABLED`, default `true`). Metrics logging records token *counts* and timings only — **never secrets or full code**.
 
 ---
 

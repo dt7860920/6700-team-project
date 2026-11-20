@@ -24,12 +24,16 @@ from __future__ import annotations
 import json
 import logging
 import threading
+import time
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 import httpx
 
 from ono.config import AgentToolProtocol, Settings
+
+if TYPE_CHECKING:
+    from ono.metrics import Metrics
 
 __all__ = [
     "BudgetExhaustedError",
@@ -120,6 +124,7 @@ class ModelClient:
         *,
         timeout_s: float = MODEL_TIMEOUT_S,
         transport: httpx.BaseTransport | None = None,
+        metrics: Metrics | None = None,
     ) -> None:
         if not settings.model_service_url:
             msg = "ModelClient requires settings.model_service_url"
@@ -130,6 +135,8 @@ class ModelClient:
         self._lock = threading.Lock()
         self._protocol: AgentToolProtocol = settings.agent_tool_protocol
         self._http = httpx.Client(timeout=timeout_s, transport=transport)
+        # Optional: every request reports latency / outcome / token counts (never content).
+        self._metrics = metrics
 
     @property
     def protocol(self) -> AgentToolProtocol:
@@ -212,6 +219,8 @@ class ModelClient:
             "model": self.model_name,
             "messages": messages,
             "temperature": temperature,
+            # TODO(metrics): streaming would let us observe time-to-first-token
+            # (ono_model_ttft_seconds); with one body per call there is no such instant.
             "stream": False,
         }
         if tools:
@@ -219,6 +228,22 @@ class ModelClient:
         headers: dict[str, str] = {}
         if self._api_key is not None:
             headers["Authorization"] = f"Bearer {self._api_key.get_secret_value()}"
+        if self._metrics is None:
+            return self._request(payload, headers)
+        start = time.perf_counter()
+        reply: ModelReply | None = None
+        try:
+            reply = self._request(payload, headers)
+            return reply
+        finally:
+            self._metrics.model_request(
+                latency_s=time.perf_counter() - start,
+                ok=reply is not None,
+                prompt_tokens=reply.prompt_tokens if reply is not None else None,
+                completion_tokens=reply.completion_tokens if reply is not None else None,
+            )
+
+    def _request(self, payload: dict[str, object], headers: dict[str, str]) -> ModelReply:
         try:
             response = self._http.post(
                 f"{self.base_url}/chat/completions", json=payload, headers=headers
