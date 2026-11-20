@@ -86,10 +86,11 @@ def create_app(
     service = ScanService(
         settings=settings,
         registry=registry,
-        analyzer=build_analyzer(settings, metrics = metrics),
-        metrics = metrics,
-        store=store
+        analyzer=build_analyzer(settings, metrics=metrics),
+        metrics=metrics,
+        store=store,
     )
+
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         try:
