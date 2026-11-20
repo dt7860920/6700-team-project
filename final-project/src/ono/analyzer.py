@@ -96,7 +96,7 @@ class AnalysisResult:
     verifier_passed: int = 0
     verifier_failed: int = 0
     verifier_skipped: int = 0
-    s: int | None = None
+    candidate_count: int | None = None
 
     @property
     def summary(self) -> str:
