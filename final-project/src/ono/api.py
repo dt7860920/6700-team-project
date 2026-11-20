@@ -88,8 +88,8 @@ def create_app(
         registry=registry,
         analyzer=build_analyzer(settings, metrics = metrics),
         metrics = metrics,
-        store=store,
-      
+        store=store
+    )
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         try:
