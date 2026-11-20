@@ -29,6 +29,12 @@ export interface InfoResponse {
   model_backend: string;
   model_name: string;
   targets_registered: number;
+  // Present once the auth backend is deployed; absent (falsy) means auth is off.
+  auth_required?: boolean;
+}
+
+export interface Me {
+  login: string;
 }
 
 export interface TraceStep {

@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { Route, Routes, useNavigate } from "react-router-dom";
-import { api, ApiError } from "./api/client";
-import type { InfoResponse, SourceCheck, TargetSummary } from "./api/types";
+import { api, ApiError, redirectToLogin } from "./api/client";
+import type { InfoResponse, Me, SourceCheck, TargetSummary } from "./api/types";
 import { Sidebar, type ScanSummary } from "./components/Sidebar";
 import { NewScanPage } from "./pages/NewScanPage";
 import { ScanPage } from "./pages/ScanPage";
@@ -31,6 +31,7 @@ export default function App() {
   const [repoCheckError, setRepoCheckError] = useState<string | null>(null);
   const [authorizedToScan, setAuthorizedToScan] = useState(false);
   const [history, setHistory] = useState<ScanSummary[]>(loadHistory);
+  const [me, setMe] = useState<Me | null>(null);
 
   const scan = useScan();
 
@@ -43,6 +44,10 @@ export default function App() {
         setInfo(i);
         setTargets(t.targets);
         if (t.targets.length > 0) setSelected(t.targets[0].target_id);
+        if (i.auth_required) {
+          const m = await api.me();
+          if (alive) setMe(m);
+        }
       } catch (err) {
         if (!alive) return;
         setLoadError(err instanceof ApiError ? err.detail : "Could not load targets from the API.");
@@ -52,6 +57,14 @@ export default function App() {
       alive = false;
     };
   }, []);
+
+  const onSignOut = async () => {
+    try {
+      await api.logout();
+    } finally {
+      setMe(null);
+    }
+  };
 
   const targetName = (id: string) =>
     id === "snippet" ? "Code snippet" : (targets.find((t) => t.target_id === id)?.name ?? id);
@@ -123,6 +136,10 @@ export default function App() {
           activeScanId={scan.scan?.scan_id ?? null}
           onNew={onNew}
           onSelect={(id) => navigate(`/scan/${id}`)}
+          authRequired={!!info?.auth_required}
+          me={me}
+          onSignIn={redirectToLogin}
+          onSignOut={onSignOut}
         />
       </div>
 
