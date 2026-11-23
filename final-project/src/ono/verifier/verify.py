@@ -59,11 +59,14 @@ from ono.progress import ProgressCallback
 from ono.verifier.oracle import (
     OracleResult,
     SinkOracle,
+    SinkOracleProtocol,
     explain,
+    language_of,
     new_canary,
     oracle_supports,
     summarize,
 )
+from ono.verifier.oracle_js import JsSinkOracle
 
 __all__ = [
     "ExecutorProvider",
@@ -83,7 +86,7 @@ class ExecutorProvider(Protocol):
     """The slice of the Executor the verifier needs: one resettable sandbox per stage."""
 
     def sandbox(
-        self, scan_id: str, workspace_dir: Path
+        self, scan_id: str, workspace_dir: Path, *, runtime: str = "python"
     ) -> AbstractContextManager[SandboxExecutor]: ...
 
 
@@ -120,32 +123,41 @@ class VerifyReport:
         return text
 
 
-def environment_note(result: ProvisionResult | None) -> str:
+def environment_note(result: ProvisionResult | None, language: str = "python") -> str:
     """What the prover is told about third-party packages in the jail (technique, not a key).
 
     Names the packages that ARE importable (so the prover imports the real app instead of
     stubbing its framework) and the ones that are not (so it stubs exactly those). It never
-    carries a payload or the canary.
+    carries a payload or the canary. ``language`` only changes which stubbing idiom is
+    suggested (Python's ``unittest.mock`` vs. Node's ``require.cache`` / module-object
+    monkeypatching); the dependency facts themselves are language-agnostic.
     """
+    stub_hint = (
+        "stub any other import with unittest.mock (sys.modules[...] = MagicMock()) "
+        "before importing the app"
+        if language != "javascript"
+        else "stub any other require() by overwriting its exported object/functions, or "
+        "require.cache[require.resolve('<module>')] = {exports: {...}}, before requiring the app"
+    )
     if result is None or result.status != "provisioned":
         why = result.summary if result is not None else "provisioning did not run"
         return (
             "Sandbox environment: NO third-party packages are installed "
-            f"({why}). Only the standard library and the repository's own modules import; "
-            "stub any other import with unittest.mock (sys.modules[...] = MagicMock()) "
-            "before importing the app."
+            f"({why}). Only the standard library/builtins and the repository's own modules "
+            f"import; {stub_hint}."
         )
     packages = ", ".join(result.installed[:40]) + (" ..." if len(result.installed) > 40 else "")
     text = (
         "Sandbox environment: the repository's declared third-party packages ARE installed "
-        f"(from {', '.join(result.installed_from)}): {packages}. Import the application "
-        "normally and drive it with its real framework (test client); do not stub these."
+        f"(from {', '.join(result.installed_from)}): {packages}. Import/require the "
+        "application normally and drive it with its real framework (test client); do not "
+        "stub these."
     )
     if result.failed:
         missing = ", ".join(f.split(" (", 1)[0] for f in result.failed[:10])
         text += (
-            f" NOT installed (build failed): {missing} - if the app imports one of them, "
-            "stub it with unittest.mock before the import."
+            f" NOT installed (build failed): {missing} - if the app imports one of "
+            f"them, {stub_hint}."
         )
     return text
 
@@ -217,12 +229,14 @@ class GradedVerifier:
         if not items:
             return report
         total = len(items)
-        report_progress(f"Opening the verifier sandbox for {total} finding(s)")
+        # One jail for the whole scan: if ANY finding needs the Node oracle, the jail must
+        # have `node` in it for the whole stage (mixed Python/JS findings share one sandbox).
+        runtime = "node" if any(language_of(f.file) == "javascript" for f in items) else "python"
+        report_progress(f"Opening the verifier sandbox for {total} finding(s) ({runtime} jail)")
         try:
-            with self.executor.sandbox(scan_id, workspace) as sandbox:
+            with self.executor.sandbox(scan_id, workspace, runtime=runtime) as sandbox:
                 near = _dedupe([finding.file for finding in items])
                 report.dependencies = self._provision(scan_id, sandbox, report_progress, near)
-                note = environment_note(report.dependencies)
                 for index, finding in enumerate(items):
                     if index:
                         sandbox.reset()  # a fresh copy: no patch leaks between findings
@@ -232,7 +246,7 @@ class GradedVerifier:
                     )
                     try:
                         proven = self._verify_one(
-                            scan_id, sandbox, finding, budget, note, report.dependencies
+                            scan_id, sandbox, finding, budget, report.dependencies
                         )
                     except BudgetExhaustedError as exc:
                         report.stopped_early = str(exc)
@@ -311,7 +325,6 @@ class GradedVerifier:
         sandbox: SandboxExecutor,
         finding: Finding,
         budget: CallBudget,
-        note: str = "",
         dependencies: ProvisionResult | None = None,
     ) -> Finding:
         v = Verification()
@@ -334,10 +347,13 @@ class GradedVerifier:
             return _apply(finding, finding.rung, verified=False, verification=v)
 
         # Rung 3: prove the sink is reachable with a read-only PoC. The learning loop seeds the
-        # prover with a prior verified PoC for this sink class, when the memory has one.
+        # prover with a prior verified PoC for this sink class, when the memory has one. The
+        # environment note is per-finding (not per-scan): it names the same provisioned/missing
+        # packages for every finding, but the stubbing idiom it suggests is language-specific.
         memory_hint = self.memory.seed_for(finding) if self.memory is not None else ""
         v.seeded = bool(memory_hint)
-        oracle = SinkOracle(sandbox, timeout_s=self.settings.verifier_poc_timeout_s)
+        note = environment_note(dependencies, language_of(finding.file))
+        oracle = _oracle_for(finding, sandbox, timeout_s=self.settings.verifier_poc_timeout_s)
         canary = new_canary(finding.cwe)
         poc, poc_check = self._prove_reachable(
             scan_id,
@@ -375,7 +391,7 @@ class GradedVerifier:
         finding: Finding,
         window: str,
         toolbox: ToolBox,
-        oracle: SinkOracle,
+        oracle: SinkOracleProtocol,
         canary: str,
         budget: CallBudget,
         deadline: float,
@@ -441,7 +457,7 @@ class GradedVerifier:
         window: str,
         poc: Poc,
         toolbox: ToolBox,
-        oracle: SinkOracle,
+        oracle: SinkOracleProtocol,
         canary: str,
         budget: CallBudget,
         deadline: float,
@@ -495,7 +511,7 @@ class GradedVerifier:
         return None
 
     def _check_patch(
-        self, finding: Finding, patch: Patch, poc: Poc, oracle: SinkOracle, canary: str
+        self, finding: Finding, patch: Patch, poc: Poc, oracle: SinkOracleProtocol, canary: str
     ) -> tuple[VerificationCheck, VerificationCheck, VerificationCheck, bool]:
         """Re-stage the PoC, apply the diff, re-run that SAME PoC, run the tests. Re-running
         the exact PoC that fired at rung 3 against the patched code is the honest
@@ -584,6 +600,16 @@ class GradedVerifier:
         return result.text
 
 
+def _oracle_for(
+    finding: Finding, sandbox: SandboxExecutor, *, timeout_s: float
+) -> SinkOracleProtocol:
+    """Pick the Python or JS/TS sink oracle for ``finding``'s file (see ``oracle_supports``,
+    which already refused anything that is neither before this is ever called)."""
+    if language_of(finding.file) == "javascript":
+        return JsSinkOracle(sandbox, timeout_s=timeout_s)
+    return SinkOracle(sandbox, timeout_s=timeout_s)
+
+
 def _dedupe(items: Sequence[str]) -> list[str]:
     """Order-preserving de-duplication (the findings' sink files for nearest-manifest)."""
     seen: set[str] = set()
@@ -595,7 +621,7 @@ def _dedupe(items: Sequence[str]) -> list[str]:
     return out
 
 
-def _rerun_staged_poc(oracle: SinkOracle, finding: Finding, canary: str) -> OracleResult:
+def _rerun_staged_poc(oracle: SinkOracleProtocol, finding: Finding, canary: str) -> OracleResult:
     """Re-run the PoC staged in ``.ono/poc.py`` against the (patched) workspace."""
     return oracle.run_staged(finding, canary)
 

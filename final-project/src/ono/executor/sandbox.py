@@ -119,6 +119,7 @@ __all__ = [
     "check_grep_pattern",
     "jail_kwargs",
     "load_seccomp_profile",
+    "select_image",
     "snapshot_manifests",
 ]
 
@@ -179,6 +180,11 @@ _CONTAINER_ENV = {
     # Provisioned packages (read-only, keeper-owned). Honoured by plain `python3` runs such
     # as the target's test suite; ignored by the `-I` oracle/guest, which add it explicitly.
     "PYTHONPATH": SANDBOX_DEPS,
+    # Same idea for Node: a plain `node` run (the target's own `npm test`, say) resolves
+    # provisioned npm packages through NODE_PATH; the JS oracle adds the directory itself
+    # (module.globalPaths) so it works even on an image/exec that does not inherit this var.
+    # Harmless on a Python-only (non-combined) jail image: node is never invoked there.
+    "NODE_PATH": f"{SANDBOX_DEPS}/node_modules",
 }
 
 _BUILDER_ENV = {
@@ -198,6 +204,13 @@ _BUILDER_ENV = {
     "PIP_NO_INPUT": "1",
     "PIP_PROGRESS_BAR": "off",
     "PIP_NO_PYTHON_VERSION_WARNING": "1",
+    # npm: cache + config under the writable /tmp (HOME is already /tmp), no audit/funding
+    # noise, no update nagging - the installed npm (pinned by the image) is the one that runs.
+    "NPM_CONFIG_CACHE": "/tmp/.npm-cache",
+    "NPM_CONFIG_AUDIT": "false",
+    "NPM_CONFIG_FUND": "false",
+    "NPM_CONFIG_UPDATE_NOTIFIER": "false",
+    "NPM_CONFIG_LOGLEVEL": "error",
 }
 
 _PYTEST_MARKERS = frozenset({"pytest.ini", "conftest.py", "tests", "test"})
@@ -243,6 +256,9 @@ class JailConfig:
     """Everything the jail needs from settings, as plain values (easy to assert on in tests)."""
 
     image: str = "python:3.13-slim"
+    image_node: str = "nikolaik/python-nodejs:python3.13-nodejs20-slim"
+    """Selected instead of ``image`` for a scan with any JS/TS finding (``runtime="node"``);
+    must have Python (the guest helper always runs ``python3``) PLUS ``node``/``npm``."""
     mem_mb: int = 1024
     cpus: float = 1.0
     pids_limit: int = 256
@@ -264,11 +280,15 @@ class JailConfig:
     """Cap on the installed dependency set; also the size of the jail's ``/deps`` tmpfs."""
     deps_index_url: str | None = None
     """Package index for the builder (``PIP_INDEX_URL``); ``None`` = PyPI."""
+    deps_npm_registry: str | None = None
+    """Registry for the builder's npm install/ci (``NPM_CONFIG_REGISTRY``); ``None`` = npm's
+    default (registry.npmjs.org)."""
 
     @classmethod
     def from_settings(cls, settings: Settings) -> Self:
         return cls(
             image=settings.sandbox_image,
+            image_node=settings.sandbox_image_node,
             mem_mb=settings.sandbox_mem_mb,
             cpus=settings.sandbox_cpus,
             pids_limit=settings.sandbox_pids_limit,
@@ -284,6 +304,7 @@ class JailConfig:
             deps_timeout_s=settings.sandbox_deps_timeout_s,
             deps_mb=settings.sandbox_deps_max_mb,
             deps_index_url=settings.sandbox_deps_index_url,
+            deps_npm_registry=settings.sandbox_deps_npm_registry,
         )
 
     @property
@@ -322,14 +343,29 @@ def load_seccomp_profile(spec: str | None) -> str | None:
     return json.dumps(profile, separators=(",", ":"))
 
 
-def jail_kwargs(config: JailConfig, *, scan_id: str, sandbox_id: str) -> dict[str, Any]:
+def select_image(config: JailConfig, runtime: str) -> str:
+    """The image for a sandbox's declared ``runtime``: ``"python"`` (default) or ``"node"``.
+
+    This is the ONLY place a client-influenced value selects a Docker image, and it chooses
+    between exactly two Executor-configured images (never an arbitrary string from a
+    request) - see ``create_sandbox``'s ``runtime`` query parameter in ``app.py``, which
+    FastAPI's ``Literal`` validation already restricts to these two values before this runs.
+    """
+    return config.image_node if runtime == "node" else config.image
+
+
+def jail_kwargs(
+    config: JailConfig, *, scan_id: str, sandbox_id: str, image: str | None = None
+) -> dict[str, Any]:
     """The exact ``containers.run`` arguments for a target container (the jail flags).
 
+    ``image`` overrides ``config.image`` (the per-sandbox runtime selection - see
+    :func:`select_image`); every other flag is identical regardless of which image is used.
     Kept as one pure function so the unit tests can assert every flag without Docker.
     """
     tmp_mb = max(16, config.workspace_mb // 2)
     return {
-        "image": config.image,
+        "image": image or config.image,
         "command": ["sleep", "infinity"],
         "detach": True,
         "name": f"ono-sbx-{sandbox_id}",
@@ -372,22 +408,28 @@ def jail_kwargs(config: JailConfig, *, scan_id: str, sandbox_id: str) -> dict[st
     }
 
 
-def builder_kwargs(config: JailConfig, *, scan_id: str, sandbox_id: str) -> dict[str, Any]:
+def builder_kwargs(
+    config: JailConfig, *, scan_id: str, sandbox_id: str, image: str | None = None
+) -> dict[str, Any]:
     """The exact ``containers.run`` arguments for a BUILDER container.
 
     Identical to :func:`jail_kwargs` in every hardening flag except the one it needs to do
-    its job: ``network_mode`` is the daemon's default bridge (pip has to reach an index).
-    Non-root, ``cap_drop=ALL``, ``no-new-privileges``, the same seccomp profile, read-only
-    rootfs with two bounded tmpfs mounts (``/build`` for the snapshot + the install target,
-    ``/tmp`` for pip's scratch), the same memory/CPU/PID caps, no host bind mounts and - like
-    every target container - never the Docker socket. It is labelled with a short TTL so
-    the sweeper removes it if the Executor dies mid-build.
+    its job: ``network_mode`` is the daemon's default bridge (pip/npm have to reach an
+    index/registry). Non-root, ``cap_drop=ALL``, ``no-new-privileges``, the same seccomp
+    profile, read-only rootfs with two bounded tmpfs mounts (``/build`` for the snapshot +
+    the install target, ``/tmp`` for pip/npm's scratch), the same memory/CPU/PID caps, no
+    host bind mounts and - like every target container - never the Docker socket. It is
+    labelled with a short TTL so the sweeper removes it if the Executor dies mid-build.
+    ``image`` is the SAME image the jail it builds for uses (see :func:`select_image`): a
+    JS/TS scan's builder needs ``npm`` just as much as its jail needs ``node``.
     """
     env = dict(_BUILDER_ENV)
     if config.deps_index_url:
         env["PIP_INDEX_URL"] = config.deps_index_url
+    if config.deps_npm_registry:
+        env["NPM_CONFIG_REGISTRY"] = config.deps_npm_registry
     return {
-        "image": config.image,
+        "image": image or config.image,
         "command": ["sleep", "infinity"],
         "detach": True,
         "name": f"ono-bld-{sandbox_id}",
@@ -600,6 +642,9 @@ class Sandbox:
     status: SandboxStatus = "dead"
     container_id: str | None = None
     resets: int = 0
+    image: str = ""
+    """The resolved image this sandbox runs (``select_image``'s result at creation time);
+    "" falls back to ``config.image`` (legacy / test-constructed sandboxes)."""
     deps: Snapshot | None = field(default=None, repr=False)
     """The builder's validated packages archive, re-extracted into ``/deps`` on every reset."""
     _lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
@@ -616,12 +661,16 @@ class Sandbox:
     def expires_at(self) -> datetime:
         return self.created_at + timedelta(seconds=self.config.ttl_s)
 
+    @property
+    def effective_image(self) -> str:
+        return self.image or self.config.image
+
     def info(self) -> SandboxInfo:
         return SandboxInfo(
             sandbox_id=self.sandbox_id,
             scan_id=self.scan_id,
             status=self.status,
-            image=self.config.image,
+            image=self.effective_image,
             container_id=self.container_id,
             created_at=self.created_at,
             expires_at=self.expires_at,
@@ -632,8 +681,13 @@ class Sandbox:
     def _start_container(self) -> None:
         """Create + start the jail and extract the snapshot into it. Cleans up on failure."""
         client = self.manager.client
-        kwargs = jail_kwargs(self.config, scan_id=self.scan_id, sandbox_id=self.sandbox_id)
-        self.manager.ensure_image(self.config.image)
+        kwargs = jail_kwargs(
+            self.config,
+            scan_id=self.scan_id,
+            sandbox_id=self.sandbox_id,
+            image=self.effective_image,
+        )
+        self.manager.ensure_image(self.effective_image)
         try:
             container = client.containers.run(**kwargs)
         except docker.errors.APIError as exc:
@@ -1298,21 +1352,25 @@ class SandboxManager:
         self._pulled.add(image)
 
     # -- lifecycle --------------------------------------------------------------
-    def create(self, scan_id: str, workspace_dir: Path) -> Sandbox:
+    def create(self, scan_id: str, workspace_dir: Path, *, runtime: str = "python") -> Sandbox:
         """Pack a local workspace directory and start a jail holding it."""
         try:
             archive = pack_workspace(workspace_dir, max_bytes=self.config.max_archive_bytes)
         except ArchiveError as exc:
             raise SandboxPathError(str(exc)) from exc
-        return self.create_from_archive(scan_id, archive)
+        return self.create_from_archive(scan_id, archive, runtime=runtime)
 
-    def create_from_archive(self, scan_id: str, archive: bytes | Path) -> Sandbox:
+    def create_from_archive(
+        self, scan_id: str, archive: bytes | Path, *, runtime: str = "python"
+    ) -> Sandbox:
         """Start a jail from a gzipped tar of the workspace (validated first).
 
         ``archive`` is either the bytes (small, test/CLI convenience: they are written
         to the snapshot directory first) or - the service path - a file the caller
         has already spooled there. **The manager takes ownership of that file**: it is
-        renamed to the sandbox's snapshot on success and deleted on any failure.
+        renamed to the sandbox's snapshot on success and deleted on any failure. ``runtime``
+        ("python" or "node") picks the base image (see :func:`select_image`) - a scan with
+        any JS/TS finding needs "node" for the WHOLE jail that verifies it.
         """
         if not _SCAN_ID_RE.match(scan_id):
             raise SandboxPathError("scan_id must match " + SCAN_ID_PATTERN)
@@ -1343,6 +1401,7 @@ class SandboxManager:
             scan_id=scan_id,
             snapshot=snapshot,
             created_at=datetime.now(tz=UTC),
+            image=select_image(self.config, runtime),
         )
         try:
             with self._lock:  # register first so concurrent creates count against the limit
@@ -1421,9 +1480,14 @@ class SandboxManager:
                 **extra,
             )
 
-        kwargs = builder_kwargs(config, scan_id=sandbox.scan_id, sandbox_id=sandbox.sandbox_id)
+        kwargs = builder_kwargs(
+            config,
+            scan_id=sandbox.scan_id,
+            sandbox_id=sandbox.sandbox_id,
+            image=sandbox.effective_image,
+        )
         try:
-            self.ensure_image(config.image)
+            self.ensure_image(sandbox.effective_image)
             container = self.client.containers.run(**kwargs)
         except SandboxError as exc:
             return failed(f"could not start the builder container: {exc}")

@@ -168,20 +168,23 @@ class ExecutorClient:
         return [SandboxInfo.model_validate(item) for item in data]
 
     # -- lifecycle ----------------------------------------------------------------
-    def create(self, scan_id: str, workspace_dir: Path) -> SandboxInfo:
-        """Pack ``workspace_dir`` and create a sandbox holding it."""
+    def create(self, scan_id: str, workspace_dir: Path, *, runtime: str = "python") -> SandboxInfo:
+        """Pack ``workspace_dir`` and create a sandbox holding it. ``runtime`` ("python" or
+        "node") picks the jail's base image - see ``select_image`` on the Executor side."""
         try:
             archive = pack_workspace(workspace_dir, max_bytes=self.max_archive_bytes)
         except ArchiveError as exc:
             raise ExecutorRequestError(413, str(exc)) from exc
-        return self.create_from_archive(scan_id, archive)
+        return self.create_from_archive(scan_id, archive, runtime=runtime)
 
-    def create_from_archive(self, scan_id: str, archive: bytes) -> SandboxInfo:
+    def create_from_archive(
+        self, scan_id: str, archive: bytes, *, runtime: str = "python"
+    ) -> SandboxInfo:
         response = self._request(
             "POST",
             "/sandboxes",
             content=archive,
-            params={"scan_id": scan_id},
+            params={"scan_id": scan_id, "runtime": runtime},
             headers={"Content-Type": "application/gzip"},
             timeout_s=max(self.timeout_s, 300.0),  # image pull + extraction can be slow
         )
@@ -302,9 +305,11 @@ class ExecutorClient:
 
     # -- convenience ----------------------------------------------------------------
     @contextmanager
-    def sandbox(self, scan_id: str, workspace_dir: Path) -> Iterator[SandboxHandle]:
+    def sandbox(
+        self, scan_id: str, workspace_dir: Path, *, runtime: str = "python"
+    ) -> Iterator[SandboxHandle]:
         """``with client.sandbox(...) as sbx:`` - destroyed on exit, even on error."""
-        info = self.create(scan_id, workspace_dir)
+        info = self.create(scan_id, workspace_dir, runtime=runtime)
         handle = SandboxHandle(client=self, info=info)
         try:
             yield handle

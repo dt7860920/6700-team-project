@@ -400,13 +400,17 @@ class FakeExecExecutor:
         self.docker = docker
         self.events: list[str] = []
         self.sandboxes: list[LocalExecSandbox] = []
+        self.runtimes: list[str] = []  # every `runtime` the verifier asked for, in order
 
     def health(self) -> ExecutorHealth:
         return ExecutorHealth(status="ok", docker=self.docker, active_sandboxes=0)
 
     @contextmanager
-    def sandbox(self, scan_id: str, workspace_dir: Path) -> Iterator[LocalExecSandbox]:
+    def sandbox(
+        self, scan_id: str, workspace_dir: Path, *, runtime: str = "python"
+    ) -> Iterator[LocalExecSandbox]:
         assert workspace_dir.is_dir(), f"workspace {workspace_dir} must exist when the jail opens"
+        self.runtimes.append(runtime)
         sbx = LocalExecSandbox(workspace_dir, sandbox_id=f"sbx_{scan_id}")
         self.sandboxes.append(sbx)
         self.events.append(f"create {scan_id}")
@@ -439,7 +443,9 @@ class FakeExecutor:
         )
 
     @contextmanager
-    def sandbox(self, scan_id: str, workspace_dir: Path) -> Iterator[LocalSandbox]:
+    def sandbox(
+        self, scan_id: str, workspace_dir: Path, *, runtime: str = "python"
+    ) -> Iterator[LocalSandbox]:
         if self.auth_fail:
             raise ExecutorAuthError("executor rejected the token: invalid bearer token")
         assert workspace_dir.is_dir(), f"workspace {workspace_dir} must exist when the jail opens"

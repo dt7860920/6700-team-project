@@ -14,7 +14,8 @@ the framework's own test client, and *how* to get past import-time dependencies 
 preconditions (login / session / role) so execution actually reaches the sink.
 
 Crucially this is NOT an answer key. It never contains the oracle's canary and never a
-pre-written exploit payload: it tells the prover to read ``os.environ["ONO_PAYLOAD"]`` and
+pre-written exploit payload: it tells the prover to read the ``ONO_PAYLOAD`` environment
+variable (``os.environ["ONO_PAYLOAD"]`` in Python, ``process.env.ONO_PAYLOAD`` in JS/TS) and
 place it where attacker input enters, and to drive the real request path. The oracle still
 picks the canary at verify time and still requires the flagged line to be on the call stack
 with the canary in the sink's dangerous argument, so a cheating PoC is rejected exactly as
@@ -37,6 +38,21 @@ _PY_FRAMEWORK_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("aiohttp", ("aiohttp", "web.Application", "web.RouteTableDef")),
 )
 _JS_FRAMEWORK_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (
+        "nestjs",
+        ("@nestjs/common", "@controller(", "@injectable(", "@get(", "@post(", "nestfactory"),
+    ),
+    (
+        "next",
+        (
+            "next/server",
+            "nextresponse",
+            "getserversideprops",
+            "export default function handler",
+            "pages/api",
+            "app/api/",
+        ),
+    ),
     ("express", ("express(", "require('express')", 'require("express")', "app.get(", "app.post(")),
 )
 
@@ -82,6 +98,19 @@ reached. Satisfy it rather than giving up:
   - wrap the whole drive in try/except: the oracle records AT the sink call, so an error
     that happens AFTER the sink (a bad-SQL error, a missing file) does not matter."""
 
+_IMPORT_STUB_RECIPE_JS = """\
+Handle import-time (require-time) dependencies FIRST. Requiring the app often runs
+module-level code that needs an env var, a secret or a service the jail does not have,
+throwing before the sink is reached. Satisfy it rather than giving up:
+  - a required env var:  process.env.THE_VAR = process.env.THE_VAR || "x";  BEFORE the
+    require() of the app module
+  - a module-level client (DB, etc.): overwrite the exported constructor/function on the
+    cached module object before requiring the app, e.g.
+      const db = require('some-db-client'); db.connect = () => ({ query: () => {} });
+    or: require.cache[require.resolve('some-db-client')] = { exports: { ... } };
+  - wrap the drive in try/catch: the oracle records AT the sink call, so an error that
+    happens AFTER the sink (a bad-SQL error, a missing file) does not matter."""
+
 _GENERIC_SCAFFOLD = """\
 Generic front-controller / handler drive (works without a framework test client):
   import os
@@ -92,6 +121,28 @@ Generic front-controller / handler drive (works without a framework test client)
   token = handle({"path": "/login", "args": {"username": "...", "password": "..."}})
   # 2) drive the vulnerable route, putting the payload where attacker input enters
   handle({"path": "<vulnerable route>", "token": token, "args": {"<field>": payload}})"""
+
+_GENERIC_SCAFFOLD_JS = """\
+Generic Express/Node drive with NO extra packages (works even when the target declares no
+test-only dependencies like supertest): start the app's own exported `app` on an EPHEMERAL
+loopback port and issue a real request to it with Node's built-in `http` module - this is
+exactly what `supertest` does internally, so it works whether or not supertest is installed.
+The jail blocks all egress EXCEPT loopback, so this always works:
+  const http = require('http');
+  process.env.THE_VAR = process.env.THE_VAR || "x";   // satisfy import-time config first
+  const app = require('<module>');                     // the exported Express app/router
+  const payload = process.env.ONO_PAYLOAD;
+  const srv = app.listen(0, '127.0.0.1', () => {
+    const port = srv.address().port;
+    // 1) satisfy any precondition the route checks (a header, a cookie, a prior request)
+    // 2) drive the vulnerable route, putting the payload where attacker input enters
+    http.get({ hostname: '127.0.0.1', port, path: '/search?q=' + encodeURIComponent(payload),
+               headers: { /* e.g. 'x-api-key': '...' */ } },
+      (res) => { res.on('data', () => {}); res.on('end', () => srv.close()); }
+    ).on('error', () => srv.close());
+  });
+If `supertest` IS declared by the target (check package.json), `require('supertest')(app).get(...)`
+is a shorter equivalent - use whichever is available."""
 
 _FRAMEWORK_SCAFFOLDS: dict[str, str] = {
     "flask": """\
@@ -127,12 +178,39 @@ FastAPI / Starlette - use starlette.testclient.TestClient (no server, no network
 Starlette - starlette.testclient.TestClient(app) and GET/POST the vulnerable route with
 the payload in the query/body/header where attacker input enters.""",
     "express": """\
-Express (JS/TS) - driven with supertest against the exported app, e.g.
-  const request = require("supertest");
-  const app = require("./server");
+Express (JS/TS) - require the exported app and drive it on an ephemeral loopback port (or,
+if the target declares supertest, `require("supertest")(app).get(...)`):
+  const request = require("supertest");   // only if package.json declares it
+  const app = require("./server");        // the module exporting the Express app
   await request(app).get("/run").query({ host: process.env.ONO_PAYLOAD });
-NOTE: the dynamic sink oracle is Python-only for now, so a JS finding is reported honestly
-as 'skipped', not proven. This scaffold is for completeness / future work.""",
+See the generic Node drive below for the no-supertest form (always works).""",
+    "nestjs": """\
+NestJS - bootstrap the app with NestFactory and drive it the same way as Express (Nest sits
+on top of Express/Fastify under the hood):
+  const { NestFactory } = require('@nestjs/core');
+  const { AppModule } = require('./app.module');     // or wherever the root module lives
+  (async () => {
+    const app = await NestFactory.create(AppModule);
+    await app.init();
+    const server = app.getHttpServer();
+    server.listen(0, '127.0.0.1', () => {
+      const port = server.address().port;
+      const http = require('http');
+      http.get({ hostname: '127.0.0.1', port, path: '/<route>?q=' +
+        encodeURIComponent(process.env.ONO_PAYLOAD) }, (res) => { res.on('end', () => {}); });
+    });
+  })();""",
+    "next": """\
+Next.js API route - the handler is usually a plain `(req, res) => {...}` (pages/api) or a
+Request/Response-based function (app/api/.../route.js); import and call it directly with a
+minimal mock request/response rather than running the whole `next` server:
+  const handler = require('./pages/api/<route>').default;
+  const payload = process.env.ONO_PAYLOAD;
+  let body = '';
+  const req = { method: 'GET', query: { q: payload }, headers: {} };
+  const res = { status() { return this; }, json(v) { body = JSON.stringify(v); },
+                send(v) { body = String(v); }, setHeader() {} };
+  await handler(req, res);""",
 }
 
 
@@ -169,13 +247,18 @@ def _cwe_hint(cwe: str) -> str:
 
 def scaffold_for(finding: Finding, window_text: str) -> str:
     """The scaffold block injected into the prover's task prompt for this finding."""
+    is_js = not finding.file.endswith(".py")
     framework = detect_framework(finding, window_text)
     parts: list[str] = [
         "HOW TO REACH THE SINK (drive the application, do not call the sink yourself):",
         f"- Attacker entry point (drive THIS): {entry_hint(finding)}",
         f"- Flagged sink to reach: {finding.location} ({finding.cwe})",
+        "- Language: JavaScript/TypeScript - read the payload with process.env.ONO_PAYLOAD "
+        "and write the script for `node` (CommonJS require(), not ESM import)."
+        if is_js
+        else '- Language: Python - read the payload with os.environ["ONO_PAYLOAD"].',
         "",
-        _IMPORT_STUB_RECIPE,
+        _IMPORT_STUB_RECIPE_JS if is_js else _IMPORT_STUB_RECIPE,
         "",
     ]
     hint = _cwe_hint(finding.cwe)
@@ -186,5 +269,5 @@ def scaffold_for(finding: Finding, window_text: str) -> str:
         parts.append(f"Detected framework: {framework}.")
         parts.append(_FRAMEWORK_SCAFFOLDS[framework])
         parts.append("")
-    parts.append(_GENERIC_SCAFFOLD)
+    parts.append(_GENERIC_SCAFFOLD_JS if is_js else _GENERIC_SCAFFOLD)
     return "\n".join(parts)

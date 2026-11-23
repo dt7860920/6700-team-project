@@ -8,7 +8,8 @@ network with no ``ports:`` block - and every endpoint except ``/health`` require
 
     GET    /health                          liveness (no auth; reports Docker reachability)
     GET    /sandboxes                       list live sandboxes
-    POST   /sandboxes?scan_id=...           create: body = gzipped tar of the workspace
+    POST   /sandboxes?scan_id=...&runtime=  create: body = gzipped tar of the workspace;
+                                            runtime=python (default) or node (adds node/npm)
     GET    /sandboxes/{id}                  metadata
     DELETE /sandboxes/{id}                  destroy (teardown always succeeds)
     POST   /sandboxes/{id}/read             read a file / line range
@@ -32,7 +33,7 @@ import tempfile
 from collections.abc import AsyncIterator, Awaitable, Callable, MutableMapping
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.concurrency import run_in_threadpool
@@ -345,6 +346,13 @@ def create_executor_app(
         request: Request,
         manager: ManagerDep,
         scan_id: Annotated[str, Query(pattern=SCAN_ID_PATTERN, max_length=64)],
+        # A closed two-value choice, not an arbitrary string: FastAPI 422s anything else
+        # before this ever reaches select_image - the client can only pick between the two
+        # images THIS Executor was configured with, never name an image of its own.
+        runtime: Annotated[
+            Literal["python", "node"],
+            Query(description="Jail base image: python (default) or node (adds node/npm)."),
+        ] = "python",
     ) -> SandboxInfo:
         # The body goes straight to a file in the snapshot directory, one chunk at a
         # time, with the byte cap enforced as it streams: the Executor's RAM never holds
@@ -368,7 +376,9 @@ def create_executor_app(
             with contextlib.suppress(OSError):
                 spool.unlink()
             raise
-        sandbox = await run_in_threadpool(manager.create_from_archive, scan_id, spool)
+        sandbox = await run_in_threadpool(
+            manager.create_from_archive, scan_id, spool, runtime=runtime
+        )
         return sandbox.info()
 
     @app.get(

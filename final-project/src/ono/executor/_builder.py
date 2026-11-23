@@ -30,9 +30,11 @@ member names, and the unit tests exercise the parsers directly.
 from __future__ import annotations
 
 import configparser
+import contextlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -85,6 +87,7 @@ def manifest_kind(rel: str) -> str | None:
         "setup.cfg": "setup_cfg",
         "setup.py": "setup_py",
         "Pipfile": "pipfile",
+        "package.json": "package_json",
     }.get(name)
 
 
@@ -93,7 +96,11 @@ _PROJECT_MANIFESTS = {
     "setup.cfg": "setup_cfg",
     "setup.py": "setup_py",
     "Pipfile": "pipfile",
+    "package.json": "package_json",
 }
+
+NODE_LOCKFILES = ("package-lock.json", "npm-shrinkwrap.json")
+"""Presence of either selects ``npm ci`` over ``npm install`` (see ``Build._install_node``)."""
 
 
 def basename_manifest_kind(name: str) -> str | None:
@@ -142,6 +149,32 @@ def nearest_manifests(root: str, sink_rel: str) -> list[str]:
             return found
         if not dirs:
             return []
+        dirs = dirs[:-1]
+
+
+def nearest_node_manifest(root: str, sink_rel: str) -> str | None:
+    """Walk UP from the sink file's directory to ``root`` for the CLOSEST ``package.json``.
+
+    Deliberately a separate walk from :func:`nearest_manifests` (which stops at the first
+    ancestor declaring ANY manifest, Python or Node): a full-stack repo's sink-nearest
+    directory may have a ``requirements.txt`` with no ``package.json`` while an ancestor
+    above it has the frontend's own ``package.json`` - this walk does not stop early just
+    because a Python manifest was found at a lower level.
+    """
+    rel = sink_rel.replace("\\", "/").strip("/")
+    parts = [p for p in rel.split("/") if p not in ("", ".")]
+    dirs = parts[:-1]
+    while True:
+        rel_dir = "/".join(dirs)
+        candidate = (
+            os.path.join(root, rel_dir, "package.json")
+            if rel_dir
+            else os.path.join(root, "package.json")
+        )
+        if os.path.isfile(candidate):
+            return f"{rel_dir}/package.json" if rel_dir else "package.json"
+        if not dirs:
+            return None
         dirs = dirs[:-1]
 
 
@@ -691,9 +724,23 @@ class Build:
             for rel in nearest_manifests(self.src, sink):
                 if rel not in near_manifests and rel not in root_manifests:
                     near_manifests.append(rel)
+        # Node: a SEPARATE nearest-package.json walk (see nearest_node_manifest's docstring)
+        # falling back to a root package.json; at most one package.json is installed.
+        node_manifest: str | None = None
+        for sink in self.near:
+            node_manifest = nearest_node_manifest(self.src, sink)
+            if node_manifest is not None:
+                break
+        if node_manifest is None and "package.json" in root_manifests:
+            node_manifest = "package.json"
         self.manifests = near_manifests + [m for m in root_manifests if m not in near_manifests]
+        if node_manifest is not None and node_manifest not in self.manifests:
+            self.manifests.append(node_manifest)
         if not self.manifests:
             return self.result(started, status="skipped")
+
+        if node_manifest is not None:
+            self._install_node(node_manifest)
 
         sets: list[InstallSet] = []
         for rel in near_manifests:
@@ -715,7 +762,7 @@ class Build:
                     else ("pyproject.toml (built metadata)")
                 )
                 sets.insert(0, InstallSet(label, args=reqs, requirements=reqs, primary=True))
-        if not sets:
+        if not sets and node_manifest is None:
             self.error = "no installable dependency declaration found in " + ", ".join(
                 self.manifests
             )
@@ -736,6 +783,71 @@ class Build:
             self.error = "nothing could be installed: " + "; ".join(self.failed)[:600]
             return self.result(started, status="failed")
         return self.result(started, status="provisioned")
+
+    def _install_node(self, rel: str) -> None:
+        """``npm ci`` (a lockfile is present) else ``npm install``, in the package.json's OWN
+        directory, then move the resulting ``node_modules`` into the shared ``site`` output -
+        the exact same tar that ships Python's ``--target`` output into the jail's ``/deps``,
+        so Node resolves it via ``NODE_PATH=/deps/node_modules`` (see ``sandbox.py``). Best
+        effort and never raises: a failure is recorded in ``failed``/``warnings``, never
+        fatal to the python side of the same build.
+        """
+        rel_dir = os.path.dirname(rel)
+        work_dir = os.path.join(self.src, rel_dir) if rel_dir else self.src
+        has_lock = any(os.path.isfile(os.path.join(work_dir, name)) for name in NODE_LOCKFILES)
+        label = f"{rel} (npm {'ci' if has_lock else 'install'})"
+        ok, output = self._npm_install(work_dir, ci=has_lock)
+        if not ok and has_lock:
+            # `npm ci` is strict about a lockfile matching package.json; a stale lockfile in
+            # an otherwise-fine repo should not cost the app its dependencies entirely.
+            label = f"{rel} (npm install, after ci failed)"
+            ok, output2 = self._npm_install(work_dir, ci=False)
+            output += "\n" + output2
+        if not ok:
+            self.failed.append(f"{rel} (npm): {_last_line(output)}")
+            return
+        node_modules = os.path.join(work_dir, "node_modules")
+        if not os.path.isdir(node_modules):
+            self.failed.append(f"{rel} (npm): npm reported success but no node_modules exists")
+            return
+        dest = os.path.join(self.site, "node_modules")
+        if os.path.isdir(dest):
+            shutil.rmtree(dest)
+        try:
+            shutil.move(node_modules, dest)
+        except OSError as exc:
+            self.failed.append(f"{rel} (npm): could not collect node_modules: {exc}")
+            return
+        _strip_node_modules_symlinks(dest)
+        self.installed_from.append(label)
+
+    def _npm_install(self, work_dir: str, *, ci: bool) -> tuple[bool, str]:
+        remaining = self.remaining()
+        if remaining <= 0:
+            return False, "build timed out before npm could run"
+        cmd = [
+            "npm",
+            "ci" if ci else "install",
+            "--no-audit",
+            "--no-fund",
+            "--loglevel=error",
+        ]
+        try:
+            proc = subprocess.run(  # fixed argv, no shell
+                cmd,
+                cwd=work_dir,
+                capture_output=True,
+                text=True,
+                timeout=max(1.0, remaining),
+                check=False,
+                errors="replace",
+            )
+        except subprocess.TimeoutExpired as exc:
+            out = exc.stdout if isinstance(exc.stdout, str) else ""
+            return False, out + "\nnpm timed out"
+        except FileNotFoundError:
+            return False, "npm is not available in this builder image"
+        return proc.returncode == 0, (proc.stdout or "") + (proc.stderr or "")
 
     def _build_into(self, sets: list[InstallSet], rel: str) -> None:
         """A nearest manifest (setup.py / dynamic pyproject) whose metadata must be built."""
@@ -767,7 +879,11 @@ class Build:
             "status": status,
             "manifests": self.manifests,
             "installed_from": self.installed_from,
-            "installed": installed_packages(self.site) if status == "provisioned" else [],
+            "installed": (
+                installed_packages(self.site) + installed_node_packages(self.site)
+                if status == "provisioned"
+                else []
+            ),
             "failed": self.failed,
             "relaxed": self.relaxed,
             "warnings": self.warnings,
@@ -791,6 +907,73 @@ def dir_size(root: str) -> int:
             except OSError:
                 continue
     return total
+
+
+def _strip_node_modules_symlinks(node_modules: str) -> None:
+    """Remove every symlink under a freshly-installed ``node_modules`` (CLI shims in
+    ``.bin/`` - themselves symlinks to a package's own script - are the common case, but
+    any stray symlink is removed the same way). The workspace-archive validator this
+    builder's output goes through (shared with every snapshot, see ``archive.py``) rejects
+    symlink members outright; `require()` never needs them, only a shell invoking a
+    package's CLI binary would, which nothing in the jail or the oracle ever does.
+    """
+    for dirpath, dirnames, filenames in os.walk(node_modules, topdown=True):
+        if os.path.basename(dirpath) == ".bin":
+            shutil.rmtree(dirpath, ignore_errors=True)
+            dirnames[:] = []  # already removed; do not descend into it
+            continue
+        for name in [*dirnames, *filenames]:
+            full = os.path.join(dirpath, name)
+            if os.path.islink(full):
+                if name in dirnames:
+                    dirnames.remove(name)
+                with contextlib.suppress(OSError):
+                    os.remove(full)
+
+
+def installed_node_packages(site: str) -> list[str]:
+    """``name version`` for every top-level (and scoped ``@org/name``) package under
+    ``<site>/node_modules`` - the npm sibling of :func:`installed_packages`."""
+    found: list[str] = []
+    node_modules = os.path.join(site, "node_modules")
+    try:
+        entries = sorted(os.listdir(node_modules))
+    except OSError:
+        return found
+    for entry in entries:
+        if entry.startswith("."):
+            continue
+        path = os.path.join(node_modules, entry)
+        if not os.path.isdir(path):
+            continue
+        if entry.startswith("@"):
+            try:
+                scoped = sorted(os.listdir(path))
+            except OSError:
+                continue
+            for sub in scoped:
+                found_pkg = _node_package_name_version(os.path.join(path, sub), f"{entry}/{sub}")
+                if found_pkg:
+                    found.append(found_pkg)
+            continue
+        found_pkg = _node_package_name_version(path, entry)
+        if found_pkg:
+            found.append(found_pkg)
+    return found
+
+
+def _node_package_name_version(package_dir: str, fallback_name: str) -> str | None:
+    pkg_path = os.path.join(package_dir, "package.json")
+    try:
+        with open(pkg_path, encoding="utf-8", errors="replace") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    name = str(data.get("name") or fallback_name)
+    version = str(data.get("version") or "")
+    return f"{name} {version}".strip()
 
 
 def installed_packages(site: str) -> list[str]:

@@ -349,7 +349,7 @@ class FakeDocker:
             with tarfile.open(fileobj=stdin, mode="r:gz") as tar:
                 tar.extractall(dest, filter="data")
             return 0, b"", b""
-        if cmd[0] == "tar" and "-cz" in cmd:  # the builder's output leaves as a tar
+        if cmd[0] == "tar" and any(a in ("-cz", "-czh") for a in cmd):  # the builder's output
             src = self.container_dir(cid, cmd[cmd.index("-C") + 1])
             buf = io.BytesIO()
             with tarfile.open(fileobj=buf, mode="w:gz") as tar:
