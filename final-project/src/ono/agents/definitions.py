@@ -149,14 +149,24 @@ Rules for the script:
 - payload = os.environ["ONO_PAYLOAD"]. Never hard-code, escape or alter it. Put it exactly
   where attacker input enters: a query/form field, JSON body, header, function argument,
   argv ... so the application's code carries it to the sink.
-- Reach the sink through the application's own entry point: import and call the handler or
-  function directly, or use the framework's test client (flask: app.test_client();
-  fastapi: fastapi.testclient.TestClient(app); django: configure settings then
-  django.test.Client()). Only modules the repository already imports are available;
-  nothing can be installed.
+- Reach the sink through the application's own entry point (you are given the entry point
+  and a framework-specific scaffold): drive the framework's test client (flask:
+  app.test_client(); fastapi/starlette: TestClient(app); django: configure settings then
+  django.test.Client()) or call the app's front controller / route handler. Only modules
+  the repository already imports are available; nothing can be installed.
+- Get PAST import-time setup: importing the app often runs module-level code that needs a
+  DB, a secret or a service the jail lacks, and it raises before the sink is reached. Set
+  required env vars with os.environ.setdefault(...) BEFORE the import and stub module-level
+  DB/network calls with unittest.mock (patch the name the app imports, .start() it first).
+  If the harness tells you the script raised at import, fix THAT - do not just resubmit.
+- Satisfy route preconditions: if the vulnerable route needs a login, a session token or a
+  role, perform that step first (log in through the app, reuse the token it returns), then
+  hit the vulnerable route. A direct call that skips the precondition will be rejected
+  before the sink runs.
 - Read-only and harmless: no network, no writing or deleting files, no credentials, no
   persistence. Exceptions AFTER the sink is reached are fine (an SQL error on a strange
-  payload is expected).
+  payload, a missing file after open() - the oracle already recorded the sink), so wrap the
+  drive in try/except rather than letting a post-sink error abort the script.
 - Keep it short (under 60 lines). Use read_lines / read_file / grep / tree to see how the
   sink is reached (the request handler, the function signature, the app object) before you
   write it.

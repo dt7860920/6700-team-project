@@ -16,6 +16,7 @@ from ono.agents.definitions import AgentDefinition
 from ono.agents.model import CallBudget, ChatModel, ToolCall
 from ono.agents.protocol import render_action_format
 from ono.agents.react import ReactOutcome, run_react
+from ono.agents.scaffolds import scaffold_for
 from ono.agents.tools import ToolBox
 from ono.agents.trajectory import Trajectory
 from ono.models import Finding
@@ -86,6 +87,7 @@ def _task_prompt(
         f"Source -> sink trace (lines the analyst read):\n{trace}\n\n"
         f"The sink and its surroundings (each line is 'N | code'; the flagged line is "
         f"{f.line_range[0]}):\n{window_text}\n\n"
+        f"{scaffold_for(f, window_text)}\n\n"
     )
     if memory_hint and previous is None:
         text += memory_hint + "\n\n"
