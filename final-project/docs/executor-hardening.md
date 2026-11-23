@@ -10,6 +10,7 @@ it covers the four review findings that are deployment decisions rather than cod
 | H2 no user-namespace remapping | #93 | how to enable `userns-remap` and verify the jails under it | no (daemon setting) |
 | M1 single static bearer token | #94 | rotation procedure, `.env` hygiene, why the internal network is load-bearing | no |
 | M2 seccomp | #95 | the shipped hardened profile (on by default), how to validate / disable / replace it | no |
+| the dependency builder | — | what the one network-enabled container can and cannot do, and how it is torn down | no |
 
 Nothing here is forced: the stock `docker compose up` behaves exactly as before.
 
@@ -218,7 +219,63 @@ host. If a target's test-suite needs something the profile blocks, you will see
 
 ---
 
-## 5. Related operational knobs from the same review
+## 5. The dependency BUILDER: the one container with a network
+
+Proving a finding in a real framework app needs that app to *import* inside the verifier's
+jail, and the jail is `network_mode=none` on purpose, so the target's declared Python
+dependencies are installed in a **separate, ephemeral builder container**
+(`builder_kwargs()` in `src/ono/executor/sandbox.py`) and shipped into the jail as files.
+Installing an untrusted repository's dependencies **executes its code** (`setup.py`, PEP 517
+build backends, a malicious package's own install hooks), so everything about the builder
+is designed around "this process is hostile and must be allowed exactly one thing: fetch
+packages".
+
+What the builder can do:
+
+* reach the package index (`SANDBOX_DEPS_INDEX_URL`, PyPI by default) over the daemon's
+  default bridge network - the only hardening flag that differs from a jail;
+* write into two bounded tmpfs mounts: `/build` (the workspace snapshot under `/build/src`,
+  the `pip install --target` directory under `/build/site`) and `/tmp` (pip's scratch);
+* run for at most `SANDBOX_DEPS_TIMEOUT_S` seconds (`timeout -s KILL` inside, a socket
+  deadline outside) and produce at most `SANDBOX_DEPS_MAX_MB` of installed packages.
+
+What it cannot do - identical to the jail: it runs as uid 10001 under a keeper PID 1 (uid
+10002), `cap_drop=ALL`, `no-new-privileges`, the same seccomp profile, read-only rootfs,
+`nosuid,nodev` mounts, the same memory (`SANDBOX_MEM_MB`, swap off), CPU and PID caps,
+`oom_score_adj=1000`, no host bind mounts, no devices, no ports, and **never the Docker
+socket**. Its only output is `/build/site`, which the Executor tars out under the size cap
+and validates with the same rules as a workspace upload (no absolute or `..` names, no
+symlinks or special files, bounded expansion) before extracting it into the jail's `/deps`
+as the *keeper* uid - so the inmate can import the packages but not modify them. The
+jail's own flags are unchanged: it stays `network_mode=none`.
+
+Lifecycle: the builder is force-removed when the build ends, on every path (success,
+failure, timeout, or the sandbox's own `destroy()` - teardown wins over an in-flight build).
+It carries `ono.sandbox=1` + `ono.builder=1` and an `ono.ttl_s` label of
+`2 x SANDBOX_DEPS_TIMEOUT_S + 180`, so if the Executor dies mid-build the sweeper removes
+the orphan on *that* TTL rather than the jail's 30 minutes.
+
+pip: the version pinned in `SANDBOX_IMAGE` (never upgraded), `--no-cache-dir`,
+`--no-compile`, `--no-input`, `--prefer-binary`, `PIP_DISABLE_PIP_VERSION_CHECK=1`. The
+slim image has no compiler, so a package that only ships as a C-extension sdist fails to
+build; the installer then falls back to one requirement at a time (a failed pin is retried
+by bare name) and reports exactly which lines did not install - the rest still ship.
+
+Verify on your daemon:
+
+```bash
+ONO_DOCKER_TESTS=1 uv run pytest -m docker -q tests/test_executor_docker.py -k "builder or provision"
+ONO_DOCKER_TESTS=1 uv run pytest -m docker -q tests/test_verifier_fixtures_docker.py   # before/after prove-rate
+```
+
+Turning it off: `SANDBOX_DEPS_ENABLED=false` (the Executor then answers `disabled` and the
+verifier runs the stdlib-only jail, i.e. the behaviour before this phase existed). For an
+air-gapped host, point `SANDBOX_DEPS_INDEX_URL` at an internal mirror; the builder has no
+other reason to talk to anything.
+
+---
+
+## 6. Related operational knobs from the same review
 
 * **`SANDBOX_SNAPSHOT_DIR`** (#96): uploads are streamed to disk and each live sandbox's
   reset snapshot is a file, not process memory. Retained bytes are bounded by

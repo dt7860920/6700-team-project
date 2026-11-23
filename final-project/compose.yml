@@ -98,6 +98,11 @@ services:
       SANDBOX_PIDS_LIMIT: ${SANDBOX_PIDS_LIMIT:-256}
       SANDBOX_CMD_TIMEOUT_S: ${SANDBOX_CMD_TIMEOUT_S:-300}
       SANDBOX_TTL_S: ${SANDBOX_TTL_S:-1800}
+      # Dependency provisioning: the one ephemeral container WITH network (pip), hardened like
+      # a jail otherwise; its output is shipped read-only into the network-less verifier jail.
+      SANDBOX_DEPS_ENABLED: ${SANDBOX_DEPS_ENABLED:-true}
+      SANDBOX_DEPS_TIMEOUT_S: ${SANDBOX_DEPS_TIMEOUT_S:-300}
+      SANDBOX_DEPS_MAX_MB: ${SANDBOX_DEPS_MAX_MB:-256}
     volumes:
       # PRIVILEGE: the host Docker socket. This is the one place in the stack it appears.
       # The Executor needs it to create/exec/destroy the jailed target containers; the

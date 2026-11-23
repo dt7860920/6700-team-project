@@ -4,9 +4,13 @@ It mimics exactly the surface :mod:`ono.executor.sandbox` uses - ``containers.ru
 ``containers.list``, ``images.get/pull``, ``api.exec_create/exec_start/exec_inspect/
 inspect_container/remove_container``, ``ping`` - and is realistic where it matters:
 
-* the ``tar -x`` exec really extracts the uploaded archive into a temp "workspace";
+* the ``tar -x`` exec really extracts the uploaded archive into a temp "workspace"
+  (``-C /workspace``, ``-C /deps`` and ``-C /build/src`` map to per-container directories);
 * ``python3 -I -S -c <guest> ...`` execs run the real in-jail helper against it;
 * ``timeout ... sh -c <cmd>`` execs are routed to a programmable handler;
+* the BUILDER's execs run the real :mod:`ono.executor._builder` installer against the
+  extracted snapshot with a *fake pip* (``pip_handler``) that lays down ``<name>/`` +
+  ``<name>.dist-info`` for every requirement, then ``tar -cz`` the fake site dir out;
 * the exec socket speaks Docker's multiplexed frame protocol, lazily, so stdin
   written by the sandbox layer is seen by the fake "process".
 """
@@ -17,6 +21,7 @@ import contextlib
 import hashlib
 import io
 import json
+import shutil
 import struct
 import tarfile
 import tempfile
@@ -27,9 +32,11 @@ from typing import IO, Any
 import docker.errors
 import requests
 
-from ono.executor import _guest
+from ono.executor import _builder, _guest
 
 RunHandler = Callable[[str], tuple[int, bytes, bytes]]
+PipHandler = Callable[[list[str], Path], tuple[int, str]]
+"""``(pip args after 'install', site dir) -> (exit code, output)`` - the fake pip."""
 
 
 def frame(stream: int, payload: bytes) -> bytes:
@@ -157,6 +164,8 @@ class _Containers:
         )
         self.docker.live[cid] = container
         self.docker.workspaces[cid] = self.docker.new_workspace(cid)
+        if kwargs.get("labels", {}).get("ono.builder") == "1":
+            self.docker.builders.append(cid)
         return container
 
     def list(self, all: bool = False, filters: dict[str, str] | None = None) -> list[FakeContainer]:
@@ -239,9 +248,15 @@ class FakeDocker:
         self.removed: list[str] = []
         self.pulled: list[str] = []
         self.missing_images: set[str] = set()
+        self.builders: list[str] = []  # ids of every builder container ever started
         self.oom_kills = 0
         # knobs
         self.run_handler: RunHandler = lambda cmd: (0, f"ran: {cmd}\n".encode(), b"")
+        self.pip_handler: PipHandler = self.fake_pip
+        self.pip_fail: set[str] = set()  # requirement names the fake pip refuses
+        self.pip_fail_all = False
+        self.pip_package_bytes = 64  # size of each fake package's __init__.py
+        self.build_result_override: str | None = None  # raw stdout of the builder exec
         self.run_error: Exception | None = None
         self.pull_error: Exception | None = None
         self.remove_error: Exception | None = None
@@ -260,12 +275,52 @@ class FakeDocker:
         return True
 
     def new_workspace(self, cid: str) -> Path:
-        ws = self.root / cid[:4]
+        ws = self.root / cid[:4] / "workspace"
         ws.mkdir(parents=True, exist_ok=True)
         return ws
 
     def workspace(self, container_id: str) -> Path:
         return self.workspaces[container_id]
+
+    def container_dir(self, container_id: str, path: str) -> Path:
+        """The host directory standing in for ``path`` inside the fake container."""
+        return self.workspaces[container_id].parent / path.strip("/")
+
+    def deps_dir(self, container_id: str) -> Path:
+        return self.container_dir(container_id, "/deps")
+
+    # -- the fake pip -----------------------------------------------------------
+    def fake_pip(self, args: list[str], site: Path) -> tuple[int, str]:
+        """Lay down a fake package per requirement; refuse the ones in ``pip_fail``."""
+        if self.pip_fail_all:
+            return 1, "ERROR: fake pip refuses everything\n"
+        reqs: list[str] = []
+        i = 0
+        while i < len(args):
+            if args[i] == "-r":
+                reqs.extend(_builder.requirement_lines(args[i + 1]))
+                i += 2
+                continue
+            reqs.append(args[i])
+            i += 1
+        for req in reqs:
+            name = _builder.requirement_name(req)
+            if name is None:
+                return 1, f"ERROR: fake pip cannot install {req!r}\n"
+            bare = name.split("[", 1)[0].lower().replace("-", "_")
+            if bare in self.pip_fail or (
+                _builder.is_pinned(req) and f"{bare}{_spec_of(req)}" in self.pip_fail
+            ):
+                return 1, f"ERROR: No matching distribution found for {req}\n"
+            pkg = site / bare
+            pkg.mkdir(parents=True, exist_ok=True)
+            (pkg / "__init__.py").write_text(
+                f"NAME = {bare!r}\nPAD = {'x' * self.pip_package_bytes!r}\n"
+            )
+            info = site / f"{bare}-1.0.dist-info"
+            info.mkdir(exist_ok=True)
+            (info / "METADATA").write_text(f"Name: {bare}\nVersion: 1.0\n")
+        return 0, "Successfully installed " + " ".join(reqs) + "\n"
 
     def add_orphan(self, cid: str, labels: dict[str, str], created: str) -> FakeContainer:
         container = FakeContainer(self, cid, labels, created)
@@ -284,12 +339,33 @@ class FakeDocker:
         exec_.stdin_sha256 = digest.hexdigest()
         stdin.seek(0)
         cmd = exec_.cmd
-        ws = self.workspaces[exec_.container_id]
-        if cmd[0] == "tar":
+        cid = exec_.container_id
+        ws = self.workspaces[cid]
+        if cmd[0] == "tar" and "-xz" in cmd:
             if self.tar_fails:
                 return 2, b"", b"tar: boom\n"
+            dest = self.container_dir(cid, cmd[cmd.index("-C") + 1])
+            dest.mkdir(parents=True, exist_ok=True)
             with tarfile.open(fileobj=stdin, mode="r:gz") as tar:
-                tar.extractall(ws, filter="data")
+                tar.extractall(dest, filter="data")
+            return 0, b"", b""
+        if cmd[0] == "tar" and "-cz" in cmd:  # the builder's output leaves as a tar
+            src = self.container_dir(cid, cmd[cmd.index("-C") + 1])
+            buf = io.BytesIO()
+            with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+                tar.add(src, arcname=".")
+            return 0, buf.getvalue(), b""
+        if cmd[0] == "sh" and cmd[2].startswith("mkdir -p /build/src"):  # into the builder
+            for sub in ("/build/src", "/build/site"):
+                self.container_dir(cid, sub).mkdir(parents=True, exist_ok=True)
+            with tarfile.open(fileobj=stdin, mode="r:gz") as tar:
+                tar.extractall(self.container_dir(cid, "/build/src"), filter="data")
+            return 0, b"", b""
+        if cmd[0] == "sh" and cmd[2].startswith("find /deps -mindepth 1 -delete"):
+            deps = self.deps_dir(cid)
+            if deps.exists():
+                shutil.rmtree(deps)
+            deps.mkdir(parents=True)
             return 0, b"", b""
         if cmd[0] == "python3" and cmd[1:4] == ["-I", "-S", "-c"]:
             assert cmd[4] == _guest_source(), "guest source must be shipped verbatim"
@@ -301,10 +377,32 @@ class FakeDocker:
             return (1, b"", b"nope\n") if self.reap_fails else (0, b"", b"")
         if cmd[0] == "sh" and "memory.events" in cmd[2]:
             return 0, f"low 0\nhigh 0\nmax 0\noom 0\noom_kill {self.oom_kills}\n".encode(), b""
+        if cmd[0] == "timeout" and cmd[4:7] == ["python3", "-I", "-c"]:  # the builder
+            assert cmd[7] == _builder_source(), "builder source must be shipped verbatim"
+            return self.perform_build(cid, json.loads(cmd[8]))
         if cmd[0] == "timeout":
             assert cmd[1:3] == ["-s", "KILL"] and cmd[4:6] == ["sh", "-c"]
             return self.run_handler(cmd[6])
         raise AssertionError(f"unexpected exec: {cmd}")
+
+    def perform_build(self, cid: str, config: dict[str, Any]) -> tuple[int, bytes, bytes]:
+        """Run the real installer against the fake builder dirs, pip replaced by the fake."""
+        if self.build_result_override is not None:
+            return 0, self.build_result_override.encode(), b""
+        site = self.container_dir(cid, str(config["site"]))
+        config = {
+            **config,
+            "src": str(self.container_dir(cid, str(config["src"]))),
+            "site": str(site),
+        }
+
+        def pip(args: list[str], _timeout_s: float) -> tuple[int, str]:
+            return self.pip_handler(args, site)
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = _builder.main([json.dumps(config)], pip=pip)
+        return code, out.getvalue().encode(), b""
 
     # -- assertions -------------------------------------------------------------
     def user_commands(self) -> list[str]:
@@ -320,3 +418,23 @@ def _guest_source() -> str:
     from ono.executor.sandbox import GUEST_SOURCE
 
     return GUEST_SOURCE
+
+
+def _builder_source() -> str:
+    from ono.executor.sandbox import BUILDER_SOURCE
+
+    return BUILDER_SOURCE
+
+
+def _spec_of(req: str) -> str:
+    """``flask==1.0`` -> ``==1.0`` (what ``pip_fail`` entries like ``flask==1.0`` match on)."""
+    match = _builder._NAME_RE.match(req.split(";", 1)[0])
+    return match.group(3).strip().replace(" ", "") if match and match.group(3) else ""
+
+
+def read_build_result(stdout: bytes) -> dict[str, Any]:
+    line = next(
+        ln for ln in reversed(stdout.decode().splitlines()) if ln.startswith(_builder.RESULT_MARKER)
+    )
+    data: dict[str, Any] = json.loads(line[len(_builder.RESULT_MARKER) :])
+    return data
