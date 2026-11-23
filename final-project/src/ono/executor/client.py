@@ -31,6 +31,7 @@ from ono.executor.models import (
     FileContent,
     GrepResult,
     PatchResult,
+    ProvisionResult,
     RunResult,
     SandboxInfo,
     TestRunResult,
@@ -52,6 +53,8 @@ log = logging.getLogger(__name__)
 
 _DEFAULT_TIMEOUT_S = 30.0
 _RUN_SLACK_S = 30.0  # request timeout for run() = command budget + this
+_PROVISION_DEFAULT_S = 300.0  # the server's default build budget (sandbox_deps_timeout_s)
+_PROVISION_SLACK_S = 240.0  # + two tar round-trips and the builder's start/teardown
 
 
 class ExecutorError(RuntimeError):
@@ -277,6 +280,21 @@ class ExecutorClient:
         )
         return TestRunResult.model_validate(response.json())
 
+    def provision(self, sandbox_id: str, timeout_s: float | None = None) -> ProvisionResult:
+        """Build the workspace's declared dependencies in the Executor's builder and ship
+        them into the jail. A failed build is a result (``status="failed"``), not an error."""
+        body: dict[str, Any] = {}
+        if timeout_s is not None:
+            body["timeout_s"] = timeout_s
+        # Build budget + extraction + archive round-trips: generous, the server caps it.
+        response = self._request(
+            "POST",
+            f"/sandboxes/{sandbox_id}/provision",
+            json=body,
+            timeout_s=(timeout_s or _PROVISION_DEFAULT_S) + _PROVISION_SLACK_S,
+        )
+        return ProvisionResult.model_validate(response.json())
+
     # -- convenience ----------------------------------------------------------------
     @contextmanager
     def sandbox(self, scan_id: str, workspace_dir: Path) -> Iterator[SandboxHandle]:
@@ -324,6 +342,9 @@ class SandboxHandle:
 
     def run_tests(self, timeout_s: float | None = None) -> TestRunResult:
         return self.client.run_tests(self.sandbox_id, timeout_s)
+
+    def provision(self, timeout_s: float | None = None) -> ProvisionResult:
+        return self.client.provision(self.sandbox_id, timeout_s)
 
     def reset(self) -> SandboxInfo:
         self.info = self.client.reset(self.sandbox_id)

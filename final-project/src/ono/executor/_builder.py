@@ -1,0 +1,725 @@
+"""In-builder dependency installer: runs INSIDE the ephemeral BUILDER container.
+
+The Executor ships this module's *source text* into a hardened, network-enabled builder
+container (see ``sandbox.builder_kwargs``) and runs::
+
+    python3 -I -c "<this file>" '<json config>'
+
+with the target's validated workspace snapshot extracted under ``config["src"]``. It then
+
+1. **detects** the manifests the repository declares (``requirements*.txt``,
+   ``pyproject.toml`` PEP 621 / poetry, ``setup.cfg``, ``setup.py``, ``Pipfile``);
+2. turns them into ``pip install`` argument sets - a *primary* set (what the app needs to
+   import) and *secondary*, best-effort sets (dev / test extras, other requirement files);
+3. runs ``pip install --target <site>`` for each set under the remaining wall-clock budget,
+   falling back to one requirement at a time when a whole file fails (one unbuildable pin
+   must not cost the framework the app imports), then relaxing a failed *pinned* line to
+   its bare name (a modern wheel usually still makes the app importable);
+4. measures the installed size against the cap and prints ONE line
+   ``ONO_BUILD_RESULT <json>`` describing what was installed, what failed, and why.
+
+Everything here runs as an unprivileged user with no host mounts and no Docker socket; the
+only artefact that leaves the builder is the ``<site>`` directory, tarred by the Executor
+and validated like any workspace archive before it reaches a verification jail.
+
+Stdlib only. Python >= 3.11 for ``tomllib`` (the builder image is pinned to 3.13); must stay
+importable on the host - the Executor imports :func:`manifest_kind` to scan a snapshot's
+member names, and the unit tests exercise the parsers directly.
+"""
+
+from __future__ import annotations
+
+import configparser
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+import tomllib
+from collections.abc import Callable
+from typing import Any
+
+RESULT_MARKER = "ONO_BUILD_RESULT "
+PRIMARY_REQUIREMENTS = "requirements.txt"
+_REQ_FILE = re.compile(r"^requirements[A-Za-z0-9._-]*\.txt$")
+_SKIP_DIRS = frozenset({"node_modules", "venv", ".venv", "env", "build", "dist", "site-packages"})
+_EXTRA_KEYS = ("test", "tests", "testing", "dev", "develop", "development")
+_NAME_RE = re.compile(r"^\s*([A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?)(\[[^\]]*\])?\s*(.*)$")
+_PIN_RE = re.compile(r"^[<>=!~]")
+_MAX_NESTED_REQ = 3
+_OUTPUT_TAIL = 1200
+
+PipRunner = Callable[[list[str], float], tuple[int, str]]
+"""``(pip args after 'install', timeout_s) -> (exit code, combined output)``."""
+
+
+# ---------------------------------------------------------------------------
+# Manifest detection (shared with the Executor's snapshot scan)
+# ---------------------------------------------------------------------------
+
+
+def manifest_kind(rel: str) -> str | None:
+    """Classify a workspace-relative path as a dependency manifest, or ``None``.
+
+    Requirement files are accepted at the root and one directory down (``requirements/*.txt``,
+    ``backend/requirements.txt``); project manifests (``pyproject.toml``, ``setup.cfg``,
+    ``setup.py``, ``Pipfile``) only at the root, where they define the project. Hidden and
+    vendored directories never count.
+    """
+    parts = [p for p in rel.replace("\\", "/").split("/") if p not in ("", ".")]
+    if not parts or len(parts) > 2:
+        return None
+    if any(p.startswith(".") or p in _SKIP_DIRS for p in parts[:-1]):
+        return None
+    name = parts[-1]
+    if len(parts) == 2:
+        if _REQ_FILE.match(name) or (parts[0] == "requirements" and name.endswith(".txt")):
+            return "requirements"
+        return None
+    if _REQ_FILE.match(name):
+        return "requirements"
+    return {
+        "pyproject.toml": "pyproject",
+        "setup.cfg": "setup_cfg",
+        "setup.py": "setup_py",
+        "Pipfile": "pipfile",
+    }.get(name)
+
+
+def find_manifests(root: str) -> list[str]:
+    """Every manifest under ``root`` (relative paths, sorted, root files first)."""
+    found: list[str] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        rel_dir = os.path.relpath(dirpath, root)
+        depth = 0 if rel_dir == "." else rel_dir.count(os.sep) + 1
+        dirnames[:] = sorted(
+            d for d in dirnames if depth < 1 and not d.startswith(".") and d not in _SKIP_DIRS
+        )
+        for name in sorted(filenames):
+            rel = name if rel_dir == "." else os.path.join(rel_dir, name).replace(os.sep, "/")
+            if manifest_kind(rel) is not None:
+                found.append(rel)
+    return sorted(found, key=lambda r: (r.count("/"), r != PRIMARY_REQUIREMENTS, r))
+
+
+# ---------------------------------------------------------------------------
+# Manifest parsers (pure; no code from the repository is executed here)
+# ---------------------------------------------------------------------------
+
+
+class InstallSet:
+    """One ``pip install`` invocation: where the requirements came from and what to pass."""
+
+    __slots__ = ("args", "label", "primary", "requirements")
+
+    def __init__(
+        self, label: str, *, args: list[str], requirements: list[str], primary: bool
+    ) -> None:
+        self.label = label
+        self.args = args
+        self.requirements = requirements  # the individual lines, for the per-line fallback
+        self.primary = primary
+
+
+def _read(path: str) -> str:
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        return fh.read()
+
+
+def requirement_lines(path: str, _depth: int = 0) -> list[str]:
+    """The individual requirements of a pip requirements file (nested ``-r`` followed)."""
+    lines: list[str] = []
+    try:
+        text = _read(path)
+    except OSError:
+        return lines
+    for raw in text.splitlines():
+        line = raw.split(" #", 1)[0].split("\t#", 1)[0].strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith(("-r ", "--requirement ")) and _depth < _MAX_NESTED_REQ:
+            nested = os.path.join(os.path.dirname(path), line.split(None, 1)[1].strip())
+            lines.extend(requirement_lines(nested, _depth + 1))
+            continue
+        if line.startswith("-"):  # -c / --index-url / --hash options: pip-level, not a package
+            continue
+        lines.append(line.rstrip("\\").strip())
+    return lines
+
+
+def _poetry_spec(name: str, value: Any) -> str | None:
+    """A ``[tool.poetry.dependencies]`` entry as a PEP 508 string (``None`` = skip)."""
+    if isinstance(value, list):
+        value = value[0] if value else None
+    extras = ""
+    markers = ""
+    if isinstance(value, dict):
+        if value.get("optional") or any(k in value for k in ("git", "path", "url", "file")):
+            return None
+        if value.get("extras"):
+            extras = "[" + ",".join(str(e) for e in value["extras"]) + "]"
+        if value.get("markers"):
+            markers = "; " + str(value["markers"])
+        value = value.get("version", "*")
+    if not isinstance(value, str):
+        return None
+    return f"{name}{extras}{poetry_constraint(value)}{markers}"
+
+
+def poetry_constraint(spec: str) -> str:
+    """Poetry's ``^`` / ``~`` / bare-version constraints as PEP 440 specifiers."""
+    spec = spec.strip()
+    if spec in ("", "*"):
+        return ""
+
+    def parts_of(version: str) -> list[int]:
+        return [int(p) for p in version.split(".") if p.isdigit()]
+
+    if spec.startswith("^"):
+        version = spec[1:]
+        nums = parts_of(version)
+        if not nums:
+            return ""
+        upper = list(nums)
+        bump = next((i for i, n in enumerate(nums) if n != 0), len(nums) - 1)
+        upper[bump] += 1
+        for i in range(bump + 1, len(upper)):
+            upper[i] = 0
+        return f">={version},<{'.'.join(map(str, upper))}"
+    if spec.startswith("~") and not spec.startswith("~="):
+        version = spec[1:]
+        nums = parts_of(version)
+        if not nums:
+            return ""
+        upper = list(nums[:2]) if len(nums) >= 2 else [nums[0]]
+        upper[-1] += 1
+        return f">={version},<{'.'.join(map(str, upper))}"
+    if spec[0].isdigit():
+        return f"=={spec}"
+    return spec.replace(" ", "")
+
+
+def _pipfile_spec(name: str, value: Any) -> str | None:
+    extras = ""
+    if isinstance(value, dict):
+        if any(k in value for k in ("git", "path", "file", "url")):
+            return None
+        if value.get("extras"):
+            extras = "[" + ",".join(str(e) for e in value["extras"]) + "]"
+        value = value.get("version", "*")
+    if not isinstance(value, str):
+        return None
+    spec = value.strip()
+    return f"{name}{extras}" if spec in ("", "*") else f"{name}{extras}{spec}"
+
+
+def _toml(path: str) -> dict[str, Any] | None:
+    try:
+        with open(path, "rb") as fh:
+            return tomllib.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
+def _strings(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [v.strip() for v in value if isinstance(v, str) and v.strip()]
+
+
+def plan_pyproject(path: str) -> tuple[list[str] | None, list[InstallSet], list[str]]:
+    """``(primary requirements or None, secondary sets, warnings)`` from a pyproject.toml.
+
+    ``None`` as the primary means the file declares nothing static (no ``[project]``
+    dependencies, or ``dynamic = ["dependencies"]``) and the project must be *built* for
+    its metadata (:func:`build_metadata`).
+    """
+    data = _toml(path)
+    warnings: list[str] = []
+    if data is None:
+        return None, [], [f"{os.path.basename(path)}: not valid TOML (ignored)"]
+    secondary: list[InstallSet] = []
+    primary: list[str] | None = None
+    project = data.get("project")
+    if isinstance(project, dict):
+        if "dependencies" in project and "dependencies" not in _strings(project.get("dynamic")):
+            primary = _strings(project.get("dependencies"))
+        optional = project.get("optional-dependencies")
+        if isinstance(optional, dict):
+            for key in _EXTRA_KEYS:
+                reqs = _strings(optional.get(key))
+                if reqs:
+                    secondary.append(
+                        InstallSet(
+                            f"pyproject.toml [{key}]", args=reqs, requirements=reqs, primary=False
+                        )
+                    )
+    poetry = data.get("tool", {}).get("poetry") if isinstance(data.get("tool"), dict) else None
+    if isinstance(poetry, dict):
+        deps = poetry.get("dependencies")
+        if isinstance(deps, dict) and primary is None:
+            primary = [
+                spec
+                for name, value in deps.items()
+                if name.lower() != "python" and (spec := _poetry_spec(name, value)) is not None
+            ]
+        for group_name, group in (poetry.get("group") or {}).items():
+            group_deps = group.get("dependencies") if isinstance(group, dict) else None
+            if group_name in _EXTRA_KEYS and isinstance(group_deps, dict):
+                reqs = [s for n, v in group_deps.items() if (s := _poetry_spec(n, v)) is not None]
+                if reqs:
+                    secondary.append(
+                        InstallSet(
+                            f"pyproject.toml poetry group {group_name}",
+                            args=reqs,
+                            requirements=reqs,
+                            primary=False,
+                        )
+                    )
+        dev = poetry.get("dev-dependencies")
+        if isinstance(dev, dict):
+            reqs = [s for n, v in dev.items() if (s := _poetry_spec(n, v)) is not None]
+            if reqs:
+                secondary.append(
+                    InstallSet(
+                        "pyproject.toml poetry dev-dependencies",
+                        args=reqs,
+                        requirements=reqs,
+                        primary=False,
+                    )
+                )
+    return primary, secondary, warnings
+
+
+def plan_setup_cfg(path: str) -> tuple[list[str] | None, list[InstallSet]]:
+    parser = configparser.ConfigParser(interpolation=None)
+    try:
+        parser.read_string(_read(path))
+    except (OSError, configparser.Error):
+        return None, []
+    primary: list[str] | None = None
+    if parser.has_option("options", "install_requires"):
+        primary = _cfg_list(parser.get("options", "install_requires"))
+    secondary: list[InstallSet] = []
+    if parser.has_section("options.extras_require"):
+        for key in _EXTRA_KEYS:
+            if parser.has_option("options.extras_require", key):
+                reqs = _cfg_list(parser.get("options.extras_require", key))
+                if reqs:
+                    secondary.append(
+                        InstallSet(
+                            f"setup.cfg [{key}]", args=reqs, requirements=reqs, primary=False
+                        )
+                    )
+    return primary, secondary
+
+
+def _cfg_list(value: str) -> list[str]:
+    """A newline-separated setup.cfg list (``;`` stays: it introduces PEP 508 markers)."""
+    out: list[str] = []
+    for raw in value.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if line:
+            out.append(line)
+    return out
+
+
+def plan_pipfile(path: str) -> tuple[list[str] | None, list[InstallSet]]:
+    data = _toml(path)
+    if data is None:
+        return None, []
+    packages = data.get("packages")
+    primary = (
+        [s for n, v in packages.items() if (s := _pipfile_spec(n, v)) is not None]
+        if isinstance(packages, dict)
+        else None
+    )
+    secondary: list[InstallSet] = []
+    dev = data.get("dev-packages")
+    if isinstance(dev, dict):
+        reqs = [s for n, v in dev.items() if (s := _pipfile_spec(n, v)) is not None]
+        if reqs:
+            secondary.append(
+                InstallSet("Pipfile [dev-packages]", args=reqs, requirements=reqs, primary=False)
+            )
+    return primary, secondary
+
+
+def plan_installs(root: str, manifests: list[str]) -> tuple[list[InstallSet], list[str], bool]:
+    """Turn the detected manifests into ordered install sets.
+
+    Returns ``(sets, warnings, needs_build)``: ``needs_build`` is true when the project
+    declares no static dependency list but ships a ``setup.py`` / ``setup.cfg`` /
+    ``pyproject.toml`` whose metadata must be *built* to learn the dependencies.
+    """
+    sets: list[InstallSet] = []
+    warnings: list[str] = []
+    kinds = {m: manifest_kind(m) for m in manifests}
+    primary_done = False
+    needs_build = False
+
+    if PRIMARY_REQUIREMENTS in kinds:
+        path = os.path.join(root, PRIMARY_REQUIREMENTS)
+        sets.append(
+            InstallSet(
+                PRIMARY_REQUIREMENTS,
+                args=["-r", path],
+                requirements=requirement_lines(path),
+                primary=True,
+            )
+        )
+        primary_done = True
+
+    secondary: list[InstallSet] = []
+    if "pyproject.toml" in kinds:
+        primary, extra, notes = plan_pyproject(os.path.join(root, "pyproject.toml"))
+        warnings += notes
+        if primary is not None and not primary_done:
+            sets.append(
+                InstallSet("pyproject.toml", args=primary, requirements=primary, primary=True)
+            )
+            primary_done = True
+        elif primary is None and not primary_done:
+            needs_build = True
+        secondary += extra
+    if "setup.cfg" in kinds:
+        primary, extra = plan_setup_cfg(os.path.join(root, "setup.cfg"))
+        if primary is not None and not primary_done:
+            sets.append(InstallSet("setup.cfg", args=primary, requirements=primary, primary=True))
+            primary_done = True
+            needs_build = False
+        secondary += extra
+    if "Pipfile" in kinds:
+        primary, extra = plan_pipfile(os.path.join(root, "Pipfile"))
+        if primary is not None and not primary_done:
+            sets.append(InstallSet("Pipfile", args=primary, requirements=primary, primary=True))
+            primary_done = True
+            needs_build = False
+        secondary += extra
+    if "setup.py" in kinds and not primary_done:
+        needs_build = True
+
+    for rel, kind in kinds.items():
+        if kind == "requirements" and rel != PRIMARY_REQUIREMENTS:
+            path = os.path.join(root, rel)
+            secondary.append(
+                InstallSet(
+                    rel, args=["-r", path], requirements=requirement_lines(path), primary=False
+                )
+            )
+    sets.extend(secondary)
+    return sets, warnings, needs_build and not primary_done
+
+
+# ---------------------------------------------------------------------------
+# pip
+# ---------------------------------------------------------------------------
+
+
+def run_pip(site: str) -> PipRunner:
+    """The real pip, as a child process of this (isolated) interpreter."""
+
+    def runner(args: list[str], timeout_s: float) -> tuple[int, str]:
+        cmd = [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--target",
+            site,
+            "--no-cache-dir",
+            "--no-compile",
+            "--no-input",
+            "--disable-pip-version-check",
+            "--progress-bar",
+            "off",
+            "--prefer-binary",
+            "--no-warn-script-location",
+            *args,
+        ]
+        try:
+            proc = subprocess.run(  # fixed argv built above, no shell
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=max(1.0, timeout_s),
+                check=False,
+                errors="replace",
+            )
+        except subprocess.TimeoutExpired as exc:
+            out = exc.stdout if isinstance(exc.stdout, str) else ""
+            return 124, out + "\npip timed out"
+        return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+
+    return runner
+
+
+def build_metadata(root: str, timeout_s: float) -> tuple[list[str] | None, str]:
+    """Dependencies of a project that must be *built* to know them (``setup.py`` & co).
+
+    ``pip install --dry-run --report`` runs the project's build backend (arbitrary code -
+    which is exactly why this happens only inside the builder container) and reports the
+    built metadata; the ``Requires-Dist`` entries without an ``extra ==`` marker are the
+    install requirements. Nothing is installed by this step.
+    """
+    with tempfile.TemporaryDirectory(prefix="ono-meta-") as tmp:
+        report = os.path.join(tmp, "report.json")
+        cmd = [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--dry-run",
+            "--no-deps",
+            "--no-cache-dir",
+            "--no-input",
+            "--disable-pip-version-check",
+            "--progress-bar",
+            "off",
+            "--report",
+            report,
+            "--target",
+            os.path.join(tmp, "unused"),
+            root,
+        ]
+        try:
+            proc = subprocess.run(  # fixed argv, no shell
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=max(1.0, timeout_s),
+                check=False,
+                errors="replace",
+            )
+        except subprocess.TimeoutExpired:
+            return None, "building the project metadata timed out"
+        if proc.returncode != 0:
+            return None, "building the project metadata failed: " + _tail(
+                (proc.stdout or "") + (proc.stderr or "")
+            )
+        try:
+            with open(report, encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError) as exc:
+            return None, f"pip wrote no usable metadata report: {exc}"
+    items = data.get("install") if isinstance(data, dict) else None
+    if not isinstance(items, list) or not items:
+        return None, "pip reported no project metadata"
+    metadata = items[0].get("metadata") if isinstance(items[0], dict) else None
+    requires = metadata.get("requires_dist") if isinstance(metadata, dict) else None
+    return [r for r in _strings(requires) if "extra ==" not in r and "extra==" not in r], ""
+
+
+def _tail(text: str) -> str:
+    return text.strip()[-_OUTPUT_TAIL:]
+
+
+def requirement_name(line: str) -> str | None:
+    """``flask[async]>=2  ; python_version>'3'`` -> ``flask[async]``; ``None`` for URLs/paths."""
+    if "://" in line or line.startswith((".", "/", "-")) or "@" in line.split(";")[0]:
+        return None
+    match = _NAME_RE.match(line.split(";", 1)[0])
+    return match.group(1) + (match.group(2) or "") if match else None
+
+
+def is_pinned(line: str) -> bool:
+    match = _NAME_RE.match(line.split(";", 1)[0])
+    return bool(match and match.group(3) and _PIN_RE.match(match.group(3).strip()))
+
+
+# ---------------------------------------------------------------------------
+# The build
+# ---------------------------------------------------------------------------
+
+
+class Build:
+    """State of one dependency build: what was installed, what failed, the budget left."""
+
+    def __init__(self, config: dict[str, Any], pip: PipRunner | None = None) -> None:
+        self.src = str(config["src"])
+        self.site = str(config["site"])
+        self.max_bytes = int(config.get("max_bytes", 256_000_000))
+        self.deadline = time.monotonic() + float(config.get("timeout_s", 300.0))
+        self.pip = pip or run_pip(self.site)
+        self.manifests: list[str] = []
+        self.installed_from: list[str] = []
+        self.failed: list[str] = []
+        self.relaxed: list[str] = []
+        self.warnings: list[str] = []
+        self.error = ""
+
+    def remaining(self) -> float:
+        return self.deadline - time.monotonic()
+
+    def _install(self, args: list[str]) -> tuple[bool, str]:
+        if self.remaining() <= 0:
+            return False, "build timed out"
+        code, out = self.pip(args, self.remaining())
+        return code == 0, _tail(out)
+
+    def install_set(self, item: InstallSet) -> bool:
+        ok, out = self._install(item.args)
+        if ok:
+            self.installed_from.append(item.label)
+            return True
+        if self.remaining() <= 0 or "timed out" in out[-40:]:
+            self.error = f"build timed out while installing {item.label}"
+            return False
+        if "No space left" in out:
+            self.error = f"installed dependencies exceed the size cap ({self.max_bytes} bytes)"
+            return False
+        # One line at a time: a single unbuildable pin must not cost the rest of the file.
+        any_ok = False
+        for req in item.requirements:
+            if self.remaining() <= 0:
+                self.error = f"build timed out while installing {item.label}"
+                return any_ok
+            ok, line_out = self._install([req])
+            if ok:
+                any_ok = True
+                continue
+            name = requirement_name(req)
+            if name is not None and is_pinned(req):
+                ok, _ = self._install([name])
+                if ok:
+                    self.relaxed.append(req)
+                    any_ok = True
+                    continue
+            self.failed.append(f"{req} ({item.label}): {_last_line(line_out)}")
+        if any_ok:
+            self.installed_from.append(f"{item.label} (partial)")
+        elif item.primary and not item.requirements:
+            self.failed.append(f"{item.label}: {_last_line(out)}")
+        return any_ok
+
+    def run(self) -> dict[str, Any]:
+        started = time.perf_counter()
+        self.manifests = find_manifests(self.src)
+        if not self.manifests:
+            return self.result(started, status="skipped")
+        sets, warnings, needs_build = plan_installs(self.src, self.manifests)
+        self.warnings += warnings
+        if needs_build:
+            reqs, why = build_metadata(self.src, self.remaining())
+            if reqs is None:
+                self.warnings.append(why)
+            else:
+                label = (
+                    "setup.py (built metadata)"
+                    if "setup.py" in self.manifests
+                    else ("pyproject.toml (built metadata)")
+                )
+                sets.insert(0, InstallSet(label, args=reqs, requirements=reqs, primary=True))
+        if not sets:
+            self.error = "no installable dependency declaration found in " + ", ".join(
+                self.manifests
+            )
+            return self.result(started, status="failed")
+        for item in sets:
+            if not self.pip_ok(item):
+                break
+        if not self.error:
+            size = dir_size(self.site)
+            if size > self.max_bytes:
+                self.error = (
+                    f"installed dependencies are {size} bytes, above the cap of "
+                    f"{self.max_bytes} bytes"
+                )
+        if self.error:
+            return self.result(started, status="failed")
+        if not self.installed_from:
+            self.error = "nothing could be installed: " + "; ".join(self.failed)[:600]
+            return self.result(started, status="failed")
+        return self.result(started, status="provisioned")
+
+    def pip_ok(self, item: InstallSet) -> bool:
+        """Install one set; a failing *secondary* set is a warning, a primary one is reported."""
+        if not item.args:
+            return True
+        ok = self.install_set(item)
+        if self.error:
+            return False
+        if not ok and not item.primary:
+            self.warnings.append(f"{item.label}: could not be installed (optional)")
+        return True
+
+    def result(self, started: float, *, status: str) -> dict[str, Any]:
+        return {
+            "ok": status != "failed",
+            "status": status,
+            "manifests": self.manifests,
+            "installed_from": self.installed_from,
+            "installed": installed_packages(self.site) if status == "provisioned" else [],
+            "failed": self.failed,
+            "relaxed": self.relaxed,
+            "warnings": self.warnings,
+            "size_bytes": dir_size(self.site),
+            "duration_ms": (time.perf_counter() - started) * 1000,
+            "error": self.error,
+        }
+
+
+def _last_line(text: str) -> str:
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    return lines[-1][:200] if lines else "pip failed"
+
+
+def dir_size(root: str) -> int:
+    total = 0
+    for dirpath, _dirs, files in os.walk(root):
+        for name in files:
+            try:
+                total += os.lstat(os.path.join(dirpath, name)).st_size
+            except OSError:
+                continue
+    return total
+
+
+def installed_packages(site: str) -> list[str]:
+    """``name version`` for every ``*.dist-info`` in the target directory."""
+    found: list[str] = []
+    try:
+        entries = sorted(os.listdir(site))
+    except OSError:
+        return found
+    for entry in entries:
+        if not entry.endswith(".dist-info"):
+            continue
+        name = version = ""
+        try:
+            with open(
+                os.path.join(site, entry, "METADATA"), encoding="utf-8", errors="replace"
+            ) as fh:
+                for line in fh:
+                    if line.startswith("Name:"):
+                        name = line[5:].strip()
+                    elif line.startswith("Version:"):
+                        version = line[8:].strip()
+                    if name and version:
+                        break
+        except OSError:
+            continue
+        if name:
+            found.append(f"{name} {version}".strip())
+    return found
+
+
+def main(argv: list[str], pip: PipRunner | None = None) -> int:
+    if len(argv) < 1:
+        sys.stdout.write(RESULT_MARKER + json.dumps({"ok": False, "error": "usage: <json>"}) + "\n")
+        return 2
+    try:
+        config = json.loads(argv[0])
+        os.makedirs(config["site"], exist_ok=True)
+        result = Build(config, pip).run()
+    except Exception as exc:  # the builder itself failed: report, never hang
+        result = {"ok": False, "status": "failed", "error": f"{type(exc).__name__}: {exc}"}
+    sys.stdout.write(RESULT_MARKER + json.dumps(result, default=str) + "\n")
+    sys.stdout.flush()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -18,6 +18,8 @@ network with no ``ports:`` block - and every endpoint except ``/health`` require
     POST   /sandboxes/{id}/run              run a shell command (hard timeout, capped output)
     POST   /sandboxes/{id}/run_tests        detect + run the repo's test command
     POST   /sandboxes/{id}/reset            back to the clean snapshot (also revives a dead jail)
+    POST   /sandboxes/{id}/provision        build the repo's declared Python deps in an ephemeral
+                                            builder and ship them read-only into the jail
 """
 
 from __future__ import annotations
@@ -47,6 +49,8 @@ from ono.executor.models import (
     GrepResult,
     PatchRequest,
     PatchResult,
+    ProvisionRequest,
+    ProvisionResult,
     ReadRequest,
     RunRequest,
     RunResult,
@@ -466,6 +470,27 @@ def create_executor_app(
     def run_tests(sandbox: SandboxDep, body: TestRunRequest | None = None) -> TestRunResult:
         body = body or TestRunRequest()
         return sandbox.run_tests(body.timeout_s)
+
+    @app.post(
+        "/sandboxes/{sandbox_id}/provision",
+        response_model=ProvisionResult,
+        dependencies=AUTH,
+        tags=["operations"],
+        responses=_ERRORS,
+        summary="Build the workspace's declared dependencies and ship them into the jail",
+        description=(
+            "Detects `requirements*.txt` / `pyproject.toml` / `setup.cfg` / `setup.py` / "
+            "`Pipfile` in the snapshot, installs them with pip inside an **ephemeral, "
+            "hardened, network-enabled builder container** (non-root, no capabilities, "
+            "read-only rootfs, resource caps, no host mounts, no Docker socket, destroyed "
+            "afterwards) and extracts the result read-only into the jail's `/deps`. The jail "
+            "itself stays `network_mode=none`. Never fails the request for a failed build: "
+            "the result's `status` says `provisioned`, `skipped`, `disabled` or `failed`."
+        ),
+    )
+    def provision(sandbox: SandboxDep, body: ProvisionRequest | None = None) -> ProvisionResult:
+        body = body or ProvisionRequest()
+        return sandbox.provision(body.timeout_s)
 
     return app
 

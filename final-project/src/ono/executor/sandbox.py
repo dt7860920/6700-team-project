@@ -24,7 +24,22 @@ no Docker socket        the socket is only ever mounted into the Executor, never
 labels ``ono.*``        the TTL sweeper finds and removes orphans after a crash
 seccomp profile         Docker's default minus ptrace/AIO/SysV-IPC/... and non-INET socket
                         families (``sandbox_seccomp_profile``, see :func:`load_seccomp_profile`)
+``/deps`` tmpfs         third-party packages the BUILDER produced, extracted as the keeper uid
+                        so the inmate can import but never modify them (``provision()``)
 ======================  =====================================================================
+
+**The builder** (:func:`builder_kwargs`, :meth:`SandboxManager.build_dependencies`) is the
+one deliberate exception to "no network": a target's declared Python dependencies have to
+come from an index, so they are installed in a *separate*, ephemeral container that keeps
+every other jail property (non-root, ``cap_drop=ALL``, ``no-new-privileges``, seccomp,
+read-only rootfs with bounded tmpfs, memory/CPU/PID caps, no host mounts, never the Docker
+socket) and additionally has a wall-clock budget and an installed-size cap. Installing an
+untrusted repository's dependencies *executes its code* (``setup.py``, build backends), so
+that is the only place it ever happens. Its sole output - the installed packages directory
+- leaves as a tar that is validated exactly like a workspace archive before being extracted
+into the verification jail, which stays ``network_mode=none`` and otherwise unchanged. The
+builder is force-removed when the build ends (success, failure, timeout, or the sandbox's
+own teardown) and carries a short TTL label for the sweeper in case the Executor dies.
 
 Files travel in by streaming a tar over ``docker exec`` stdin into ``tar -x`` running
 *as the sandbox user* (the archive API cannot write into a tmpfs under a read-only
@@ -47,6 +62,7 @@ import re
 import shutil
 import socket
 import struct
+import tarfile
 import tempfile
 import threading
 import time
@@ -63,6 +79,8 @@ import docker.types
 import requests
 
 from ono.config import Settings
+from ono.executor._builder import RESULT_MARKER as BUILD_RESULT_MARKER
+from ono.executor._builder import manifest_kind
 from ono.executor._guest import GuestError, split_rel
 from ono.executor.archive import (
     SANDBOX_UID,
@@ -72,11 +90,13 @@ from ono.executor.archive import (
     pack_workspace,
 )
 from ono.executor.models import (
+    SANDBOX_DEPS,
     SANDBOX_WORKSPACE,
     SCAN_ID_PATTERN,
     FileContent,
     GrepResult,
     PatchResult,
+    ProvisionResult,
     RunResult,
     SandboxInfo,
     SandboxStatus,
@@ -95,9 +115,11 @@ __all__ = [
     "SandboxNotRunningError",
     "SandboxOperationError",
     "SandboxPathError",
+    "builder_kwargs",
     "check_grep_pattern",
     "jail_kwargs",
     "load_seccomp_profile",
+    "snapshot_manifests",
 ]
 
 log = logging.getLogger(__name__)
@@ -111,6 +133,15 @@ LABEL_SANDBOX = "ono.sandbox"
 LABEL_SCAN = "ono.scan_id"
 LABEL_SANDBOX_ID = "ono.sandbox_id"
 LABEL_CREATED = "ono.created_at"  # unix epoch seconds, as a string
+LABEL_BUILDER = "ono.builder"
+LABEL_TTL = "ono.ttl_s"
+"""Per-container TTL the sweeper honours when shorter than the configured one (builders)."""
+
+BUILD_DIR = "/build"
+BUILD_SRC = f"{BUILD_DIR}/src"
+"""Where the builder gets the workspace snapshot (manifests, setup.py, ...)."""
+BUILD_SITE = f"{BUILD_DIR}/site"
+"""The builder's ``pip install --target`` directory: its ONLY output."""
 
 _SCAN_ID_RE = re.compile(SCAN_ID_PATTERN)
 _EXEC_GRACE_S = 5.0  # host-side slack after the in-jail `timeout` deadline
@@ -119,11 +150,14 @@ _GUEST_TIMEOUT_S = 60.0
 _REAP_TIMEOUT_S = 10.0
 _EXTRACT_TIMEOUT_S = 180.0
 _GUEST_OVERHEAD_BYTES = 256 * 1024
+_BUILD_OUTPUT_CAP = 1_000_000
 _STDERR_TAIL = 600
 _OOM_RE = re.compile(r"oom_kill\s+(\d+)")
 
 # The in-jail helper is shipped by value on every call (see _guest.py's docstring).
 GUEST_SOURCE = resources.files("ono.executor").joinpath("_guest.py").read_text(encoding="utf-8")
+# The in-builder installer, likewise shipped by value (see _builder.py's docstring).
+BUILDER_SOURCE = resources.files("ono.executor").joinpath("_builder.py").read_text(encoding="utf-8")
 
 SECCOMP_DOCKER_DEFAULT = "docker-default"
 """``sandbox_seccomp_profile`` value meaning: add nothing, keep the daemon's default."""
@@ -142,6 +176,28 @@ _CONTAINER_ENV = {
     "PYTHONUNBUFFERED": "1",
     "PIP_NO_INDEX": "1",
     "PIP_DISABLE_PIP_VERSION_CHECK": "1",
+    # Provisioned packages (read-only, keeper-owned). Honoured by plain `python3` runs such
+    # as the target's test suite; ignored by the `-I` oracle/guest, which add it explicitly.
+    "PYTHONPATH": SANDBOX_DEPS,
+}
+
+_BUILDER_ENV = {
+    "HOME": "/tmp",
+    "TMPDIR": "/tmp",
+    "LANG": "C.UTF-8",
+    "LC_ALL": "C.UTF-8",
+    "TERM": "dumb",
+    "NO_COLOR": "1",
+    "CI": "true",
+    "PYTHONDONTWRITEBYTECODE": "1",
+    "PYTHONUNBUFFERED": "1",
+    # pip: no cache, no self-upgrade, no prompts; the pip that ships with the pinned image
+    # is the one that runs (no `--upgrade pip` ever happens in the builder).
+    "PIP_NO_CACHE_DIR": "1",
+    "PIP_DISABLE_PIP_VERSION_CHECK": "1",
+    "PIP_NO_INPUT": "1",
+    "PIP_PROGRESS_BAR": "off",
+    "PIP_NO_PYTHON_VERSION_WARNING": "1",
 }
 
 _PYTEST_MARKERS = frozenset({"pytest.ini", "conftest.py", "tests", "test"})
@@ -200,6 +256,14 @@ class JailConfig:
     """Where validated archives are kept for ``reset()``; ``None`` = a private temp dir."""
     seccomp_profile: str | None = None
     """Seccomp profile JSON handed to the daemon; ``None`` = Docker's default profile."""
+    deps_enabled: bool = True
+    """Whether ``provision()`` may start a builder at all (``sandbox_deps_enabled``)."""
+    deps_timeout_s: float = 300.0
+    """Wall-clock cap on one dependency build."""
+    deps_mb: int = 256
+    """Cap on the installed dependency set; also the size of the jail's ``/deps`` tmpfs."""
+    deps_index_url: str | None = None
+    """Package index for the builder (``PIP_INDEX_URL``); ``None`` = PyPI."""
 
     @classmethod
     def from_settings(cls, settings: Settings) -> Self:
@@ -216,7 +280,15 @@ class JailConfig:
             max_archive_bytes=settings.max_clone_mb * 1_000_000,
             snapshot_dir=settings.sandbox_snapshot_dir,
             seccomp_profile=load_seccomp_profile(settings.sandbox_seccomp_profile),
+            deps_enabled=settings.sandbox_deps_enabled,
+            deps_timeout_s=settings.sandbox_deps_timeout_s,
+            deps_mb=settings.sandbox_deps_max_mb,
+            deps_index_url=settings.sandbox_deps_index_url,
         )
+
+    @property
+    def deps_max_bytes(self) -> int:
+        return self.deps_mb * 1_000_000
 
 
 def load_seccomp_profile(spec: str | None) -> str | None:
@@ -256,9 +328,6 @@ def jail_kwargs(config: JailConfig, *, scan_id: str, sandbox_id: str) -> dict[st
     Kept as one pure function so the unit tests can assert every flag without Docker.
     """
     tmp_mb = max(16, config.workspace_mb // 2)
-    security_opt = ["no-new-privileges:true"]
-    if config.seccomp_profile is not None:
-        security_opt.append(f"seccomp={config.seccomp_profile}")
     return {
         "image": config.image,
         "command": ["sleep", "infinity"],
@@ -272,7 +341,7 @@ def jail_kwargs(config: JailConfig, *, scan_id: str, sandbox_id: str) -> dict[st
         "network_mode": "none",
         "read_only": True,
         "cap_drop": ["ALL"],
-        "security_opt": security_opt,
+        "security_opt": _security_opt(config),
         "privileged": False,
         "tmpfs": {
             SANDBOX_WORKSPACE: (
@@ -280,8 +349,88 @@ def jail_kwargs(config: JailConfig, *, scan_id: str, sandbox_id: str) -> dict[st
                 f"uid={SANDBOX_UID},gid={SANDBOX_UID},mode=0755"
             ),
             "/tmp": f"rw,nosuid,nodev,size={tmp_mb}m,mode=1777",
+            # Provisioned packages: owned by the keeper uid, so the sandbox user can read
+            # (import) them but never write; filled by `tar -x` running as the keeper.
+            # `exec` (Docker's tmpfs default is noexec) because native wheels - pydantic-core,
+            # numpy, cryptography ... - are shared objects that must be mmap'd executable.
+            # Nothing the inmate can write is ever on this mount, so it adds no capability
+            # beyond the Python and /usr/bin binaries the jail already runs.
+            SANDBOX_DEPS: (
+                f"rw,exec,nosuid,nodev,size={config.deps_mb}m,"
+                f"uid={KEEPER_UID},gid={KEEPER_UID},mode=0755"
+            ),
         },
         # -- resource limits -------------------------------------------------------
+        **_resource_limits(config),
+        # -- bookkeeping -----------------------------------------------------------
+        "labels": {
+            LABEL_SANDBOX: "1",
+            LABEL_SCAN: scan_id,
+            LABEL_SANDBOX_ID: sandbox_id,
+            LABEL_CREATED: f"{time.time():.3f}",
+        },
+    }
+
+
+def builder_kwargs(config: JailConfig, *, scan_id: str, sandbox_id: str) -> dict[str, Any]:
+    """The exact ``containers.run`` arguments for a BUILDER container.
+
+    Identical to :func:`jail_kwargs` in every hardening flag except the one it needs to do
+    its job: ``network_mode`` is the daemon's default bridge (pip has to reach an index).
+    Non-root, ``cap_drop=ALL``, ``no-new-privileges``, the same seccomp profile, read-only
+    rootfs with two bounded tmpfs mounts (``/build`` for the snapshot + the install target,
+    ``/tmp`` for pip's scratch), the same memory/CPU/PID caps, no host bind mounts and - like
+    every target container - never the Docker socket. It is labelled with a short TTL so
+    the sweeper removes it if the Executor dies mid-build.
+    """
+    env = dict(_BUILDER_ENV)
+    if config.deps_index_url:
+        env["PIP_INDEX_URL"] = config.deps_index_url
+    return {
+        "image": config.image,
+        "command": ["sleep", "infinity"],
+        "detach": True,
+        "name": f"ono-bld-{sandbox_id}",
+        "hostname": "builder",
+        "user": KEEPER_USER,
+        "working_dir": BUILD_DIR,
+        "environment": env,
+        # -- isolation (network is the ONE difference from the jail) ---------------
+        "network_mode": "bridge",
+        "read_only": True,
+        "cap_drop": ["ALL"],
+        "security_opt": _security_opt(config),
+        "privileged": False,
+        "tmpfs": {
+            BUILD_DIR: (
+                f"rw,nosuid,nodev,size={config.workspace_mb + config.deps_mb}m,"
+                f"uid={SANDBOX_UID},gid={SANDBOX_UID},mode=0755"
+            ),
+            "/tmp": f"rw,nosuid,nodev,size={config.deps_mb}m,mode=1777",
+        },
+        # -- resource limits -------------------------------------------------------
+        **_resource_limits(config),
+        # -- bookkeeping -----------------------------------------------------------
+        "labels": {
+            LABEL_SANDBOX: "1",  # the sweeper's filter: an orphaned builder is swept too
+            LABEL_BUILDER: "1",
+            LABEL_SCAN: scan_id,
+            LABEL_SANDBOX_ID: sandbox_id,
+            LABEL_CREATED: f"{time.time():.3f}",
+            LABEL_TTL: f"{2 * config.deps_timeout_s + _EXTRACT_TIMEOUT_S:.0f}",
+        },
+    }
+
+
+def _security_opt(config: JailConfig) -> list[str]:
+    security_opt = ["no-new-privileges:true"]
+    if config.seccomp_profile is not None:
+        security_opt.append(f"seccomp={config.seccomp_profile}")
+    return security_opt
+
+
+def _resource_limits(config: JailConfig) -> dict[str, Any]:
+    return {
         "mem_limit": f"{config.mem_mb}m",
         "memswap_limit": f"{config.mem_mb}m",  # == mem_limit -> no swap
         "nano_cpus": int(config.cpus * 1_000_000_000),
@@ -292,13 +441,6 @@ def jail_kwargs(config: JailConfig, *, scan_id: str, sandbox_id: str) -> dict[st
             docker.types.Ulimit(name="nofile", soft=4096, hard=4096),
         ],
         "init": True,
-        # -- bookkeeping -----------------------------------------------------------
-        "labels": {
-            LABEL_SANDBOX: "1",
-            LABEL_SCAN: scan_id,
-            LABEL_SANDBOX_ID: sandbox_id,
-            LABEL_CREATED: f"{time.time():.3f}",
-        },
     }
 
 
@@ -339,16 +481,100 @@ def _recv_exact(raw: Any, n: int, deadline: float) -> bytes | None:
 
 def _iter_frames(raw: Any, deadline: float) -> list[tuple[int, bytes]]:
     """Docker's multiplexed stream: 8-byte header (type, 3 pad, u32 len) + payload."""
-    frames: list[tuple[int, bytes]] = []
+    return list(_frames(raw, deadline))
+
+
+def _frames(raw: Any, deadline: float) -> Any:
+    """Lazy variant of :func:`_iter_frames` - what the streaming exec consumes."""
     while True:
         header = _recv_exact(raw, 8, deadline)
         if header is None:
-            return frames
+            return
         stream_type, length = struct.unpack(">BxxxL", header)
         payload = _recv_exact(raw, length, deadline) if length else b""
         if payload is None:
-            return frames
-        frames.append((int(stream_type), payload))
+            return
+        yield int(stream_type), payload
+
+
+def _exec_in(
+    api: Any,
+    cid: str,
+    cmd: list[str],
+    *,
+    user: str,
+    workdir: str,
+    stdin: bytes | IO[bytes] | None,
+    timeout_s: float,
+    cap_bytes: int,
+    stdout_sink: IO[bytes] | None = None,
+) -> _ExecOutcome:
+    """Run ``cmd`` in container ``cid`` with a hard deadline and an output cap.
+
+    The exec primitive shared by the jail and the builder. ``stdin`` may be a byte string
+    or an open binary file (streamed in :data:`~ono.executor.archive.SPOOL_CHUNK_BYTES`
+    pieces, never loaded whole). With ``stdout_sink`` the command's stdout goes to that
+    file instead of memory - how a builder's archive leaves the container - and reading
+    stops once ``cap_bytes`` have arrived (``truncated``). Docker API / transport errors
+    propagate for the caller to translate.
+    """
+    deadline = time.monotonic() + timeout_s + _EXEC_GRACE_S
+    started = time.perf_counter()
+    created = api.exec_create(cid, cmd, stdin=stdin is not None, user=user, workdir=workdir)
+    exec_id = str(created["Id"])
+    sock = api.exec_start(exec_id, socket=True)
+    # docker-py hands back a SocketIO wrapper for unix/tcp daemons and a bare
+    # (SSL)socket for https ones; the underlying socket is what we drive.
+    raw = getattr(sock, "_sock", sock)
+    stdout, stderr = bytearray(), bytearray()
+    sunk = 0
+    truncated = timed_out = False
+    try:
+        if stdin is not None:
+            _send_stdin(raw, stdin, deadline)
+            raw.shutdown(socket.SHUT_WR)
+        for stream_type, payload in _frames(raw, deadline):
+            if stream_type == 1 and stdout_sink is not None:
+                room = cap_bytes - sunk
+                if len(payload) > room:
+                    truncated = True
+                    break
+                stdout_sink.write(payload)
+                sunk += len(payload)
+                continue
+            buf = stdout if stream_type == 1 else stderr
+            room = cap_bytes - len(buf)
+            if room <= 0:
+                truncated = True
+                continue
+            if len(payload) > room:
+                truncated = True
+                payload = payload[:room]
+            buf.extend(payload)
+    except TimeoutError:
+        timed_out = True
+    except OSError as exc:
+        raise SandboxError(f"exec stream failed: {exc}") from exc
+    finally:
+        _close_exec_socket(sock, raw)
+    duration_ms = (time.perf_counter() - started) * 1000
+    exit_code = None if timed_out else _exit_code_of(api, exec_id)
+    return _ExecOutcome(bytes(stdout), bytes(stderr), exit_code, duration_ms, timed_out, truncated)
+
+
+def _exit_code_of(api: Any, exec_id: str) -> int | None:
+    until = time.monotonic() + _EXIT_CODE_WAIT_S
+    while True:
+        try:
+            info = api.exec_inspect(exec_id)
+        except (docker.errors.APIError, requests.exceptions.RequestException):
+            return None
+        code = info.get("ExitCode")
+        if code is not None and not info.get("Running", False):
+            return int(code)
+        if time.monotonic() > until:
+            return None
+        time.sleep(0.02)
 
 
 # ---------------------------------------------------------------------------
@@ -374,9 +600,12 @@ class Sandbox:
     status: SandboxStatus = "dead"
     container_id: str | None = None
     resets: int = 0
+    deps: Snapshot | None = field(default=None, repr=False)
+    """The builder's validated packages archive, re-extracted into ``/deps`` on every reset."""
     _lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
     _oom_kills: int = 0
     _destroyed: bool = False
+    _builder_cid: str | None = None  # an in-flight builder container, torn down with us
 
     # -- lifecycle --------------------------------------------------------------
     @property
@@ -397,6 +626,7 @@ class Sandbox:
             created_at=self.created_at,
             expires_at=self.expires_at,
             resets=self.resets,
+            provisioned=self.deps is not None,
         )
 
     def _start_container(self) -> None:
@@ -415,31 +645,9 @@ class Sandbox:
         self.container_id = str(container.id)
         self.status = "running"
         try:
-            try:
-                archive = self.snapshot.open()
-            except OSError as exc:
-                raise SandboxError(f"workspace snapshot is missing: {exc}") from exc
-            with archive:
-                outcome = self._exec(
-                    [
-                        "tar",
-                        "-xz",
-                        "--no-same-owner",
-                        "--no-same-permissions",
-                        "-C",
-                        SANDBOX_WORKSPACE,
-                        "-f",
-                        "-",
-                    ],
-                    stdin=archive,
-                    timeout_s=_EXTRACT_TIMEOUT_S,
-                    cap_bytes=_GUEST_OVERHEAD_BYTES,
-                )
-            if outcome.exit_code != 0:
-                raise SandboxError(
-                    f"workspace extraction failed (exit {outcome.exit_code}): "
-                    f"{outcome.stderr_tail()}"
-                )
+            self._extract(self.snapshot, SANDBOX_WORKSPACE, user=SANDBOX_USER, what="workspace")
+            if self.deps is not None:
+                self._extract(self.deps, SANDBOX_DEPS, user=KEEPER_USER, what="dependencies")
             self._oom_kills = self._read_oom_kills()
         except Exception:
             self._remove_container()
@@ -457,10 +665,33 @@ class Sandbox:
             self.config.image,
         )
 
+    def _extract(self, snapshot: Snapshot, dest: str, *, user: str, what: str) -> None:
+        """Stream a validated archive into ``dest`` via ``tar -x`` running as ``user``."""
+        try:
+            archive = snapshot.open()
+        except OSError as exc:
+            raise SandboxError(f"{what} snapshot is missing: {exc}") from exc
+        with archive:
+            outcome = self._exec(
+                ["tar", "-xz", "--no-same-owner", "--no-same-permissions", "-C", dest, "-f", "-"],
+                stdin=archive,
+                timeout_s=_EXTRACT_TIMEOUT_S,
+                cap_bytes=_GUEST_OVERHEAD_BYTES,
+                user=user,
+            )
+        if outcome.exit_code != 0:
+            raise SandboxError(
+                f"{what} extraction failed (exit {outcome.exit_code}): {outcome.stderr_tail()}"
+            )
+
     def _remove_container(self) -> None:
-        """Force-remove the container. Never raises."""
+        """Force-remove the container (and an in-flight builder). Never raises."""
         cid = self.container_id
         self.container_id = None
+        builder = self._builder_cid
+        self._builder_cid = None
+        if builder is not None:
+            self.manager._remove_quietly(builder, f"sandbox {self.sandbox_id}: builder")
         if cid is None:
             return
         try:
@@ -478,14 +709,80 @@ class Sandbox:
         """Tear the jail down. Idempotent, never raises.
 
         Deliberately does NOT take the operation lock: teardown (TTL sweep, shutdown,
-        ``DELETE``) must win over an in-flight ``run()``. Force-removing the container
-        ends that exec's stream; the caller of ``run`` gets ``SandboxNotRunningError``.
+        ``DELETE``) must win over an in-flight ``run()`` or ``provision()``. Force-removing
+        the container ends that exec's stream; the caller of ``run`` gets
+        ``SandboxNotRunningError`` and an in-flight builder is removed as well.
         """
         self._destroyed = True
         self.status = "destroyed"  # refuses any operation that starts from here on
         self._remove_container()
         self.manager._forget(self)
         self.snapshot.remove()
+        if self.deps is not None:
+            self.deps.remove()
+
+    # -- dependency provisioning (the builder phase) ------------------------------
+    def provision(self, timeout_s: float | None = None) -> ProvisionResult:
+        """Build the workspace's declared Python dependencies and ship them into ``/deps``.
+
+        Never raises for a failed build: the result says ``skipped`` (no manifest),
+        ``disabled`` (the Executor's switch is off) or ``failed`` (build broke, timed out,
+        exceeded a cap, could not be shipped) and the jail keeps running without
+        third-party packages - the pre-provisioning behaviour. Only ``provisioned`` means
+        the packages are importable in the jail. Re-provisioning replaces the previous set.
+        """
+        with self._lock:
+            self._require_running()
+            if not self.config.deps_enabled:
+                return ProvisionResult(
+                    status="disabled",
+                    detail="dependency provisioning is disabled on this Executor "
+                    "(SANDBOX_DEPS_ENABLED=false)",
+                )
+            manifests = snapshot_manifests(self.snapshot)
+            if not manifests:
+                return ProvisionResult(
+                    status="skipped",
+                    detail="no dependency manifest in the workspace (requirements*.txt, "
+                    "pyproject.toml, setup.cfg, setup.py, Pipfile)",
+                )
+            budget = self.config.deps_timeout_s
+            if timeout_s is not None:
+                budget = min(budget, timeout_s)
+            snapshot, result = self.manager.build_dependencies(
+                self, manifests, timeout_s=max(1.0, budget)
+            )
+            if snapshot is None:
+                return result
+            try:
+                self._exec(
+                    ["sh", "-c", f"find {SANDBOX_DEPS} -mindepth 1 -delete"],
+                    timeout_s=_REAP_TIMEOUT_S,
+                    cap_bytes=4096,
+                    user=KEEPER_USER,
+                )
+                self._extract(snapshot, SANDBOX_DEPS, user=KEEPER_USER, what="dependencies")
+            except SandboxError as exc:
+                snapshot.remove()
+                log.warning("sandbox %s: shipping dependencies failed: %s", self.sandbox_id, exc)
+                return result.model_copy(
+                    update={
+                        "status": "failed",
+                        "installed": [],
+                        "detail": f"could not ship the built dependencies into the jail: {exc}",
+                    }
+                )
+            previous, self.deps = self.deps, snapshot
+            if previous is not None:
+                previous.remove()
+            log.info(
+                "sandbox %s: provisioned %d package(s) (%d bytes) from %s",
+                self.sandbox_id,
+                len(result.installed),
+                result.size_bytes,
+                ", ".join(result.installed_from),
+            )
+            return result
 
     def reset(self) -> SandboxInfo:
         """Back to the clean snapshot: destroy + recreate the container (revives a dead one too)."""
@@ -517,76 +814,26 @@ class Sandbox:
         stdin: bytes | IO[bytes] | None = None,
         timeout_s: float,
         cap_bytes: int,
+        user: str = SANDBOX_USER,
     ) -> _ExecOutcome:
-        """Run ``cmd`` inside the jail as the sandbox user with a hard deadline and output cap.
-
-        ``stdin`` may be a byte string or an open binary file; a file is streamed in
-        :data:`~ono.executor.archive.SPOOL_CHUNK_BYTES` pieces, never loaded whole.
-        """
+        """Run ``cmd`` inside the jail (as the sandbox user unless told otherwise) with a
+        hard deadline and output cap - :func:`_exec_in` plus the jail's error mapping."""
         cid = self._require_running()
-        api = self.manager.client.api
-        deadline = time.monotonic() + timeout_s + _EXEC_GRACE_S
-        started = time.perf_counter()
         try:
-            created = api.exec_create(
+            return _exec_in(
+                self.manager.client.api,
                 cid,
                 cmd,
-                stdin=stdin is not None,
-                user=SANDBOX_USER,
+                user=user,
                 workdir=SANDBOX_WORKSPACE,
+                stdin=stdin,
+                timeout_s=timeout_s,
+                cap_bytes=cap_bytes,
             )
-            exec_id = str(created["Id"])
-            sock = api.exec_start(exec_id, socket=True)
         except docker.errors.APIError as exc:
             raise self._translate_exec_error(exc) from exc
         except requests.exceptions.RequestException as exc:
             raise DockerUnavailableError(f"docker daemon unreachable: {exc}") from exc
-
-        # docker-py hands back a SocketIO wrapper for unix/tcp daemons and a bare
-        # (SSL)socket for https ones; the underlying socket is what we drive.
-        raw = getattr(sock, "_sock", sock)
-        stdout, stderr = bytearray(), bytearray()
-        truncated = timed_out = False
-        try:
-            if stdin is not None:
-                _send_stdin(raw, stdin, deadline)
-                raw.shutdown(socket.SHUT_WR)
-            for stream_type, payload in _iter_frames(raw, deadline):
-                buf = stdout if stream_type == 1 else stderr
-                room = cap_bytes - len(buf)
-                if room <= 0:
-                    truncated = True
-                    continue
-                if len(payload) > room:
-                    truncated = True
-                    payload = payload[:room]
-                buf.extend(payload)
-        except TimeoutError:
-            timed_out = True
-        except OSError as exc:
-            raise SandboxError(f"exec stream failed: {exc}") from exc
-        finally:
-            _close_exec_socket(sock, raw)
-        duration_ms = (time.perf_counter() - started) * 1000
-        exit_code = None if timed_out else self._exit_code(exec_id)
-        return _ExecOutcome(
-            bytes(stdout), bytes(stderr), exit_code, duration_ms, timed_out, truncated
-        )
-
-    def _exit_code(self, exec_id: str) -> int | None:
-        api = self.manager.client.api
-        until = time.monotonic() + _EXIT_CODE_WAIT_S
-        while True:
-            try:
-                info = api.exec_inspect(exec_id)
-            except (docker.errors.APIError, requests.exceptions.RequestException):
-                return None
-            code = info.get("ExitCode")
-            if code is not None and not info.get("Running", False):
-                return int(code)
-            if time.monotonic() > until:
-                return None
-            time.sleep(0.02)
 
     def _translate_exec_error(self, exc: docker.errors.APIError) -> SandboxError:
         detail = _api_detail(exc)
@@ -836,6 +1083,19 @@ def _last_line(text: str) -> str:
     return ""
 
 
+def snapshot_manifests(snapshot: Snapshot) -> list[str]:
+    """Dependency manifests among a validated snapshot's members (a header-only scan)."""
+    found: list[str] = []
+    try:
+        with tarfile.open(snapshot.path, mode="r:gz") as tar:
+            for member in tar:
+                if member.isfile() and manifest_kind(member.name) is not None:
+                    found.append(member.name.removeprefix("./"))
+    except (OSError, tarfile.TarError, EOFError):
+        return []
+    return sorted(set(found), key=lambda r: (r.count("/"), r != "requirements.txt", r))
+
+
 def _send_stdin(raw: Any, stdin: bytes | IO[bytes], deadline: float) -> None:
     """Feed ``stdin`` to the exec socket; files go chunk by chunk under the deadline."""
     if isinstance(stdin, bytes):
@@ -1081,6 +1341,198 @@ class SandboxManager:
         for sandbox in self.active():
             sandbox.destroy()
 
+    def _remove_quietly(self, cid: str, who: str) -> None:
+        """Force-remove any container by id. Never raises."""
+        try:
+            self.client.api.remove_container(cid, v=True, force=True)
+        except docker.errors.NotFound:
+            pass
+        except Exception as exc:
+            log.warning("%s: removing container %s failed: %s", who, cid[:12], exc)
+        else:
+            log.info("%s: container %s removed", who, cid[:12])
+
+    # -- the builder --------------------------------------------------------------
+    def build_dependencies(
+        self, sandbox: Sandbox, manifests: list[str], *, timeout_s: float
+    ) -> tuple[Snapshot | None, ProvisionResult]:
+        """Install ``sandbox``'s declared dependencies in an ephemeral builder container.
+
+        Returns ``(validated packages archive or None, what happened)``. The builder is
+        created with :func:`builder_kwargs`, receives the workspace snapshot under
+        ``/build/src``, runs the shipped installer (:mod:`ono.executor._builder`) under
+        ``timeout -s KILL`` and a host-side deadline, and its ``/build/site`` is tarred out
+        to a spool file under the size cap and validated with the same rules as any
+        workspace archive. The container is force-removed on every path.
+        """
+        config = self.config
+        max_bytes = config.deps_max_bytes
+        started = time.perf_counter()
+
+        def failed(detail: str, **extra: Any) -> tuple[None, ProvisionResult]:
+            log.warning("sandbox %s: dependency build failed: %s", sandbox.sandbox_id, detail)
+            return None, ProvisionResult(
+                status="failed",
+                manifests=manifests,
+                detail=detail,
+                duration_ms=(time.perf_counter() - started) * 1000,
+                **extra,
+            )
+
+        kwargs = builder_kwargs(config, scan_id=sandbox.scan_id, sandbox_id=sandbox.sandbox_id)
+        try:
+            self.ensure_image(config.image)
+            container = self.client.containers.run(**kwargs)
+        except SandboxError as exc:
+            return failed(f"could not start the builder container: {exc}")
+        except docker.errors.APIError as exc:
+            return failed(f"could not start the builder container: {_api_detail(exc)}")
+        except requests.exceptions.RequestException as exc:
+            raise DockerUnavailableError(f"docker daemon unreachable: {exc}") from exc
+        except Exception as exc:
+            return failed(f"could not start the builder container: {exc}")
+        cid = str(container.id)
+        sandbox._builder_cid = cid
+        if sandbox._destroyed:  # destroy() raced us: never leave a builder behind
+            sandbox._builder_cid = None
+            self._remove_quietly(cid, f"sandbox {sandbox.sandbox_id}: builder")
+            return failed("sandbox was destroyed while the build was starting")
+        log.info(
+            "sandbox %s: builder %s up (manifests: %s, budget %.0fs, cap %d MB)",
+            sandbox.sandbox_id,
+            cid[:12],
+            ", ".join(manifests),
+            timeout_s,
+            config.deps_mb,
+        )
+        spool = self.snapshot_dir / f"{sandbox.sandbox_id}-deps-{uuid.uuid4().hex[:8]}.tar.gz"
+        api = self.client.api
+        keep = False  # the spool file survives only as a validated snapshot handed back
+        try:
+            # 1. the workspace snapshot goes in (the builder reads manifests / setup.py from it)
+            with sandbox.snapshot.open() as archive:
+                outcome = _exec_in(
+                    api,
+                    cid,
+                    [
+                        "sh",
+                        "-c",
+                        f"mkdir -p {BUILD_SRC} {BUILD_SITE} && exec tar -xz --no-same-owner "
+                        f"--no-same-permissions -C {BUILD_SRC} -f -",
+                    ],
+                    user=SANDBOX_USER,
+                    workdir=BUILD_DIR,
+                    stdin=archive,
+                    timeout_s=_EXTRACT_TIMEOUT_S,
+                    cap_bytes=_GUEST_OVERHEAD_BYTES,
+                )
+            if outcome.exit_code != 0:
+                return failed(
+                    f"could not extract the workspace into the builder "
+                    f"(exit {outcome.exit_code}): {outcome.stderr_tail()}"
+                )
+            # 2. the installer, under a hard in-container deadline and a host-side one
+            build_config = {
+                "src": BUILD_SRC,
+                "site": BUILD_SITE,
+                "max_bytes": max_bytes,
+                "timeout_s": timeout_s,
+            }
+            outcome = _exec_in(
+                api,
+                cid,
+                [
+                    "timeout",
+                    "-s",
+                    "KILL",
+                    f"{timeout_s + _EXEC_GRACE_S:.0f}",
+                    "python3",
+                    "-I",
+                    "-c",
+                    BUILDER_SOURCE,
+                    json.dumps(build_config),
+                ],
+                user=SANDBOX_USER,
+                workdir=BUILD_SRC,
+                stdin=None,
+                timeout_s=timeout_s + _EXEC_GRACE_S,
+                cap_bytes=_BUILD_OUTPUT_CAP,
+            )
+            if outcome.timed_out or outcome.exit_code in (124, 137):
+                return failed(f"dependency build exceeded its {timeout_s:.0f}s budget")
+            data = _parse_build_result(outcome)
+            if data is None:
+                tail = outcome.stderr_tail() or _last_line(
+                    outcome.stdout.decode("utf-8", "replace")
+                )
+                return failed(f"the builder produced no result (exit {outcome.exit_code}): {tail}")
+            result = ProvisionResult(
+                status="provisioned" if data.get("status") == "provisioned" else "failed",
+                manifests=[str(m) for m in data.get("manifests", [])] or manifests,
+                installed=[str(p) for p in data.get("installed", [])],
+                installed_from=[str(s) for s in data.get("installed_from", [])],
+                failed=[str(f) for f in data.get("failed", [])],
+                relaxed=[str(r) for r in data.get("relaxed", [])],
+                warnings=[str(w) for w in data.get("warnings", [])],
+                size_bytes=max(0, int(data.get("size_bytes", 0) or 0)),
+                duration_ms=(time.perf_counter() - started) * 1000,
+                detail=str(data.get("error") or ""),
+            )
+            if result.status != "provisioned":
+                if data.get("status") == "skipped":
+                    result = result.model_copy(
+                        update={"status": "skipped", "detail": "no dependency manifest found"}
+                    )
+                else:
+                    log.warning(
+                        "sandbox %s: dependency build failed: %s", sandbox.sandbox_id, result.detail
+                    )
+                return None, result
+            # 3. the ONLY output leaves: the install target, as a bounded tar on disk
+            with spool.open("wb") as sink:
+                outcome = _exec_in(
+                    api,
+                    cid,
+                    ["tar", "-cz", "-C", BUILD_SITE, "."],
+                    user=SANDBOX_USER,
+                    workdir=BUILD_DIR,
+                    stdin=None,
+                    timeout_s=_EXTRACT_TIMEOUT_S,
+                    cap_bytes=max_bytes,
+                    stdout_sink=sink,
+                )
+            if outcome.truncated:
+                return failed(
+                    f"built dependencies are larger than the cap of {max_bytes} bytes",
+                    installed=result.installed,
+                )
+            if outcome.exit_code != 0:
+                return failed(
+                    f"could not archive the built dependencies (exit {outcome.exit_code}): "
+                    f"{outcome.stderr_tail()}"
+                )
+            try:
+                snapshot = Snapshot.validate(spool, max_bytes=max_bytes)
+            except ArchiveError as exc:
+                return failed(f"the built dependencies archive was rejected: {exc}")
+            keep = True
+            return snapshot, result.model_copy(
+                update={"duration_ms": (time.perf_counter() - started) * 1000}
+            )
+        except docker.errors.APIError as exc:
+            return failed(f"builder exec failed: {_api_detail(exc)}")
+        except requests.exceptions.RequestException as exc:
+            raise DockerUnavailableError(f"docker daemon unreachable: {exc}") from exc
+        except SandboxError as exc:
+            return failed(f"builder failed: {exc}")
+        except OSError as exc:
+            return failed(f"cannot spool the built dependencies: {exc}")
+        finally:
+            sandbox._builder_cid = None
+            self._remove_quietly(cid, f"sandbox {sandbox.sandbox_id}: builder")
+            if not keep:
+                _unlink_quietly(spool)
+
     # -- sweeper ----------------------------------------------------------------
     def sweep(self, max_age_s: float | None = None) -> list[str]:
         """Remove sandboxes past the TTL - tracked ones *and* any ``ono.sandbox`` container
@@ -1112,7 +1564,8 @@ class SandboxManager:
             if cid in removed:
                 continue
             created = _container_created_epoch(container)
-            if created is None or now - created <= max_age:
+            limit = min(max_age, _container_ttl(container, max_age))
+            if created is None or now - created <= limit:
                 continue
             try:
                 container.remove(v=True, force=True)
@@ -1161,6 +1614,31 @@ class SandboxManager:
 def _unlink_quietly(path: Path) -> None:
     with contextlib.suppress(OSError):
         path.unlink()
+
+
+def _parse_build_result(outcome: _ExecOutcome) -> dict[str, Any] | None:
+    text = outcome.stdout.decode("utf-8", "replace")
+    line = next(
+        (ln for ln in reversed(text.splitlines()) if ln.startswith(BUILD_RESULT_MARKER)), None
+    )
+    if line is None:
+        return None
+    try:
+        data = json.loads(line[len(BUILD_RESULT_MARKER) :])
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _container_ttl(container: Any, default: float) -> float:
+    labels = container.labels or {}
+    raw = labels.get(LABEL_TTL)
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
 
 
 def _container_created_epoch(container: Any) -> float | None:

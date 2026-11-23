@@ -88,6 +88,8 @@ select = [
 # The in-jail oracle (like executor/_guest.py) is stdlib-os only on purpose: it is shipped
 # into the sandbox and must stay importable on the image's (possibly older) interpreter.
 "src/ono/verifier/_oracle.py" = ["PTH"]
+# Same for the in-builder dependency installer: shipped by value into the builder container.
+"src/ono/executor/_builder.py" = ["PTH"]
 # Deliberately-vulnerable fixture: the path-traversal sink NEEDS os.path.join + open() (the
 # oracle's ``open`` audit hook keys on the builtin); rewriting to pathlib would erase the bug.
 "tests/fixtures/pathtrav_app/*" = ["PTH"]

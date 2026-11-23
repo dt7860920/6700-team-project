@@ -485,6 +485,46 @@ class Settings(BaseSettings):
         ),
     )
 
+    # -- Dependency provisioning for the verification jail (the BUILDER phase) -----------
+    # The verification jail has no network, so a target's third-party packages (Flask,
+    # Django, ...) are installed in a separate, ephemeral, hardened builder container that
+    # *does* have network (pip needs it) and are shipped into the jail as read-only files.
+    # Installing an untrusted repo's dependencies executes arbitrary code (setup.py, build
+    # backends), which is why it happens only there: non-root, cap_drop ALL, read-only
+    # rootfs, resource caps, no host mounts, never the Docker socket, destroyed afterwards.
+    sandbox_deps_enabled: bool = Field(
+        default=True,
+        description=(
+            "Build the target's declared Python dependencies (requirements*.txt, "
+            "pyproject.toml, setup.cfg/setup.py, Pipfile) in an ephemeral network-enabled "
+            "builder container and ship them read-only into the verification jail so the "
+            "prover can import the real app. False = never start a builder; findings in "
+            "framework apps stay unproven at import time (the pre-provisioning behaviour)."
+        ),
+    )
+    sandbox_deps_timeout_s: float = Field(
+        default=300.0,
+        ge=10.0,
+        le=3600.0,
+        description="Wall-clock cap on one dependency build (pip resolution + download + install).",
+    )
+    sandbox_deps_max_mb: int = Field(
+        default=256,
+        ge=8,
+        le=8192,
+        description=(
+            "Cap on the installed dependency set (also the size of the jail's /deps tmpfs, "
+            "which is charged to sandbox_mem_mb). A build above it is discarded."
+        ),
+    )
+    sandbox_deps_index_url: str | None = Field(
+        default=None,
+        description=(
+            "Package index the builder uses (PIP_INDEX_URL); None = PyPI. Point it at an "
+            "internal mirror to keep the builder off the public internet."
+        ),
+    )
+
     @model_validator(mode="after")
     def _service_backend_requires_url(self) -> Self:
         if self.model_backend == "service" and not self.model_service_url:
