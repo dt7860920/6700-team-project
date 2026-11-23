@@ -20,7 +20,7 @@ import secrets
 import shlex
 from dataclasses import dataclass, field
 from importlib import resources
-from typing import Any
+from typing import Any, Protocol
 
 from ono.agents.tools import SandboxExecutor
 from ono.executor.models import SANDBOX_DEPS, RunResult
@@ -28,11 +28,15 @@ from ono.models import Finding
 from ono.verifier._oracle import RESULT_MARKER, SUPPORTED_CWES, family_of, probe_for
 
 __all__ = [
+    "JS_EXTENSIONS",
+    "JS_SUPPORTED_CWES",
     "ORACLE_DIR",
     "SKIP_REASONS",
     "OracleResult",
     "SinkOracle",
+    "SinkOracleProtocol",
     "explain",
+    "language_of",
     "new_canary",
     "oracle_supports",
     "parse_result",
@@ -92,21 +96,65 @@ def skip_reason(cwe: str) -> str:
     return SKIP_REASONS.get(cwe, "")
 
 
+JS_EXTENSIONS: tuple[str, ...] = (".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx")
+"""File suffixes routed to the Node sink oracle (:mod:`ono.verifier.oracle_js`)."""
+
+# The CWE families the Node oracle (``oracle_hooks.js``) actually instruments: command
+# injection, code injection (eval/Function/vm), SQL injection, path traversal / external
+# control of file name, SSRF and unsafe deserialization. These are the SAME CWE roots the
+# Python oracle already defines in ``_oracle.CWE_FAMILIES`` - a CWE number means the same
+# thing regardless of language, so :func:`~ono.verifier._oracle.family_of` and :func:`explain`
+# work unchanged for a JS result. Every other dynamically-provable-in-Python family (SSTI,
+# XPath, LDAP, NoSQL, XXE, open redirect, reflected output) has no JS hook yet - a JS/TS
+# finding in one of those stays honestly ``skipped``, never falsely failed.
+JS_SUPPORTED_CWES: frozenset[str] = frozenset(
+    {"CWE-78", "CWE-77", "CWE-88"}  # command injection
+    | {"CWE-94", "CWE-95", "CWE-96"}  # code injection
+    | {"CWE-89"}  # SQL injection
+    | {"CWE-22", "CWE-23", "CWE-36"}  # path traversal
+    | {"CWE-73"}  # external control of file name/path
+    | {"CWE-918"}  # SSRF
+    | {"CWE-502", "CWE-20"}  # unsafe deserialization
+)
+
+
+def language_of(file: str) -> str:
+    """``"python"`` / ``"javascript"`` / ``""`` (unknown) from a workspace-relative path."""
+    if file.endswith(".py"):
+        return "python"
+    if file.endswith(JS_EXTENSIONS):
+        return "javascript"
+    return ""
+
+
 def oracle_supports(finding: Finding) -> str:
     """Empty if the oracle can judge this finding, else why not (language / CWE)."""
-    if not finding.file.endswith(".py"):
-        suffix = finding.file.rsplit(".", 1)[-1] if "." in finding.file else "?"
-        return f"no dynamic sink oracle for .{suffix} files (Python only for now)"
-    if finding.cwe not in SUPPORTED_CWES:
-        reason = skip_reason(finding.cwe)
-        if reason:
-            return f"{finding.cwe} is not dynamically provable: {reason}"
-        return (
-            f"no sink oracle for {finding.cwe} (dynamically proven families: SQL/command/code "
-            "injection, unsafe deserialization, path traversal, SSRF, SSTI, XPath, LDAP, NoSQL, "
-            "XXE, open redirect, file-name control, reflected unescaped output)"
-        )
-    return ""
+    language = language_of(finding.file)
+    if language == "python":
+        if finding.cwe not in SUPPORTED_CWES:
+            reason = skip_reason(finding.cwe)
+            if reason:
+                return f"{finding.cwe} is not dynamically provable: {reason}"
+            return (
+                f"no sink oracle for {finding.cwe} (dynamically proven families: SQL/command/"
+                "code injection, unsafe deserialization, path traversal, SSRF, SSTI, XPath, "
+                "LDAP, NoSQL, XXE, open redirect, file-name control, reflected unescaped output)"
+            )
+        return ""
+    if language == "javascript":
+        if finding.cwe not in JS_SUPPORTED_CWES:
+            reason = skip_reason(finding.cwe)
+            if reason:
+                return f"{finding.cwe} is not dynamically provable: {reason}"
+            return (
+                f"no JS/TS sink oracle for {finding.cwe} (dynamically proven JS/TS families: "
+                "command injection, code injection (eval/Function/vm), SQL injection, path "
+                "traversal / external control of file name, SSRF, unsafe deserialization - a "
+                "narrower set than the Python oracle covers)"
+            )
+        return ""
+    suffix = finding.file.rsplit(".", 1)[-1] if "." in finding.file else "?"
+    return f"no dynamic sink oracle for .{suffix} files (Python and JS/TS only for now)"
 
 
 @dataclass(slots=True)
@@ -290,6 +338,23 @@ def _import_failure_hint(traceback_text: str) -> str:
             "before the import) so execution can reach the sink"
         )
     return ""
+
+
+class SinkOracleProtocol(Protocol):
+    """What :mod:`ono.verifier.verify` needs from a sink oracle - satisfied by both
+    :class:`SinkOracle` (Python) and :class:`~ono.verifier.oracle_js.JsSinkOracle` (JS/TS)
+    so the verifier can pick either one for a finding without caring which it got."""
+
+    sandbox: SandboxExecutor
+    runs: int
+
+    def stage(self, poc_code: str) -> str: ...
+
+    def run(self, finding: Finding, poc_code: str, canary: str) -> OracleResult: ...
+
+    def run_staged(self, finding: Finding, canary: str) -> OracleResult: ...
+
+    def cleanup(self) -> None: ...
 
 
 class SinkOracle:

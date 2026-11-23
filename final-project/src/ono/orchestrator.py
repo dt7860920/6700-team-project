@@ -62,7 +62,7 @@ class ExecutorProvider(Protocol):
     def health(self) -> ExecutorHealth: ...
 
     def sandbox(
-        self, scan_id: str, workspace_dir: Path
+        self, scan_id: str, workspace_dir: Path, *, runtime: str = "python"
     ) -> AbstractContextManager[SandboxExecutor]: ...
 
 

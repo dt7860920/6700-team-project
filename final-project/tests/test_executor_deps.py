@@ -957,8 +957,8 @@ def test_verifier_treats_an_executor_without_the_route_as_a_failed_build(tmp_pat
 
     class OldExecutor(FakeExecExecutor):
         @contextlib.contextmanager
-        def sandbox(self, scan_id: str, workspace_dir: Path) -> Any:
-            with super().sandbox(scan_id, workspace_dir) as sbx:
+        def sandbox(self, scan_id: str, workspace_dir: Path, *, runtime: str = "python") -> Any:
+            with super().sandbox(scan_id, workspace_dir, runtime=runtime) as sbx:
                 sbx.fail_with = SandboxNotFoundError("sandbox 'x' not found")
                 yield sbx
 

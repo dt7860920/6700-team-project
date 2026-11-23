@@ -310,10 +310,12 @@ def test_give_up_when_no_poc_reaches_the_sink(workspace: Path) -> None:
 
 
 def test_unsupported_language_skips_the_oracle_without_claiming_proof(workspace: Path) -> None:
-    (workspace / "app.js").write_text("app.get('/x', (req) => db.query(req.query.id))\n")
+    """A language neither oracle instruments (Ruby here) stays an honest, unconditional
+    skip - unlike JS/TS, which this PR gave a real oracle to (see the test right below)."""
+    (workspace / "app.rb").write_text("def q(id); db.query(id); end\n")
     model = ScriptedModel(script=_prover_fixer_script([], []))  # no agent should be called
     verifier, _ = _verifier(_settings(workspace), model)
-    finding = _finding(file="app.js", line=1, cwe="CWE-89")
+    finding = _finding(file="app.rb", line=1, cwe="CWE-89")
 
     report = verifier.verify("scn_v", workspace, [finding])
 
@@ -326,5 +328,32 @@ def test_unsupported_language_skips_the_oracle_without_claiming_proof(workspace:
     assert (
         poc_check is not None
         and poc_check.status == "skipped"
-        and "Python only" in poc_check.detail
+        and "Python and JS/TS only" in poc_check.detail
     )
+
+
+def test_a_js_finding_is_no_longer_unconditionally_skipped(workspace: Path) -> None:
+    """Before this PR, EVERY JS/TS finding came back skipped regardless of CWE (the oracle
+    was Python-only). A command-injection finding in a .js file now reaches the prover -
+    it may still fail to prove (no hook matches this toy sink), but it is no longer an
+    unconditional, by-language skip."""
+    (workspace / "app.js").write_text(
+        "const { execSync } = require('child_process');\n"
+        "function run(id) { return execSync('echo ' + id); }\n"
+    )
+    # A VALID but non-proving PoC (never touches app.js at all): enough replies for every
+    # self-correction retry the verifier may spend, so the script never runs dry.
+    noop_poc = action("submit_poc", code="const payload = process.env.ONO_PAYLOAD;\n")
+    settings = _settings(workspace, max_verifier_retries=1)
+    model = ScriptedModel(script=_prover_fixer_script([noop_poc] * 4, []))
+    verifier, _ = _verifier(settings, model)
+    finding = _finding(file="app.js", line=2, cwe="CWE-78")
+
+    report = verifier.verify("scn_v_js", workspace, [finding])
+
+    unproven = report.findings[0]
+    v = unproven.verification
+    assert v is not None
+    poc_check = v.check("poc_reaches_sink")
+    assert poc_check is not None and poc_check.status != "skipped"
+    assert model.n_calls > 0  # the prover WAS invoked - the oracle did not refuse by language

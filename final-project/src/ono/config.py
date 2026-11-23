@@ -425,6 +425,15 @@ class Settings(BaseSettings):
         default="python:3.13-slim",
         description="Image the jailed target containers start from (pulled if missing).",
     )
+    sandbox_image_node: str = Field(
+        default="nikolaik/python-nodejs:python3.13-nodejs20-slim",
+        description=(
+            "Image selected instead of sandbox_image for a scan with any JS/TS finding. Must "
+            "still have Python (the in-jail read/tree/grep guest helper always runs as "
+            "`python3`, regardless of the target's language) PLUS `node`/`npm` - a combined "
+            "image, not a swap, since a scan can mix Python and JS/TS findings in one jail."
+        ),
+    )
     sandbox_mem_mb: int = Field(
         default=1024,
         ge=64,
@@ -522,6 +531,14 @@ class Settings(BaseSettings):
         description=(
             "Package index the builder uses (PIP_INDEX_URL); None = PyPI. Point it at an "
             "internal mirror to keep the builder off the public internet."
+        ),
+    )
+    sandbox_deps_npm_registry: str | None = Field(
+        default=None,
+        description=(
+            "Registry the builder's npm install/ci uses (NPM_CONFIG_REGISTRY); None = npm's "
+            "default (registry.npmjs.org). Point it at an internal mirror to keep the "
+            "builder off the public internet, same as sandbox_deps_index_url for pip."
         ),
     )
 

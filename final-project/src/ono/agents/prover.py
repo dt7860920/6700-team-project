@@ -24,7 +24,11 @@ from ono.models import Finding
 __all__ = ["MAX_POC_CHARS", "Poc", "run_prover"]
 
 MAX_POC_CHARS = 12_000
-_PYTHON_FENCE = re.compile(r"```(?:python|py)?\s*\n(.*?)```", re.DOTALL)
+# Any fenced code block counts as the submission (a 7B model asked for "a script" often
+# answers with just a fence and nothing else) - language-neutral on purpose: a JS/TS finding's
+# PoC is JavaScript, not Python, and the fence's language tag (```js, ```javascript, ```ts,
+# none at all, ...) is not reliable enough to gate on.
+_CODE_FENCE = re.compile(r"```[A-Za-z0-9_+-]*\s*\n(.*?)```", re.DOTALL)
 _PAYLOAD_REF = re.compile(r"ONO_PAYLOAD")
 
 
@@ -105,7 +109,7 @@ def _task_prompt(
     if previous is not None:
         text += (
             "Your previous script did NOT prove the finding. The harness reported:\n"
-            f"{failure}\n\nPrevious script:\n```python\n{previous.code[:4000]}\n```\n"
+            f"{failure}\n\nPrevious script:\n```\n{previous.code[:4000]}\n```\n"
             "Fix the cause named above and submit a corrected script.\n\n"
         )
     text += f"You have at most {max_steps} steps. " + render_action_format("submit_poc(code, how)")
@@ -120,15 +124,17 @@ def _accept(call: ToolCall) -> tuple[Poc | None, str]:
         return None, f"the script is longer than {MAX_POC_CHARS} characters; keep it short"
     if _PAYLOAD_REF.search(code) is None:
         return None, (
-            'the script must read the payload with os.environ["ONO_PAYLOAD"] and pass it '
-            "into the application; a hard-coded payload cannot be verified"
+            "the script must read the payload from the ONO_PAYLOAD environment variable "
+            '(os.environ["ONO_PAYLOAD"] in Python, process.env.ONO_PAYLOAD in JavaScript/'
+            "TypeScript) and pass it into the application; a hard-coded payload cannot be "
+            "verified"
         )
     return Poc(code=code + "\n", how=str(call.args.get("how") or "")[:300]), ""
 
 
 def _bare_script(text: str) -> ToolCall | None:
-    """A reply that is just a fenced Python block is taken as the submission."""
-    match = _PYTHON_FENCE.search(text)
+    """A reply that is just a fenced code block (any language) is taken as the submission."""
+    match = _CODE_FENCE.search(text)
     if match is None:
         return None
     return ToolCall(name="submit_poc", args={"code": match.group(1)})

@@ -54,6 +54,34 @@ def test_detect_framework_for_js() -> None:
     assert detect_framework(f, "const app = express();\napp.get('/run', ...)") == "express"
 
 
+def test_detect_framework_for_nestjs() -> None:
+    f = _finding(file="app.controller.ts", cwe="CWE-78")
+    window = "import { Controller, Get } from '@nestjs/common';\n@Controller('cats')"
+    assert detect_framework(f, window) == "nestjs"
+
+
+def test_detect_framework_for_next() -> None:
+    f = _finding(file="pages/api/run.js", cwe="CWE-78")
+    window = "export default function handler(req, res) { res.json({}); }"
+    assert detect_framework(f, window) == "next"
+
+
+def test_scaffold_for_js_reads_process_env_not_os_environ() -> None:
+    f = _finding(file="server.js", cwe="CWE-78")
+    scaffold = scaffold_for(f, "const app = express();\napp.get('/run', ...)")
+    assert "process.env.ONO_PAYLOAD" in scaffold
+    assert "ephemeral loopback" in scaffold.lower() or "loopback port" in scaffold.lower()
+    for leak in ("' OR '1'='1", "; rm -rf", "../../etc/passwd", "UNION SELECT"):
+        assert leak.lower() not in scaffold.lower()
+
+
+def test_scaffold_for_python_still_reads_os_environ() -> None:
+    f = _finding(file="app/server.py", cwe="CWE-89")
+    scaffold = scaffold_for(f, "from flask import Flask\napp = Flask(__name__)")
+    assert 'os.environ["ONO_PAYLOAD"]' in scaffold
+    assert "process.env" not in scaffold
+
+
 def test_entry_hint_reads_the_first_trace_hop() -> None:
     hint = entry_hint(_finding())
     assert "request.args.get" in hint and "app/server.py:12" in hint
