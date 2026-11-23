@@ -61,6 +61,10 @@ ENV PATH="/app/.venv/bin:$PATH" \
     PORT=8080 \
     GRADIO_ANALYTICS_ENABLED=False \
     WORKSPACE_DIR=/tmp/ono-workspace \
+    # HOME on the /tmp tmpfs: the rootfs is read-only, and Semgrep writes
+    # $HOME/.semgrep (settings/version cache). Without this it fails with
+    # "Read-only file system: '/app/.semgrep'" and silently falls back to regex.
+    HOME=/tmp \
     SEMGREP_SETTINGS_FILE=/tmp/semgrep-settings.yml \
     SEMGREP_SEND_METRICS=off \
     SEMGREP_ENABLE_VERSION_CHECK=0
