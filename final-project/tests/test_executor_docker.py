@@ -27,8 +27,10 @@ from conftest import LiveServer, start_live_server
 from ono.config import Settings
 from ono.executor.app import create_executor_app
 from ono.executor.client import ExecutorAuthError, ExecutorClient
+from ono.executor.models import SANDBOX_DEPS
 from ono.executor.sandbox import (
     KEEPER_UID,
+    LABEL_BUILDER,
     LABEL_CREATED,
     LABEL_SANDBOX,
     SANDBOX_USER,
@@ -40,12 +42,14 @@ from ono.executor.sandbox import (
     SandboxNotRunningError,
     SandboxOperationError,
     SandboxPathError,
+    builder_kwargs,
     load_seccomp_profile,
 )
 
 pytestmark = pytest.mark.docker
 
 FIXTURE_REPO = Path(__file__).parent / "fixtures" / "vuln_repo"
+FLASK_REPO = Path(__file__).parent / "fixtures" / "flask_sqli_app"
 TOKEN = "docker-test-token-0123456789"
 # ONO_SANDBOX_SECCOMP=hardened|docker-default|<path> runs this whole module under that
 # seccomp profile - how a profile is validated end to end before it becomes the default.
@@ -60,6 +64,8 @@ CONFIG = JailConfig(
     workspace_mb=128,
     max_active=8,
     seccomp_profile=SECCOMP,
+    deps_mb=64,
+    deps_timeout_s=240.0,
 )
 
 
@@ -213,10 +219,166 @@ def test_hardened_seccomp_profile_is_enforced_and_the_jail_still_works(
 def test_rootfs_is_read_only_and_tmpfs_is_nosuid(sandbox: Sandbox) -> None:
     r = sandbox.run("touch /usr/x; echo x >> /etc/passwd; touch /root/x; echo rc=$?")
     assert "Read-only file system" in r.stderr
-    r = sandbox.run("grep -E ' /(workspace|tmp) ' /proc/mounts")
-    assert r.stdout.count("nosuid") == 2 and r.stdout.count("nodev") == 2
+    r = sandbox.run("grep -E ' /(workspace|tmp|deps) ' /proc/mounts")
+    assert r.stdout.count("nosuid") == 3 and r.stdout.count("nodev") == 3
+    mounts = {line.split()[1]: line.split()[3] for line in r.stdout.splitlines()}
+    assert "noexec" in mounts["/workspace"] and "noexec" in mounts["/tmp"]  # Docker's default
+    assert "noexec" not in mounts[SANDBOX_DEPS]  # native wheels; keeper-owned, inmate-read-only
     r = sandbox.run("echo hi > /workspace/x && echo hi > /tmp/y && cat /workspace/x /tmp/y")
     assert r.stdout == "hi\nhi\n"
+    # /deps is the keeper's: the inmate can list it but never write into it
+    r = sandbox.run(f"stat -c '%u %a' {SANDBOX_DEPS}; touch {SANDBOX_DEPS}/x; echo rc=$?")
+    assert r.stdout.startswith(f"{KEEPER_UID} 755") and "Permission denied" in r.stderr
+
+
+# ---------------------------------------------------------------------------
+# 1b. The BUILDER: a jail with network - and nothing else relaxed
+# ---------------------------------------------------------------------------
+
+
+def test_builder_flags_as_applied_by_the_daemon(raw_docker: Any) -> None:
+    """The builder container (dependency provisioning) is the jail minus network_mode=none:
+    non-root, no caps, no-new-privileges, read-only rootfs + bounded tmpfs, cgroup caps,
+    no host mounts, no Docker socket - and it DOES have a route out (pip needs it)."""
+    container = raw_docker.containers.run(
+        **builder_kwargs(CONFIG, scan_id="scn_builderflags", sandbox_id="sbx_flags")
+    )
+    try:
+        attrs = raw_docker.api.inspect_container(container.id)
+        hc, cfg = attrs["HostConfig"], attrs["Config"]
+        assert hc["NetworkMode"] == "bridge"
+        assert hc["ReadonlyRootfs"] is True
+        assert hc["CapDrop"] == ["ALL"] and not hc.get("CapAdd")
+        assert "no-new-privileges:true" in hc["SecurityOpt"]
+        assert hc["Privileged"] is False
+        assert hc["Memory"] == 256 * 1024 * 1024 and hc["MemorySwap"] == hc["Memory"]
+        assert hc["NanoCpus"] == 1_000_000_000 and hc["PidsLimit"] == 64 and hc["Init"] is True
+        assert not hc.get("Binds") and not hc.get("Devices")
+        assert all(m["Type"] == "tmpfs" for m in attrs["Mounts"]) or attrs["Mounts"] == []
+        assert set(hc["Tmpfs"]) == {"/build", "/tmp"}
+        assert "docker.sock" not in str(attrs["Mounts"]) and "docker.sock" not in str(hc)
+        assert cfg["User"] == f"{KEEPER_UID}:{KEEPER_UID}"
+        assert cfg["Labels"][LABEL_SANDBOX] == "1" and cfg["Labels"][LABEL_BUILDER] == "1"
+        assert "PIP_NO_INDEX=1" not in cfg["Env"] and "PIP_NO_CACHE_DIR=1" in cfg["Env"]
+        probe = raw_docker.api.exec_create(
+            container.id,
+            [
+                "sh",
+                "-c",
+                "id -u; grep -E 'Cap(Eff|Bnd)|NoNewPrivs|^Seccomp:' /proc/self/status; "
+                "{ test -e /var/run/docker.sock || test -e /run/docker.sock; } "
+                "&& echo SOCKET || echo nosocket; ls /sys/class/net | tr '\\n' ' '; echo; "
+                "touch /usr/x 2>&1; touch /build/ok && echo buildok; "
+                "python3 -c 'import socket; s=socket.socket(); s.settimeout(5); "
+                's.connect(("pypi.org", 443)); print("egress")\' 2>&1',
+            ],
+            user=SANDBOX_USER,
+        )
+        out = raw_docker.api.exec_start(probe["Id"]).decode()
+        assert out.splitlines()[0] == SANDBOX_USER.split(":")[0]
+        assert "CapEff:\t0000000000000000" in out and "CapBnd:\t0000000000000000" in out
+        assert "NoNewPrivs:\t1" in out and "nosocket" in out and "SOCKET" not in out
+        if SECCOMP is not None:
+            assert "Seccomp:\t2" in out
+        assert "eth0" in out, "the builder must have a network interface"
+        assert "Read-only file system" in out and "buildok" in out
+        assert "egress" in out, f"the builder must reach the index: {out}"
+    finally:
+        container.remove(force=True)
+
+
+def test_provision_builds_real_deps_in_a_builder_and_ships_them_read_only(
+    manager: SandboxManager, raw_docker: Any
+) -> None:
+    """A real `pip install flask` happens in a builder that is gone afterwards; the jail
+    stays network-none, can import flask through /deps, and cannot modify /deps."""
+    before = {c.id for c in labelled_containers(raw_docker)}
+    sbx = manager.create("scn_provision", FLASK_REPO)
+    try:
+        jail_cid = sbx.container_id
+        # the jail cannot import flask on its own (stock python:3.13-slim, no egress)
+        assert sbx.run("python3 -c 'import flask'").exit_code != 0
+        t0 = time.perf_counter()
+        result = sbx.provision()
+        elapsed = time.perf_counter() - t0
+        assert result.status == "provisioned", result
+        assert result.manifests == ["requirements.txt"]
+        names = {p.split()[0].lower() for p in result.installed}
+        assert {"flask", "werkzeug", "jinja2"} <= names, result.installed
+        assert result.failed == [] and 0 < result.size_bytes <= CONFIG.deps_max_bytes
+        assert elapsed < CONFIG.deps_timeout_s
+        # the builder is gone; the jail's container was not replaced
+        assert {c.id for c in labelled_containers(raw_docker)} == before | {jail_cid}
+        assert not any(c.labels.get(LABEL_BUILDER) for c in labelled_containers(raw_docker)), (
+            "no builder container may outlive the build"
+        )
+        assert sbx.container_id == jail_cid and sbx.info().provisioned is True
+        # shipped read-only, owned by the keeper, importable through PYTHONPATH ...
+        r = sbx.run(
+            f"stat -c '%u' {SANDBOX_DEPS}/flask; touch {SANDBOX_DEPS}/flask/evil 2>&1; "
+            f"rm -rf {SANDBOX_DEPS}/flask 2>&1; python3 -c 'import flask; print(flask.__file__)'"
+        )
+        assert r.stdout.splitlines()[0] == str(KEEPER_UID), r
+        assert f"cannot touch '{SANDBOX_DEPS}/flask/evil': Permission denied" in r.stdout, r
+        assert f"cannot remove '{SANDBOX_DEPS}/flask/__init__.py': Permission denied" in r.stdout
+        assert r.stdout.strip().endswith(f"{SANDBOX_DEPS}/flask/__init__.py"), r
+        # ... but NOT under `python3 -I` (the oracle adds /deps itself; PYTHONPATH is ignored)
+        assert sbx.run("python3 -I -c 'import flask'").exit_code != 0
+        # the jail still has no network at all
+        assert "eth0" not in sbx.run("ls /sys/class/net").stdout
+        net = sbx.run(
+            "python3 -c \"import urllib.request as u; u.urlopen('https://pypi.org', timeout=3)\"",
+            timeout_s=10,
+        )
+        assert net.exit_code != 0 and net.timed_out is False
+        # the real Flask app now imports and serves a request inside the jail
+        r = sbx.run(
+            "python3 -c 'from app import app; c = app.test_client(); "
+            'print(c.get("/items?name=widget").status_code)\''
+        )
+        assert r.stdout.strip() == "200", r
+        # reset() recreates the jail WITH the deps; the workspace is clean again
+        sbx.run("echo junk > /workspace/junk")
+        info = sbx.reset()
+        assert info.resets == 1 and info.provisioned is True
+        assert sbx.run("python3 -c 'import flask'; ls /workspace/junk 2>&1").exit_code != 0
+        assert sbx.run("python3 -c 'import flask; print(1)'").stdout == "1\n"
+    finally:
+        sbx.destroy()
+    assert {c.id for c in labelled_containers(raw_docker)} == before
+
+
+def test_provision_without_a_manifest_starts_no_builder(
+    manager: SandboxManager, raw_docker: Any
+) -> None:
+    before = {c.id for c in labelled_containers(raw_docker)}
+    sbx = manager.create("scn_nomanifest", FIXTURE_REPO)
+    try:
+        result = sbx.provision()
+        assert result.status == "skipped" and "no dependency manifest" in result.detail
+        assert {c.id for c in labelled_containers(raw_docker)} == before | {sbx.container_id}
+        assert sbx.info().provisioned is False and sbx.run("echo ok").stdout == "ok\n"
+    finally:
+        sbx.destroy()
+
+
+def test_provision_is_bounded_by_the_size_cap(raw_docker: Any) -> None:
+    """A cap smaller than Flask's ~2.4 MB footprint: the build is discarded, nothing is
+    shipped, the builder is gone and the jail keeps working without deps."""
+    tiny = SandboxManager(dataclasses.replace(CONFIG, deps_mb=1))
+    before = {c.id for c in labelled_containers(raw_docker)}
+    sbx = tiny.create("scn_cap", FLASK_REPO)
+    try:
+        result = sbx.provision()
+        assert result.status == "failed", result
+        assert "cap" in result.detail or "space" in result.detail.lower(), result.detail
+        assert sbx.info().provisioned is False
+        assert sbx.run("python3 -c 'import flask'").exit_code != 0
+        assert sbx.run("echo ok").stdout == "ok\n"
+        assert {c.id for c in labelled_containers(raw_docker)} == before | {sbx.container_id}
+    finally:
+        sbx.destroy()
+        tiny.close()
 
 
 # ---------------------------------------------------------------------------

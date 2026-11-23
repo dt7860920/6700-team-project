@@ -17,7 +17,13 @@ with ``verified=False`` and a :class:`~ono.models.Verification` record saying wh
 stopped it; it is never silently dropped and never falsely marked verified.
 
 One jail is opened for the whole verify stage and reset between findings so a patch from
-one never leaks into the next.
+one never leaks into the next. Right after it opens, the target's declared third-party
+dependencies are **provisioned** (``sandbox.provision()``: built by the Executor in an
+ephemeral, hardened, network-enabled builder and shipped read-only into the network-less
+jail) so a PoC can import a real Flask/Django/FastAPI app instead of dying at ``import``.
+Provisioning is best-effort and honest: ``skipped`` (no manifest), ``disabled``, or
+``failed`` all fall back to the no-deps jail, and every finding's
+:class:`~ono.models.Verification` records which it was.
 """
 
 from __future__ import annotations
@@ -38,14 +44,34 @@ from ono.agents.tools import SandboxExecutor, ToolBox
 from ono.agents.trajectory import Trajectory, TrajectoryWriter
 from ono.config import Settings
 from ono.errors import PipelineError
-from ono.executor.client import ExecutorAuthError, ExecutorError, ExecutorUnavailableError
+from ono.executor.client import (
+    ExecutorAuthError,
+    ExecutorError,
+    ExecutorRequestError,
+    ExecutorUnavailableError,
+    SandboxNotFoundError,
+)
+from ono.executor.models import ProvisionResult
 from ono.learning.harvest import harvest_report
 from ono.learning.memory import KnowledgeMemory
 from ono.models import Finding, Verification, VerificationCheck
 from ono.progress import ProgressCallback
-from ono.verifier.oracle import OracleResult, SinkOracle, explain, new_canary, oracle_supports
+from ono.verifier.oracle import (
+    OracleResult,
+    SinkOracle,
+    explain,
+    new_canary,
+    oracle_supports,
+    summarize,
+)
 
-__all__ = ["ExecutorProvider", "GradedVerifier", "VerifyReport", "verify_anchor"]
+__all__ = [
+    "ExecutorProvider",
+    "GradedVerifier",
+    "VerifyReport",
+    "environment_note",
+    "verify_anchor",
+]
 
 log = logging.getLogger(__name__)
 
@@ -76,6 +102,7 @@ class VerifyReport:
     budget_limit: int = 0
     stopped_early: str = ""
     harvested: int = 0  # verified solutions written into the knowledge memory
+    dependencies: ProvisionResult | None = None  # what provisioning did for the jail
 
     @property
     def summary(self) -> str:
@@ -84,11 +111,43 @@ class VerifyReport:
             f"{self.reachable}/{n} proven reachable (rung 3), {self.fixed} fixed (rung 4); "
             f"{self.model_calls}/{self.budget_limit} model call(s)"
         )
+        if self.dependencies is not None:
+            text += f"; dependencies {self.dependencies.summary}"
         if self.harvested:
             text += f"; harvested {self.harvested} into knowledge memory"
         if self.stopped_early:
             text += f"; stopped early: {self.stopped_early}"
         return text
+
+
+def environment_note(result: ProvisionResult | None) -> str:
+    """What the prover is told about third-party packages in the jail (technique, not a key).
+
+    Names the packages that ARE importable (so the prover imports the real app instead of
+    stubbing its framework) and the ones that are not (so it stubs exactly those). It never
+    carries a payload or the canary.
+    """
+    if result is None or result.status != "provisioned":
+        why = result.summary if result is not None else "provisioning did not run"
+        return (
+            "Sandbox environment: NO third-party packages are installed "
+            f"({why}). Only the standard library and the repository's own modules import; "
+            "stub any other import with unittest.mock (sys.modules[...] = MagicMock()) "
+            "before importing the app."
+        )
+    packages = ", ".join(result.installed[:40]) + (" ..." if len(result.installed) > 40 else "")
+    text = (
+        "Sandbox environment: the repository's declared third-party packages ARE installed "
+        f"(from {', '.join(result.installed_from)}): {packages}. Import the application "
+        "normally and drive it with its real framework (test client); do not stub these."
+    )
+    if result.failed:
+        missing = ", ".join(f.split(" (", 1)[0] for f in result.failed[:10])
+        text += (
+            f" NOT installed (build failed): {missing} - if the app imports one of them, "
+            "stub it with unittest.mock before the import."
+        )
+    return text
 
 
 def verify_anchor(finding: Finding, sandbox: SandboxExecutor) -> VerificationCheck:
@@ -161,6 +220,8 @@ class GradedVerifier:
         report_progress(f"Opening the verifier sandbox for {total} finding(s)")
         try:
             with self.executor.sandbox(scan_id, workspace) as sandbox:
+                report.dependencies = self._provision(scan_id, sandbox, report_progress)
+                note = environment_note(report.dependencies)
                 for index, finding in enumerate(items):
                     if index:
                         sandbox.reset()  # a fresh copy: no patch leaks between findings
@@ -169,7 +230,9 @@ class GradedVerifier:
                         f"({finding.cwe})"
                     )
                     try:
-                        proven = self._verify_one(scan_id, sandbox, finding, budget)
+                        proven = self._verify_one(
+                            scan_id, sandbox, finding, budget, note, report.dependencies
+                        )
                     except BudgetExhaustedError as exc:
                         report.stopped_early = str(exc)
                         break
@@ -201,11 +264,50 @@ class GradedVerifier:
         log.info("verifier[%s]: %s", scan_id, report.summary)
         return report
 
+    # -- dependency provisioning ---------------------------------------------------------
+    def _provision(
+        self, scan_id: str, sandbox: SandboxExecutor, report_progress: ProgressCallback
+    ) -> ProvisionResult:
+        """Ask the Executor to build + ship the target's dependencies. Never fails the stage:
+        any outcome other than ``provisioned`` means the jail stays stdlib-only."""
+        if not self.settings.sandbox_deps_enabled:
+            result = ProvisionResult(
+                status="disabled",
+                detail="dependency provisioning is off (SANDBOX_DEPS_ENABLED=false)",
+            )
+        else:
+            report_progress("Provisioning the target's declared dependencies for the verifier")
+            try:
+                result = sandbox.provision(timeout_s=self.settings.sandbox_deps_timeout_s)
+            except (ExecutorRequestError, SandboxNotFoundError) as exc:
+                # A 404 right after a successful create is an Executor without the route
+                # (older build); any other 4xx/5xx is a provisioning failure. Either way the
+                # jail is still there and the no-deps path is the honest fallback.
+                result = ProvisionResult(
+                    status="failed", detail=f"the Executor could not provision: {exc}"
+                )
+        if result.status == "provisioned":
+            log.info("verifier[%s]: dependencies %s", scan_id, result.summary)
+        else:
+            log.warning(
+                "verifier[%s]: no third-party packages in the jail (%s)", scan_id, result.summary
+            )
+        report_progress(f"Dependencies: {result.summary[:300]}")
+        return result
+
     # -- one finding ------------------------------------------------------------------
     def _verify_one(
-        self, scan_id: str, sandbox: SandboxExecutor, finding: Finding, budget: CallBudget
+        self,
+        scan_id: str,
+        sandbox: SandboxExecutor,
+        finding: Finding,
+        budget: CallBudget,
+        note: str = "",
+        dependencies: ProvisionResult | None = None,
     ) -> Finding:
         v = Verification()
+        if dependencies is not None:
+            v.dependencies = dependencies.summary[:500]
         deadline = time.monotonic() + self.settings.verifier_finding_timeout_s
         toolbox = ToolBox(sandbox, max_output_chars=self.settings.agent_tool_output_chars)
 
@@ -229,7 +331,17 @@ class GradedVerifier:
         oracle = SinkOracle(sandbox, timeout_s=self.settings.verifier_poc_timeout_s)
         canary = new_canary()
         poc, poc_check = self._prove_reachable(
-            scan_id, finding, window, toolbox, oracle, canary, budget, deadline, v, memory_hint
+            scan_id,
+            finding,
+            window,
+            toolbox,
+            oracle,
+            canary,
+            budget,
+            deadline,
+            v,
+            memory_hint,
+            note,
         )
         v.checks.append(poc_check)
         if poc is None or poc_check.status != "passed":
@@ -260,9 +372,11 @@ class GradedVerifier:
         deadline: float,
         v: Verification,
         memory_hint: str = "",
+        note: str = "",
     ) -> tuple[Poc | None, VerificationCheck]:
         previous: Poc | None = None
-        failure = ""
+        failure = ""  # the full explanation, for the prover's next attempt
+        summary = ""  # the short one (exception's last line, hint), for the record
         for attempt in range(1, self.settings.max_verifier_retries + 1):
             if time.monotonic() > deadline:
                 return None, VerificationCheck(
@@ -282,11 +396,12 @@ class GradedVerifier:
                 previous=previous,
                 failure=failure,
                 memory_hint=memory_hint,
+                environment_note=note,
             )
             v.model_calls += traj.model_calls
             self.trajectories.write(traj)
             if outcome.answer is None:
-                failure = f"no PoC was produced ({outcome.reason})"
+                failure = summary = f"no PoC was produced ({outcome.reason})"
                 continue
             previous = outcome.answer
             result = oracle.run(finding, outcome.answer.code, canary)
@@ -299,14 +414,15 @@ class GradedVerifier:
                     detail=result.evidence or "payload reached the flagged sink",
                 )
             failure = explain(result, finding)
+            summary = summarize(result, finding)
             log.info(
-                "verifier[%s]: PoC attempt %d did not fire: %s", scan_id, attempt, failure[:200]
+                "verifier[%s]: PoC attempt %d did not fire: %s", scan_id, attempt, summary[:300]
             )
         return previous, VerificationCheck(
             name="poc_reaches_sink",
             status="failed",
             detail=f"no read-only PoC reached {finding.location} in "
-            f"{self.settings.max_verifier_retries} attempt(s): {failure[:400]}",
+            f"{self.settings.max_verifier_retries} attempt(s): {summary[:600]}",
         )
 
     def _prove_fixed(

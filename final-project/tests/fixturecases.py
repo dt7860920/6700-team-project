@@ -33,6 +33,8 @@ class FixtureCase:
     naive_poc: str  # a plausible from-scratch script that never reaches the sink
     reachable: bool = True  # whether an honest PoC can prove it (False = planted FP)
     note: str = ""
+    needs_deps: bool = False  # the app imports a third-party package (flask, fastapi, ...)
+    expected_packages: tuple[str, ...] = ()  # names provisioning must have installed
 
     @property
     def dir(self) -> Path:
@@ -173,3 +175,94 @@ CHEAT_POC = (
 
 REACHABLE_CASES: list[FixtureCase] = [SQLI_LOGIN_CASE, CMD_INJECTION_CASE, PATH_TRAVERSAL_CASE]
 ALL_CASES: list[FixtureCase] = [*REACHABLE_CASES, SAFE_QUERY_CASE]
+
+# ---------------------------------------------------------------------------
+# REAL third-party-framework apps: the sink sits inside a route handler and the module
+# cannot even be imported without the framework. Proving these needs dependency
+# provisioning (the hardened builder) on top of the entry-point PoC - exactly the wall the
+# live 10-repo run hit (`import flask` -> ModuleNotFoundError -> poc_reaches_sink failed).
+# ---------------------------------------------------------------------------
+
+FLASK_SQLI_CASE = FixtureCase(
+    name="flask_sqli_behind_login",
+    fixture="flask_sqli_app",
+    cwe="CWE-89",
+    sink_file="app.py",
+    sink_line=49,
+    source=TraceStep(
+        file="app.py", line=46, symbol='request.args.get("q")', note="attacker-controlled GET param"
+    ),
+    honest_poc=(
+        "import os\n"
+        "from app import app  # a REAL Flask app: needs the provisioned `flask` package\n"
+        "client = app.test_client()\n"
+        'payload = os.environ["ONO_PAYLOAD"]\n'
+        'client.post("/login", data={"username": "admin", "password": "s3cret"})\n'
+        'client.get("/account/search", query_string={"q": payload})\n'
+    ),
+    # Skips the login precondition: a 401 before the sink runs.
+    naive_poc=(
+        "import os\n"
+        "from app import app\n"
+        'app.test_client().get("/account/search", query_string={"q": os.environ["ONO_PAYLOAD"]})\n'
+    ),
+    note="Flask route interpolates the search term into SQL text; needs flask to import",
+    needs_deps=True,
+    expected_packages=("flask",),
+)
+
+# The same Flask app, a PLANTED false positive: /items binds its parameter. Even with the
+# framework provisioned and the route driven, the canary never reaches the SQL text.
+FLASK_SAFE_CASE = FixtureCase(
+    name="flask_parameterized_false_positive",
+    fixture="flask_sqli_app",
+    cwe="CWE-89",
+    sink_file="app.py",
+    sink_line=58,
+    source=TraceStep(
+        file="app.py", line=55, symbol='request.args.get("name")', note="attacker-controlled param"
+    ),
+    honest_poc=(
+        "import os\n"
+        "from app import app\n"
+        'app.test_client().get("/items", query_string={"name": os.environ["ONO_PAYLOAD"]})\n'
+    ),
+    naive_poc="import os\nfrom app import app\n",
+    reachable=False,
+    note="parameterized query inside a Flask route flagged as SQLi (planted false positive)",
+    needs_deps=True,
+    expected_packages=("flask",),
+)
+
+FASTAPI_CMD_CASE = FixtureCase(
+    name="fastapi_cmd_injection_behind_token",
+    fixture="fastapi_cmd_app",
+    cwe="CWE-78",
+    sink_file="main.py",
+    sink_line=23,
+    source=TraceStep(
+        file="main.py", line=19, symbol="host: str", note="attacker-controlled query param"
+    ),
+    honest_poc=(
+        "import os\n"
+        "from fastapi.testclient import TestClient  # needs the provisioned fastapi + httpx\n"
+        "from main import app\n"
+        "TestClient(app).get(\n"
+        '    "/admin/ping", params={"host": os.environ["ONO_PAYLOAD"]}, '
+        'headers={"x-token": "ops-token-7f3a"}\n'
+        ")\n"
+    ),
+    # Skips the token precondition: a 403 before the sink runs.
+    naive_poc=(
+        "import os\n"
+        "from fastapi.testclient import TestClient\n"
+        "from main import app\n"
+        'TestClient(app).get("/admin/ping", params={"host": os.environ["ONO_PAYLOAD"]})\n'
+    ),
+    note="FastAPI route concatenates the host into a shell command; deps come from pyproject",
+    needs_deps=True,
+    expected_packages=("fastapi", "httpx"),
+)
+
+DEPENDENCY_CASES: list[FixtureCase] = [FLASK_SQLI_CASE, FASTAPI_CMD_CASE]
+"""Reachable only once the framework is provisioned: the before/after prove-rate set."""

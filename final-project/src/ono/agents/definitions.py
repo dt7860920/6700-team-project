@@ -152,8 +152,9 @@ Rules for the script:
 - Reach the sink through the application's own entry point (you are given the entry point
   and a framework-specific scaffold): drive the framework's test client (flask:
   app.test_client(); fastapi/starlette: TestClient(app); django: configure settings then
-  django.test.Client()) or call the app's front controller / route handler. Only modules
-  the repository already imports are available; nothing can be installed.
+  django.test.Client()) or call the app's front controller / route handler. The task tells
+  you which third-party packages are installed in the sandbox ("Sandbox environment");
+  nothing else can be installed - stub any other import with unittest.mock.
 - Get PAST import-time setup: importing the app often runs module-level code that needs a
   DB, a secret or a service the jail lacks, and it raises before the sink is reached. Set
   required env vars with os.environ.setdefault(...) BEFORE the import and stub module-level

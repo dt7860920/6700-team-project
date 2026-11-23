@@ -407,6 +407,13 @@ def run_oracle(config: dict[str, Any], root: str) -> dict[str, Any]:
     os.environ[PAYLOAD_ENV] = state.canary
     if root not in sys.path:
         sys.path.insert(0, root)
+    # Provisioned third-party packages (the jail's read-only /deps). The oracle runs under
+    # ``python3 -I`` so PYTHONPATH is ignored on purpose; the Executor-controlled directory
+    # is appended explicitly - AFTER the workspace and the stdlib, so nothing in it can
+    # shadow either.
+    for extra in config.get("sys_path") or []:
+        if isinstance(extra, str) and os.path.isdir(extra) and extra not in sys.path:
+            sys.path.append(extra)
     os.chdir(root)
     out, err = io.StringIO(), io.StringIO()
     real_out, real_err = sys.stdout, sys.stderr

@@ -1,0 +1,2 @@
+# Era-appropriate pin: Flask 3.x is the line that supports Python 3.13.
+flask>=3.0,<4

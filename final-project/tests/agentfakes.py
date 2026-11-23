@@ -27,6 +27,7 @@ from typing import Any
 
 from ono.agents.model import CallBudget, ModelReply
 from ono.config import AgentToolProtocol
+from ono.executor._builder import find_manifests
 from ono.executor._guest import apply_patch as guest_apply_patch
 from ono.executor.client import (
     ExecutorAuthError,
@@ -39,6 +40,7 @@ from ono.executor.models import (
     GrepMatch,
     GrepResult,
     PatchResult,
+    ProvisionResult,
     RunResult,
     SandboxInfo,
     TestRunResult,
@@ -281,6 +283,26 @@ class LocalExecSandbox(LocalSandbox):
         super().__init__(workspace, sandbox_id=sandbox_id)
         self.resets = 0
         self.runs: list[str] = []
+        self.provision_result: ProvisionResult | None = None  # scripted answer, if any
+        self.provision_calls = 0
+
+    def provision(self, timeout_s: float | None = None) -> ProvisionResult:
+        """No builder offline: ``skipped`` without a manifest, ``failed`` with one (the
+        honest no-deps fallback the verifier must cope with), unless scripted."""
+        self.provision_calls += 1
+        self._maybe_fail()
+        if self.provision_result is not None:
+            return self.provision_result
+        manifests = find_manifests(str(self.root))
+        if not manifests:
+            return ProvisionResult(
+                status="skipped", detail="no dependency manifest in the workspace"
+            )
+        return ProvisionResult(
+            status="failed",
+            manifests=manifests,
+            detail="the offline test sandbox has no builder container",
+        )
 
     def apply_patch(self, diff: str) -> PatchResult:
         result = guest_apply_patch(str(self.root), diff)
