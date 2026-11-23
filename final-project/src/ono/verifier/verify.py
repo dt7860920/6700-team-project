@@ -220,7 +220,8 @@ class GradedVerifier:
         report_progress(f"Opening the verifier sandbox for {total} finding(s)")
         try:
             with self.executor.sandbox(scan_id, workspace) as sandbox:
-                report.dependencies = self._provision(scan_id, sandbox, report_progress)
+                near = _dedupe([finding.file for finding in items])
+                report.dependencies = self._provision(scan_id, sandbox, report_progress, near)
                 note = environment_note(report.dependencies)
                 for index, finding in enumerate(items):
                     if index:
@@ -266,10 +267,16 @@ class GradedVerifier:
 
     # -- dependency provisioning ---------------------------------------------------------
     def _provision(
-        self, scan_id: str, sandbox: SandboxExecutor, report_progress: ProgressCallback
+        self,
+        scan_id: str,
+        sandbox: SandboxExecutor,
+        report_progress: ProgressCallback,
+        near: list[str],
     ) -> ProvisionResult:
-        """Ask the Executor to build + ship the target's dependencies. Never fails the stage:
-        any outcome other than ``provisioned`` means the jail stays stdlib-only."""
+        """Ask the Executor to build + ship the target's dependencies. ``near`` lists the
+        findings' sink files so the builder provisions from the manifest NEAREST each one
+        (union with the root manifest). Never fails the stage: any outcome other than
+        ``provisioned`` means the jail stays stdlib-only."""
         if not self.settings.sandbox_deps_enabled:
             result = ProvisionResult(
                 status="disabled",
@@ -278,7 +285,9 @@ class GradedVerifier:
         else:
             report_progress("Provisioning the target's declared dependencies for the verifier")
             try:
-                result = sandbox.provision(timeout_s=self.settings.sandbox_deps_timeout_s)
+                result = sandbox.provision(
+                    timeout_s=self.settings.sandbox_deps_timeout_s, near=near
+                )
             except (ExecutorRequestError, SandboxNotFoundError) as exc:
                 # A 404 right after a successful create is an Executor without the route
                 # (older build); any other 4xx/5xx is a provisioning failure. Either way the
@@ -329,7 +338,7 @@ class GradedVerifier:
         memory_hint = self.memory.seed_for(finding) if self.memory is not None else ""
         v.seeded = bool(memory_hint)
         oracle = SinkOracle(sandbox, timeout_s=self.settings.verifier_poc_timeout_s)
-        canary = new_canary()
+        canary = new_canary(finding.cwe)
         poc, poc_check = self._prove_reachable(
             scan_id,
             finding,
@@ -573,6 +582,17 @@ class GradedVerifier:
             ToolCall("read_lines", {"path": finding.file, "start": start, "end": end})
         )
         return result.text
+
+
+def _dedupe(items: Sequence[str]) -> list[str]:
+    """Order-preserving de-duplication (the findings' sink files for nearest-manifest)."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in items:
+        if item and item not in seen:
+            seen.add(item)
+            out.append(item)
+    return out
 
 
 def _rerun_staged_poc(oracle: SinkOracle, finding: Finding, canary: str) -> OracleResult:

@@ -285,11 +285,15 @@ class LocalExecSandbox(LocalSandbox):
         self.runs: list[str] = []
         self.provision_result: ProvisionResult | None = None  # scripted answer, if any
         self.provision_calls = 0
+        self.provision_near: list[str] = []
 
-    def provision(self, timeout_s: float | None = None) -> ProvisionResult:
+    def provision(
+        self, timeout_s: float | None = None, *, near: list[str] | None = None
+    ) -> ProvisionResult:
         """No builder offline: ``skipped`` without a manifest, ``failed`` with one (the
         honest no-deps fallback the verifier must cope with), unless scripted."""
         self.provision_calls += 1
+        self.provision_near = list(near or [])
         self._maybe_fail()
         if self.provision_result is not None:
             return self.provision_result

@@ -31,7 +31,9 @@ from ono.executor._builder import (
     Build,
     find_manifests,
     is_pinned,
+    manifest_install_sets,
     manifest_kind,
+    nearest_manifests,
     plan_installs,
     plan_pipfile,
     plan_pyproject,
@@ -70,6 +72,8 @@ FIXTURES = Path(__file__).parent / "fixtures"
 FLASK_APP = FIXTURES / "flask_sqli_app"
 FASTAPI_APP = FIXTURES / "fastapi_cmd_app"
 NO_MANIFEST_APP = FIXTURES / "sqli_login_app"
+NESTED_FLASK_APP = FIXTURES / "nested_flask_app"
+NESTED_SINK = "dockerized_labs/sqli_lab/app.py"
 TOKEN = "unit-test-token-0123456789"
 
 
@@ -334,6 +338,71 @@ def test_plan_installs_priority(tmp_path: Path) -> None:
     (tmp_path / "setup.cfg").write_text("[options]\ninstall_requires = click\n")
     sets, _, needs_build = plan_installs(str(tmp_path), find_manifests(str(tmp_path)))
     assert [s.args for s in sets] == [["click"]] and needs_build is False
+
+
+def test_nearest_manifests_walks_up_from_the_sink(tmp_path: Path) -> None:
+    (tmp_path / "requirements.txt").write_text("django\n")
+    lab = tmp_path / "dockerized_labs" / "sqli_lab"
+    lab.mkdir(parents=True)
+    (lab / "requirements.txt").write_text("flask\n")
+    (lab / "app.py").write_text("x = 1\n")
+    # the lab's OWN manifest wins for a sink inside it ...
+    assert nearest_manifests(str(tmp_path), NESTED_SINK) == [
+        "dockerized_labs/sqli_lab/requirements.txt"
+    ]
+    # ... a sink with no nearer manifest falls back to the repository root ...
+    (tmp_path / "other").mkdir()
+    (tmp_path / "other" / "x.py").write_text("x = 1\n")
+    assert nearest_manifests(str(tmp_path), "other/x.py") == ["requirements.txt"]
+    # ... and a tree with no manifest at all yields nothing.
+    bare = tmp_path / "bare"
+    (bare / "pkg").mkdir(parents=True)
+    (bare / "pkg" / "m.py").write_text("x = 1\n")
+    assert nearest_manifests(str(bare), "pkg/m.py") == []
+
+
+def test_manifest_install_sets_for_a_nested_requirements(tmp_path: Path) -> None:
+    lab = tmp_path / "labs" / "a"
+    lab.mkdir(parents=True)
+    (lab / "requirements.txt").write_text("flask>=3\n")
+    sets, needs_build = manifest_install_sets(
+        str(tmp_path), "labs/a/requirements.txt", primary=True
+    )
+    assert needs_build is False
+    assert [(s.label, s.primary) for s in sets] == [("labs/a/requirements.txt", True)]
+    assert sets[0].args == ["-r", str(lab / "requirements.txt")]
+
+
+def test_build_provisions_from_the_nearest_manifest(tmp_path: Path) -> None:
+    """The headline of the manifest fix: a Django root + a nested Flask lab provisions BOTH
+    (Flask from the lab's own manifest, as PRIMARY, unioned with the root Django); without
+    ``near`` the root scan sees only Django and the Flask lab would die at import."""
+    src, site = tmp_path / "src", tmp_path / "site"
+    shutil.copytree(NESTED_FLASK_APP, src)
+    site.mkdir()
+    result = Build(_build_config(src, site, near=[NESTED_SINK]), FakePip(site)).run()
+    assert result["status"] == "provisioned", result
+    installed = {p.split()[0].lower() for p in result["installed"]}
+    assert "flask" in installed and "django" in installed  # nearest + root union
+    # the nearest (nested) manifest is installed FIRST, as the primary set
+    assert result["installed_from"][0] == "dockerized_labs/sqli_lab/requirements.txt"
+    assert result["manifests"][0] == "dockerized_labs/sqli_lab/requirements.txt"
+    # WITHOUT near (the pre-fix behaviour) the depth-bounded root scan sees only Django
+    shutil.rmtree(site)
+    site.mkdir()
+    before = Build(_build_config(src, site), FakePip(site)).run()
+    assert {p.split()[0].lower() for p in before["installed"]} == {"django"}
+
+
+def test_provision_from_nearest_manifest_on_the_fake_docker(
+    manager: SandboxManager, fake: FakeDocker
+) -> None:
+    sbx = manager.create("scn_near", NESTED_FLASK_APP)
+    result = sbx.provision(near=[NESTED_SINK])
+    assert result.status == "provisioned", result
+    names = {p.split()[0].lower() for p in result.installed}
+    assert "flask" in names and "django" in names
+    assert "dockerized_labs/sqli_lab/requirements.txt" in result.manifests
 
 
 def test_requirement_name_and_pins() -> None:

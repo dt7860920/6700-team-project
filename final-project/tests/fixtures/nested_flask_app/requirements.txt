@@ -1,0 +1,5 @@
+# The REPOSITORY-ROOT manifest: this is a Django project at its top level. Provisioning
+# from THIS file alone (the old behaviour) installs Django - never Flask - so the vulnerable
+# nested Flask lab below dies at `import flask`. The pygoat shape the nearest-manifest fix
+# targets.
+Django>=4.2,<6

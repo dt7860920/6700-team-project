@@ -280,12 +280,17 @@ class ExecutorClient:
         )
         return TestRunResult.model_validate(response.json())
 
-    def provision(self, sandbox_id: str, timeout_s: float | None = None) -> ProvisionResult:
+    def provision(
+        self, sandbox_id: str, timeout_s: float | None = None, *, near: list[str] | None = None
+    ) -> ProvisionResult:
         """Build the workspace's declared dependencies in the Executor's builder and ship
-        them into the jail. A failed build is a result (``status="failed"``), not an error."""
+        them into the jail. ``near`` lists sink files to provision from the nearest manifest.
+        A failed build is a result (``status="failed"``), not an error."""
         body: dict[str, Any] = {}
         if timeout_s is not None:
             body["timeout_s"] = timeout_s
+        if near:
+            body["near"] = list(near)
         # Build budget + extraction + archive round-trips: generous, the server caps it.
         response = self._request(
             "POST",
@@ -343,8 +348,10 @@ class SandboxHandle:
     def run_tests(self, timeout_s: float | None = None) -> TestRunResult:
         return self.client.run_tests(self.sandbox_id, timeout_s)
 
-    def provision(self, timeout_s: float | None = None) -> ProvisionResult:
-        return self.client.provision(self.sandbox_id, timeout_s)
+    def provision(
+        self, timeout_s: float | None = None, *, near: list[str] | None = None
+    ) -> ProvisionResult:
+        return self.client.provision(self.sandbox_id, timeout_s, near=near)
 
     def reset(self) -> SandboxInfo:
         self.info = self.client.reset(self.sandbox_id)

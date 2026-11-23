@@ -187,6 +187,15 @@ class ProvisionRequest(BaseModel):
         gt=0,
         description="Wall-clock budget for the build; capped by the server's deps timeout.",
     )
+    near: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Sink files (workspace-relative) to provision from the NEAREST manifest: the "
+            "builder walks up from each file's directory to the closest requirements*.txt / "
+            "pyproject.toml / setup.cfg / setup.py / Pipfile and installs that first, unioned "
+            "with the repository root manifest. Empty = root-manifest behaviour only."
+        ),
+    )
 
 
 class ProvisionResult(BaseModel):

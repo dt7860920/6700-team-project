@@ -88,6 +88,91 @@ def manifest_kind(rel: str) -> str | None:
     }.get(name)
 
 
+_PROJECT_MANIFESTS = {
+    "pyproject.toml": "pyproject",
+    "setup.cfg": "setup_cfg",
+    "setup.py": "setup_py",
+    "Pipfile": "pipfile",
+}
+
+
+def basename_manifest_kind(name: str) -> str | None:
+    """Classify a manifest by its BASENAME alone (any depth) - for nearest-to-sink walking.
+
+    Unlike :func:`manifest_kind` (which bounds depth for the root scan), this accepts a
+    project manifest wherever it sits, because walking up from a sink deliberately visits
+    nested application directories (a Flask app under ``dockerized_labs/<lab>/``).
+    """
+    if _REQ_FILE.match(name):
+        return "requirements"
+    return _PROJECT_MANIFESTS.get(name)
+
+
+def manifests_in_dir(root: str, rel_dir: str) -> list[str]:
+    """Manifest files directly inside ``root/rel_dir`` (workspace-relative, sorted)."""
+    abs_dir = os.path.join(root, rel_dir) if rel_dir else root
+    try:
+        names = sorted(os.listdir(abs_dir))
+    except OSError:
+        return []
+    out: list[str] = []
+    for name in names:
+        if basename_manifest_kind(name) is None:
+            continue
+        if not os.path.isfile(os.path.join(abs_dir, name)):
+            continue
+        out.append(f"{rel_dir}/{name}" if rel_dir else name)
+    return out
+
+
+def nearest_manifests(root: str, sink_rel: str) -> list[str]:
+    """Walk UP from the sink file's directory to ``root``; return the manifests in the CLOSEST
+    ancestor directory that declares any. Empty if none exist between the sink and the root.
+
+    This is what lets a nested app's OWN requirements win over an unrelated root manifest:
+    a Flask sink in ``dockerized_labs/lab/app.py`` provisions ``dockerized_labs/lab/
+    requirements.txt`` (Flask), not the Django ``requirements.txt`` at the repository root.
+    """
+    rel = sink_rel.replace("\\", "/").strip("/")
+    parts = [p for p in rel.split("/") if p not in ("", ".")]
+    dirs = parts[:-1]  # drop the filename itself
+    while True:
+        found = manifests_in_dir(root, "/".join(dirs))
+        if found:
+            return found
+        if not dirs:
+            return []
+        dirs = dirs[:-1]
+
+
+def manifest_install_sets(root: str, rel: str, *, primary: bool) -> tuple[list[InstallSet], bool]:
+    """``(install sets, needs_build)`` for ONE manifest at ``rel`` (any depth). ``needs_build``
+    means the file declares no static dependency list and its metadata must be built."""
+    path = os.path.join(root, rel)
+    kind = basename_manifest_kind(os.path.basename(rel))
+    if kind == "requirements":
+        reqs = requirement_lines(path)
+        return [InstallSet(rel, args=["-r", path], requirements=reqs, primary=primary)], False
+    if kind == "pyproject":
+        prim, extra, _ = plan_pyproject(path)
+        if prim is not None:
+            return [InstallSet(rel, args=prim, requirements=prim, primary=primary), *extra], False
+        return list(extra), True
+    if kind == "setup_cfg":
+        prim, extra = plan_setup_cfg(path)
+        if prim is not None:
+            return [InstallSet(rel, args=prim, requirements=prim, primary=primary), *extra], False
+        return list(extra), True
+    if kind == "pipfile":
+        prim, extra = plan_pipfile(path)
+        if prim is not None:
+            return [InstallSet(rel, args=prim, requirements=prim, primary=primary), *extra], False
+        return list(extra), False
+    if kind == "setup_py":
+        return [], True
+    return [], False
+
+
 def find_manifests(root: str) -> list[str]:
     """Every manifest under ``root`` (relative paths, sorted, root files first)."""
     found: list[str] = []
@@ -543,6 +628,8 @@ class Build:
         self.max_bytes = int(config.get("max_bytes", 256_000_000))
         self.deadline = time.monotonic() + float(config.get("timeout_s", 300.0))
         self.pip = pip or run_pip(self.site)
+        # Sink files the verifier wants provisioned FROM the nearest manifest (workspace-rel).
+        self.near: list[str] = [str(p) for p in (config.get("near") or []) if isinstance(p, str)]
         self.manifests: list[str] = []
         self.installed_from: list[str] = []
         self.failed: list[str] = []
@@ -596,11 +683,27 @@ class Build:
 
     def run(self) -> dict[str, Any]:
         started = time.perf_counter()
-        self.manifests = find_manifests(self.src)
+        root_manifests = find_manifests(self.src)
+        # Manifests nearest each sink file come FIRST (installed as primary); the root manifest
+        # is unioned in behind them so the app's own framework wins without losing shared deps.
+        near_manifests: list[str] = []
+        for sink in self.near:
+            for rel in nearest_manifests(self.src, sink):
+                if rel not in near_manifests and rel not in root_manifests:
+                    near_manifests.append(rel)
+        self.manifests = near_manifests + [m for m in root_manifests if m not in near_manifests]
         if not self.manifests:
             return self.result(started, status="skipped")
-        sets, warnings, needs_build = plan_installs(self.src, self.manifests)
+
+        sets: list[InstallSet] = []
+        for rel in near_manifests:
+            near_sets, near_needs_build = manifest_install_sets(self.src, rel, primary=True)
+            sets += near_sets
+            if near_needs_build:
+                self._build_into(sets, rel)
+        root_sets, warnings, needs_build = plan_installs(self.src, root_manifests)
         self.warnings += warnings
+        sets += root_sets
         if needs_build:
             reqs, why = build_metadata(self.src, self.remaining())
             if reqs is None:
@@ -608,7 +711,7 @@ class Build:
             else:
                 label = (
                     "setup.py (built metadata)"
-                    if "setup.py" in self.manifests
+                    if "setup.py" in root_manifests
                     else ("pyproject.toml (built metadata)")
                 )
                 sets.insert(0, InstallSet(label, args=reqs, requirements=reqs, primary=True))
@@ -633,6 +736,19 @@ class Build:
             self.error = "nothing could be installed: " + "; ".join(self.failed)[:600]
             return self.result(started, status="failed")
         return self.result(started, status="provisioned")
+
+    def _build_into(self, sets: list[InstallSet], rel: str) -> None:
+        """A nearest manifest (setup.py / dynamic pyproject) whose metadata must be built."""
+        rel_dir = os.path.dirname(rel)
+        build_dir = os.path.join(self.src, rel_dir) if rel_dir else self.src
+        reqs, why = build_metadata(build_dir, self.remaining())
+        if reqs is None:
+            self.warnings.append(why)
+        else:
+            sets.insert(
+                0,
+                InstallSet(f"{rel} (built metadata)", args=reqs, requirements=reqs, primary=True),
+            )
 
     def pip_ok(self, item: InstallSet) -> bool:
         """Install one set; a failing *secondary* set is a warning, a primary one is reported."""
