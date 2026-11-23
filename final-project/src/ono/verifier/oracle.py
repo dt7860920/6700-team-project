@@ -23,7 +23,7 @@ from importlib import resources
 from typing import Any
 
 from ono.agents.tools import SandboxExecutor
-from ono.executor.models import RunResult
+from ono.executor.models import SANDBOX_DEPS, RunResult
 from ono.models import Finding
 from ono.verifier._oracle import RESULT_MARKER, SUPPORTED_CWES, family_of
 
@@ -36,6 +36,7 @@ __all__ = [
     "oracle_supports",
     "parse_result",
     "stage_command",
+    "summarize",
 ]
 
 log = logging.getLogger(__name__)
@@ -114,6 +115,9 @@ def oracle_command(finding: Finding, canary: str) -> str:
         "canary": canary,
         "poc": POC_FILE,
         "tolerance": 3,
+        # Provisioned dependencies (read-only, Executor-controlled); appended to sys.path
+        # by the oracle only if the directory exists - a no-deps jail is unaffected.
+        "sys_path": [SANDBOX_DEPS],
     }
     return f"python3 -I {ORACLE_FILE} {shlex.quote(json.dumps(config))}"
 
@@ -155,6 +159,16 @@ def parse_result(run: RunResult) -> OracleResult:
 
 def explain(result: OracleResult, finding: Finding) -> str:
     """Why a run did not prove the finding - specific enough for the prover to act on."""
+    return _explain(result, finding, full_traceback=True)
+
+
+def summarize(result: OracleResult, finding: Finding) -> str:
+    """The same verdict for the finding's record: the exception's LAST line instead of the
+    traceback tail, so a clipped detail still names the cause (``ModuleNotFoundError: ...``)."""
+    return _explain(result, finding, full_traceback=False)
+
+
+def _explain(result: OracleResult, finding: Finding, *, full_traceback: bool) -> str:
     if not result.ok:
         return result.error
     if result.fired:
@@ -187,15 +201,23 @@ def explain(result: OracleResult, finding: Finding) -> str:
             f"no instrumented sink saw the payload; the script never reached {finding.location}"
         )
     if result.poc_error:
-        parts.append("the script raised:\n" + result.poc_error.strip()[-_TAIL:])
+        if full_traceback:
+            parts.append("the script raised:\n" + result.poc_error.strip()[-_TAIL:])
+        else:
+            parts.append("the script raised: " + _last_line(result.poc_error))
         hint = _import_failure_hint(result.poc_error)
         if hint:
             parts.append(hint)
     elif result.poc_exit not in (0, None):
         parts.append(f"the script exited with status {result.poc_exit}")
-    if result.poc_stderr.strip():
+    if result.poc_stderr.strip() and full_traceback:
         parts.append("stderr tail:\n" + result.poc_stderr.strip()[-_TAIL:])
     return "; ".join(parts) if len(parts) == 1 else parts[0] + "\n" + "\n".join(parts[1:])
+
+
+def _last_line(text: str) -> str:
+    lines = [ln.strip() for ln in text.strip().splitlines() if ln.strip()]
+    return lines[-1][:300] if lines else ""
 
 
 def _import_failure_hint(traceback_text: str) -> str:

@@ -47,14 +47,22 @@ def run_prover(
     previous: Poc | None = None,
     failure: str = "",
     memory_hint: str = "",
+    environment_note: str = "",
 ) -> ReactOutcome[Poc]:
     """One bounded attempt. ``previous`` / ``failure`` carry the verifier's feedback;
-    ``memory_hint`` is a prior verified PoC for this sink class (the learning loop)."""
+    ``memory_hint`` is a prior verified PoC for this sink class (the learning loop);
+    ``environment_note`` says which third-party packages the jail has (or has not)."""
     return run_react(
         model,
         definition,
         task=_task_prompt(
-            finding, window_text, definition.max_steps, previous, failure, memory_hint
+            finding,
+            window_text,
+            definition.max_steps,
+            previous,
+            failure,
+            memory_hint,
+            environment_note,
         ),
         toolbox=toolbox,
         budget=budget,
@@ -76,6 +84,7 @@ def _task_prompt(
     previous: Poc | None,
     failure: str,
     memory_hint: str = "",
+    environment_note: str = "",
 ) -> str:
     trace = "\n".join(f"  {t.file}:{t.line}  {t.symbol}  ({t.note})" for t in f.trace) or "  -"
     text = (
@@ -89,6 +98,8 @@ def _task_prompt(
         f"{f.line_range[0]}):\n{window_text}\n\n"
         f"{scaffold_for(f, window_text)}\n\n"
     )
+    if environment_note:
+        text += environment_note + "\n\n"
     if memory_hint and previous is None:
         text += memory_hint + "\n\n"
     if previous is not None:

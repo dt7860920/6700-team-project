@@ -28,6 +28,7 @@ from ono.executor.models import (
     FileContent,
     GrepResult,
     PatchResult,
+    ProvisionResult,
     RunResult,
     SandboxInfo,
     TestRunResult,
@@ -81,6 +82,8 @@ class SandboxExecutor(SandboxReader, Protocol):
     def run(self, cmd: str, timeout_s: float | None = None) -> RunResult: ...
 
     def run_tests(self, timeout_s: float | None = None) -> TestRunResult: ...
+
+    def provision(self, timeout_s: float | None = None) -> ProvisionResult: ...
 
     def reset(self) -> SandboxInfo: ...
 

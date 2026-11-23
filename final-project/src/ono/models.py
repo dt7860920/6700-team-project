@@ -176,6 +176,14 @@ class Verification(BaseModel):
     seeded: bool = Field(
         default=False, description="Whether a knowledge-memory hint was seeded into the prover."
     )
+    dependencies: str = Field(
+        default="",
+        description=(
+            "What dependency provisioning did for the verifier jail: 'provisioned N "
+            "package(s) from requirements.txt', 'skipped: no dependency manifest ...', "
+            "'disabled: ...' or 'failed: <why>' (the PoC then ran without third-party packages)."
+        ),
+    )
     checks: list[VerificationCheck] = Field(default_factory=list)
     poc: str = Field(default="", description="The read-only PoC script that proved rung 3.")
     evidence: str = Field(
