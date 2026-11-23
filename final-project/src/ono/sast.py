@@ -20,7 +20,14 @@ Network - registry rulesets (``p/owasp-top-ten`` and the per-language ``p/...`` 
 are fetched from semgrep.dev by the Semgrep CLI at scan time and cached locally, so this
 stage is *not* air-gapped by default even though metrics and version checks are off.
 For fully offline operation point ``sast_ruleset`` at a local rules file or directory
-(any ``--config`` value Semgrep accepts) instead of ``p/...`` names.
+(any ``--config`` value Semgrep accepts) instead of ``p/...`` names (issue #105).
+
+Sandbox - on Linux semgrep-core is run under ``setarch -R`` to disable ASLR (it segfaults
+on some kernels otherwise), but that prefix cannot set the process personality inside a
+hardened container that drops capabilities and sets no-new-privileges: ``setarch`` then
+exits "Operation not permitted" and semgrep never starts. :func:`run_semgrep` detects that
+and transparently retries without the prefix, so SAST does not silently collapse to the
+Python-only regex fallback (which returns zero candidates on JS/Java/Go/... targets).
 
 Deliberately NOT here yet (later steps): CodeQL / SARIF ingestion, call-graph
 enrichment of candidates, entry-point union.
@@ -72,6 +79,17 @@ _SEMGREP_COMPLETED_EXIT_CODES = frozenset({0, 1, 3})
 # spells them, compared case-insensitively) plus the prose markers older versions emit.
 _SEMGREP_FATAL_ERROR_TYPES = frozenset({"fatal error", "out of memory", "stack overflow"})
 _SEMGREP_CRASH_MARKERS = ("exited with", "engine was killed", "Fatal error", "out of memory")
+# The ``setarch -R`` ASLR-off prefix (see ``_aslr_safe_prefix``) cannot change the process
+# personality inside a hardened sandbox - the app container drops all capabilities and sets
+# no-new-privileges, so ``setarch`` fails with "Operation not permitted" and the whole
+# ``setarch ... semgrep`` command exits non-zero BEFORE semgrep ever runs (so there is no
+# JSON to parse). Detecting these markers in stderr lets ``run_semgrep`` transparently retry
+# without the prefix instead of silently falling back to the Python-only regex scanner.
+_SEMGREP_SETARCH_FAILURE_MARKERS = (
+    "setarch:",
+    "failed to set personality",
+    "operation not permitted",
+)
 # Environment handed to the Semgrep subprocess (issue #106): what it needs to run, keep its
 # settings / rule cache and (for ``p/...`` packs) reach the registry through a proxy or a
 # custom CA - never the host's model keys, executor token or anything else this process
@@ -431,6 +449,32 @@ def _is_fatal_error(error: object) -> bool:
     return any(marker in message for marker in _SEMGREP_CRASH_MARKERS)
 
 
+def _run_semgrep_subprocess(cmd: list[str], root: Path) -> subprocess.CompletedProcess[str]:
+    """One Semgrep invocation (fixed argv, no shell, cwd is our workspace, scrubbed env)."""
+    return subprocess.run(
+        cmd,
+        cwd=root,
+        env=semgrep_env(),
+        capture_output=True,
+        text=True,
+        timeout=_SEMGREP_RUN_TIMEOUT_S,
+        check=False,
+    )
+
+
+def setarch_failed(proc: subprocess.CompletedProcess[str]) -> bool:
+    """Did the ``setarch`` ASLR-off prefix fail to set the process personality?
+
+    True when the command exited non-zero and its stderr carries a ``setarch`` personality
+    marker - the signature of a cap-dropped / no-new-privileges sandbox where ``setarch``
+    cannot run (so semgrep never started and there is nothing to parse).
+    """
+    if proc.returncode == 0:
+        return False
+    stderr = (proc.stderr or "").lower()
+    return any(marker in stderr for marker in _SEMGREP_SETARCH_FAILURE_MARKERS)
+
+
 def run_semgrep(root: Path, rulesets: Iterable[str]) -> dict[str, object]:
     """Execute Semgrep and return its parsed JSON document.
 
@@ -438,21 +482,30 @@ def run_semgrep(root: Path, rulesets: Iterable[str]) -> dict[str, object]:
     produced no results but did not complete (see :func:`semgrep_failure_reason`) and an
     output document over :data:`_SEMGREP_MAX_STDOUT_BYTES`. Separated from
     :func:`parse_semgrep_results` so tests can feed canned JSON without a binary.
+
+    The ``setarch -R`` ASLR-off prefix guards semgrep-core against a kernel-specific segfault,
+    but it cannot run in a hardened sandbox (dropped caps + no-new-privileges). When the
+    prefixed attempt fails with a ``setarch`` personality error, this retries WITHOUT the
+    prefix so real Semgrep still runs inside the container instead of silently degrading to
+    the Python-only regex fallback (which returns zero candidates on JS/Java/Go/... repos).
     """
     executable = semgrep_executable()
     if executable is None:
         raise SemgrepUnavailableError("semgrep is not installed")
-    cmd = _aslr_safe_prefix() + semgrep_command(root, rulesets, executable)
+    base_cmd = semgrep_command(root, rulesets, executable)
+    prefix = _aslr_safe_prefix()
     try:
-        proc = subprocess.run(  # fixed argv, no shell, cwd is our own workspace, scrubbed env
-            cmd,
-            cwd=root,
-            env=semgrep_env(),
-            capture_output=True,
-            text=True,
-            timeout=_SEMGREP_RUN_TIMEOUT_S,
-            check=False,
-        )
+        if prefix:
+            proc = _run_semgrep_subprocess(prefix + base_cmd, root)
+            if setarch_failed(proc):
+                log.warning(
+                    "sast(semgrep): the setarch ASLR-off prefix could not set the process "
+                    "personality (%s); retrying without it so semgrep runs in this sandbox",
+                    (proc.stderr or "").strip().splitlines()[-1:] or ["no stderr"],
+                )
+                proc = _run_semgrep_subprocess(base_cmd, root)
+        else:
+            proc = _run_semgrep_subprocess(base_cmd, root)
     except FileNotFoundError as exc:
         raise SemgrepUnavailableError(f"semgrep is not installed: {exc}") from exc
     except subprocess.TimeoutExpired as exc:

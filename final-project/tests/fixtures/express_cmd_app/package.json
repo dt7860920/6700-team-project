@@ -1,0 +1,9 @@
+{
+  "name": "express-cmd-app",
+  "version": "0.0.0",
+  "private": true,
+  "main": "server.js",
+  "dependencies": {
+    "express": "^4.18.0"
+  }
+}

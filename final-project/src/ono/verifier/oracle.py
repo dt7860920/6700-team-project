@@ -188,11 +188,46 @@ def explain(result: OracleResult, finding: Finding) -> str:
         )
     if result.poc_error:
         parts.append("the script raised:\n" + result.poc_error.strip()[-_TAIL:])
+        hint = _import_failure_hint(result.poc_error)
+        if hint:
+            parts.append(hint)
     elif result.poc_exit not in (0, None):
         parts.append(f"the script exited with status {result.poc_exit}")
     if result.poc_stderr.strip():
         parts.append("stderr tail:\n" + result.poc_stderr.strip()[-_TAIL:])
     return "; ".join(parts) if len(parts) == 1 else parts[0] + "\n" + "\n".join(parts[1:])
+
+
+def _import_failure_hint(traceback_text: str) -> str:
+    """Turn a common import-time crash into an actionable instruction for the next attempt.
+
+    The dominant real-app failure is the PoC dying while importing the app (module-level
+    code needs a DB / secret / service the jail lacks), never reaching the sink. Naming the
+    fix - stub it - is what turns a stuck loop into a proof. This is technique, not an
+    answer key: it never carries a payload or a canary.
+    """
+    tail = traceback_text.strip().splitlines()[-1:] or [""]
+    last = tail[0]
+    if "KeyError" in last and "environ" in traceback_text:
+        return (
+            "the app read a required environment variable at import time; set it with "
+            'os.environ.setdefault("<VAR>", "x") BEFORE importing the app'
+        )
+    if last.startswith(("ModuleNotFoundError", "ImportError")):
+        return (
+            "a module could not be imported at load time; only drive modules the repository "
+            "already ships - stub an optional/third-party dependency with unittest.mock, or "
+            "import the specific handler module rather than the whole package"
+        )
+    if last.startswith(("OperationalError", "ConnectionError", "ConnectionRefusedError")) or (
+        "connect" in traceback_text and ("Error" in last)
+    ):
+        return (
+            "the app opened a database/network connection at import time; stub it with "
+            "unittest.mock (patch the connect/engine factory the module imports, .start() it "
+            "before the import) so execution can reach the sink"
+        )
+    return ""
 
 
 class SinkOracle:

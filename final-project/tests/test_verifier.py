@@ -161,6 +161,26 @@ def test_explain_names_the_cheating_poc() -> None:
     assert "not the flagged sink" in explain(result, finding)
 
 
+def test_explain_hints_at_an_import_time_env_dependency() -> None:
+    """The dominant real-app failure (import crashes before the sink) gets an actionable hint."""
+    finding = _finding(file="app/server.py", line=41, cwe="CWE-89")
+    tb = (
+        'Traceback (most recent call last):\n  File "app/config.py", line 9, in <module>\n'
+        "    SECRET_KEY = os.environ[\"ACCOUNT_SECRET_KEY\"]\nKeyError: 'ACCOUNT_SECRET_KEY'\n"
+    )
+    result = OracleResult(ok=True, fired=False, poc_error=tb)
+    message = explain(result, finding)
+    assert "never reached" in message
+    assert "os.environ.setdefault" in message  # the fix the prover should apply next
+
+
+def test_explain_hints_at_an_import_time_module_dependency() -> None:
+    finding = _finding(file="app/views.py", line=10, cwe="CWE-89")
+    tb = "Traceback (most recent call last):\n  ...\nModuleNotFoundError: No module named 'redis'\n"
+    result = OracleResult(ok=True, fired=False, poc_error=tb)
+    assert "unittest.mock" in explain(result, finding)
+
+
 # ---------------------------------------------------------------------------
 # rung 3 + rung 4 end to end (real oracle, real patch, real pytest)
 # ---------------------------------------------------------------------------
