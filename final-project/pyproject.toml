@@ -42,6 +42,13 @@ dev = [
   "pytest-asyncio>=0.24",
   "ruff>=0.8",
   "types-PyYAML>=6.0",
+  # Pure-Python libraries the OFFLINE sink-oracle tests drive directly (host interpreter).
+  # The REAL (docker) oracle installs whatever a target declares; these just let the added
+  # CWE families (SSTI / open-redirect / XSS / LDAP / XXE) be exercised without a container.
+  "flask>=3.0",        # brings werkzeug + jinja2 (SSTI, open-redirect, reflected-output hooks)
+  "ldap3>=2.9",        # LDAP injection hook
+  "defusedxml>=0.7",   # the SAFE side of the XXE hook (entity-forbidding parser)
+  "mako>=1.3",         # the Mako branch of the SSTI hook
 ]
 
 [project.scripts]
@@ -90,9 +97,10 @@ select = [
 "src/ono/verifier/_oracle.py" = ["PTH"]
 # Same for the in-builder dependency installer: shipped by value into the builder container.
 "src/ono/executor/_builder.py" = ["PTH"]
-# Deliberately-vulnerable fixture: the path-traversal sink NEEDS os.path.join + open() (the
-# oracle's ``open`` audit hook keys on the builtin); rewriting to pathlib would erase the bug.
+# Deliberately-vulnerable fixtures: the path-traversal / file-path sinks NEED os.path.join +
+# open() (the oracle's ``open`` audit hook keys on the builtin); pathlib would erase the bug.
 "tests/fixtures/pathtrav_app/*" = ["PTH"]
+"tests/fixtures/flask_family_app/*" = ["PTH"]
 
 [tool.mypy]
 python_version = "3.13"
@@ -111,6 +119,14 @@ follow_imports = "skip"
 # docker-py ships no type information (no py.typed, no stubs on typeshed). The sandbox
 # layer coerces every value it reads from the SDK to a concrete type.
 module = ["docker", "docker.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# Optional security libraries the in-jail sink oracle wraps behind guarded imports. They are
+# not runtime dependencies of ONO (the jail installs whatever a target declares); the oracle
+# treats every value it reads from them as Any, so their missing/partial stubs must not block
+# the strict gate.
+module = ["mako.*", "lxml", "lxml.*", "ldap3", "ldap3.*", "ldap", "ldap.*", "pymongo", "pymongo.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

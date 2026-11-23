@@ -490,7 +490,7 @@ def create_executor_app(
     )
     def provision(sandbox: SandboxDep, body: ProvisionRequest | None = None) -> ProvisionResult:
         body = body or ProvisionRequest()
-        return sandbox.provision(body.timeout_s)
+        return sandbox.provision(body.timeout_s, near=body.near)
 
     return app
 

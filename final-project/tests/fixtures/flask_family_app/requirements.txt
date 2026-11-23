@@ -1,0 +1,3 @@
+# A real Flask app whose routes host the added CWE families. The verifier's builder installs
+# flask into the network-none jail so the real app imports (the XPath route uses the stdlib).
+flask>=3.0,<4

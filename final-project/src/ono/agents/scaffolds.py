@@ -136,6 +136,37 @@ as 'skipped', not proven. This scaffold is for completeness / future work.""",
 }
 
 
+# Per-CWE guidance on WHERE the payload must land for the oracle to observe it. This is
+# technique, never an answer key: it still tells the prover to read os.environ["ONO_PAYLOAD"]
+# and drive the real request path, and the oracle still picks the canary and requires the
+# flagged line on the stack. A hint only names the shape of the dangerous argument so the
+# prover aims the payload at it (e.g. an off-site URL for open redirect, markup for XSS).
+_CWE_HINTS: dict[str, str] = {
+    "CWE-1336": "SSTI: the payload must land in the TEMPLATE BODY that is rendered (e.g. the "
+    "string passed to render_template_string / Environment.from_string), not merely in the "
+    "render context.",
+    "CWE-917": "SSTI: put the payload in the template STRING that is compiled/rendered.",
+    "CWE-643": "XPath injection: the payload must be concatenated into the XPath EXPRESSION text "
+    "(.xpath(...) / findall(...)), not bound as a variable.",
+    "CWE-90": "LDAP injection: the payload must reach the search FILTER string unescaped - the "
+    "oracle's payload carries metacharacters that a proper escaper would remove.",
+    "CWE-943": "NoSQL injection: the payload must reach a query OPERATOR position (a $where JS "
+    "string, or a $-prefixed operator key), not a plain parameterised field value.",
+    "CWE-611": "XXE: send XML whose DOCTYPE declares an entity built from the payload to the "
+    "parser (e.g. lxml.etree.fromstring / minidom.parseString) - a DTD-forbidding parser is safe.",
+    "CWE-601": "Open redirect: drive the route with an OFF-SITE absolute URL that contains the "
+    'payload (e.g. next="//attacker.example/<payload>"); a fixed internal path is not a redirect.',
+    "CWE-73": "File-path control: the payload must make the opened path escape its intended "
+    'directory (a "../" traversal or an attacker-controlled directory component).',
+    "CWE-79": "Reflected output: the payload (which carries HTML markup) must appear UNESCAPED in "
+    "the response body built at the flagged line (Response(...) / make_response(...)).",
+}
+
+
+def _cwe_hint(cwe: str) -> str:
+    return _CWE_HINTS.get(cwe, "")
+
+
 def scaffold_for(finding: Finding, window_text: str) -> str:
     """The scaffold block injected into the prover's task prompt for this finding."""
     framework = detect_framework(finding, window_text)
@@ -147,6 +178,10 @@ def scaffold_for(finding: Finding, window_text: str) -> str:
         _IMPORT_STUB_RECIPE,
         "",
     ]
+    hint = _cwe_hint(finding.cwe)
+    if hint:
+        parts.append(hint)
+        parts.append("")
     if framework and framework in _FRAMEWORK_SCAFFOLDS:
         parts.append(f"Detected framework: {framework}.")
         parts.append(_FRAMEWORK_SCAFFOLDS[framework])

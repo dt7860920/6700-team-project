@@ -80,7 +80,7 @@ import requests
 
 from ono.config import Settings
 from ono.executor._builder import RESULT_MARKER as BUILD_RESULT_MARKER
-from ono.executor._builder import manifest_kind
+from ono.executor._builder import basename_manifest_kind, manifest_kind
 from ono.executor._guest import GuestError, split_rel
 from ono.executor.archive import (
     SANDBOX_UID,
@@ -722,8 +722,13 @@ class Sandbox:
             self.deps.remove()
 
     # -- dependency provisioning (the builder phase) ------------------------------
-    def provision(self, timeout_s: float | None = None) -> ProvisionResult:
+    def provision(
+        self, timeout_s: float | None = None, *, near: list[str] | None = None
+    ) -> ProvisionResult:
         """Build the workspace's declared Python dependencies and ship them into ``/deps``.
+
+        ``near`` lists sink files to provision from the NEAREST manifest (walk up to the
+        closest one, union with the root); empty = root-manifest behaviour.
 
         Never raises for a failed build: the result says ``skipped`` (no manifest),
         ``disabled`` (the Executor's switch is off) or ``failed`` (build broke, timed out,
@@ -731,6 +736,7 @@ class Sandbox:
         third-party packages - the pre-provisioning behaviour. Only ``provisioned`` means
         the packages are importable in the jail. Re-provisioning replaces the previous set.
         """
+        near = near or []
         with self._lock:
             self._require_running()
             if not self.config.deps_enabled:
@@ -739,7 +745,10 @@ class Sandbox:
                     detail="dependency provisioning is disabled on this Executor "
                     "(SANDBOX_DEPS_ENABLED=false)",
                 )
-            manifests = snapshot_manifests(self.snapshot)
+            # Gate on the union of root manifests and any manifest nearest a sink (which may
+            # sit deeper than the root scan reaches), so a nested app with its OWN manifest is
+            # still provisioned even when the repository root declares none.
+            manifests = snapshot_manifests(self.snapshot, near=near)
             if not manifests:
                 return ProvisionResult(
                     status="skipped",
@@ -750,7 +759,7 @@ class Sandbox:
             if timeout_s is not None:
                 budget = min(budget, timeout_s)
             snapshot, result = self.manager.build_dependencies(
-                self, manifests, timeout_s=max(1.0, budget)
+                self, manifests, timeout_s=max(1.0, budget), near=near
             )
             if snapshot is None:
                 return result
@@ -1083,17 +1092,45 @@ def _last_line(text: str) -> str:
     return ""
 
 
-def snapshot_manifests(snapshot: Snapshot) -> list[str]:
-    """Dependency manifests among a validated snapshot's members (a header-only scan)."""
+def snapshot_manifests(snapshot: Snapshot, *, near: list[str] | None = None) -> list[str]:
+    """Dependency manifests among a validated snapshot's members (a header-only scan).
+
+    The root scan (:func:`manifest_kind`) is depth-bounded; ``near`` additionally admits any
+    manifest that sits on the path from one of those sink files up to the root (by basename,
+    at any depth), so a nested application's own manifest is not missed.
+    """
+    near = near or []
+    ancestors: set[str] = set()
+    for sink in near:
+        ancestors |= set(_ancestor_dirs(sink))
     found: list[str] = []
     try:
         with tarfile.open(snapshot.path, mode="r:gz") as tar:
             for member in tar:
-                if member.isfile() and manifest_kind(member.name) is not None:
-                    found.append(member.name.removeprefix("./"))
+                if not member.isfile():
+                    continue
+                name = member.name.removeprefix("./")
+                if manifest_kind(name) is not None:
+                    found.append(name)
+                    continue
+                rel_dir = name.rsplit("/", 1)[0] if "/" in name else ""
+                if rel_dir in ancestors and basename_manifest_kind(name.rsplit("/", 1)[-1]):
+                    found.append(name)
     except (OSError, tarfile.TarError, EOFError):
         return []
     return sorted(set(found), key=lambda r: (r.count("/"), r != "requirements.txt", r))
+
+
+def _ancestor_dirs(sink_rel: str) -> list[str]:
+    """Every directory from the sink file's own directory up to (and including) the root."""
+    parts = [p for p in sink_rel.replace("\\", "/").strip("/").split("/") if p not in ("", ".")]
+    dirs = parts[:-1]
+    out: list[str] = []
+    while True:
+        out.append("/".join(dirs))
+        if not dirs:
+            return out
+        dirs = dirs[:-1]
 
 
 def _send_stdin(raw: Any, stdin: bytes | IO[bytes], deadline: float) -> None:
@@ -1354,7 +1391,12 @@ class SandboxManager:
 
     # -- the builder --------------------------------------------------------------
     def build_dependencies(
-        self, sandbox: Sandbox, manifests: list[str], *, timeout_s: float
+        self,
+        sandbox: Sandbox,
+        manifests: list[str],
+        *,
+        timeout_s: float,
+        near: list[str] | None = None,
     ) -> tuple[Snapshot | None, ProvisionResult]:
         """Install ``sandbox``'s declared dependencies in an ephemeral builder container.
 
@@ -1437,6 +1479,7 @@ class SandboxManager:
                 "site": BUILD_SITE,
                 "max_bytes": max_bytes,
                 "timeout_s": timeout_s,
+                "near": list(near or []),
             }
             outcome = _exec_in(
                 api,

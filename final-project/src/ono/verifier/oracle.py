@@ -25,16 +25,18 @@ from typing import Any
 from ono.agents.tools import SandboxExecutor
 from ono.executor.models import SANDBOX_DEPS, RunResult
 from ono.models import Finding
-from ono.verifier._oracle import RESULT_MARKER, SUPPORTED_CWES, family_of
+from ono.verifier._oracle import RESULT_MARKER, SUPPORTED_CWES, family_of, probe_for
 
 __all__ = [
     "ORACLE_DIR",
+    "SKIP_REASONS",
     "OracleResult",
     "SinkOracle",
     "explain",
     "new_canary",
     "oracle_supports",
     "parse_result",
+    "skip_reason",
     "stage_command",
     "summarize",
 ]
@@ -51,9 +53,43 @@ def _oracle_source() -> str:
     return resources.files("ono.verifier").joinpath("_oracle.py").read_text(encoding="utf-8")
 
 
-def new_canary() -> str:
-    """A fresh, unguessable payload: letters and digits only, so it survives any sink."""
-    return "ONO" + secrets.token_hex(8)
+def new_canary(cwe: str = "") -> str:
+    """A fresh, unguessable payload. The core is letters and digits only, so it survives any
+    sink unchanged; for the escaping-defended families (XSS/LDAP) a metacharacter probe is
+    appended so an escaped copy no longer matches (see ``_oracle.CANARY_PROBE``)."""
+    return "ONO" + secrets.token_hex(8) + probe_for(cwe)
+
+
+# CWEs the dynamic oracle deliberately does NOT try to prove: there is no runtime observation
+# where a secret canary reaching a dangerous argument distinguishes vulnerable from safe.
+# These findings stay honestly model-asserted (rung <= 2), never false-failed.
+SKIP_REASONS: dict[str, str] = {
+    "CWE-327": "weak/broken cryptography is a property of the ALGORITHM chosen, not of tainted "
+    "input reaching a sink - nothing a canary can trigger at runtime (stays model-asserted)",
+    "CWE-328": "use of a weak hash is an algorithm-choice property, not a tainted-data-flow sink",
+    "CWE-326": "inadequate key strength is a configuration property, not a runtime taint sink",
+    "CWE-798": "hard-coded credentials are static constants in the source; no canary flows into "
+    "them at runtime (detect by reading the code, not by driving a sink)",
+    "CWE-259": "a hard-coded password is a static constant, not a tainted-input sink",
+    "CWE-285": "improper authorization is a missing/weak CHECK; there is no dangerous argument a "
+    "canary lands in (stays model-asserted)",
+    "CWE-306": "missing authentication is the ABSENCE of a check, not a sink reached by taint",
+    "CWE-862": "missing authorization is an absent check, not a dangerous-argument sink",
+    "CWE-863": "incorrect authorization is a logic property of a check, not a taint sink",
+    "CWE-352": "CSRF is the absence of a token check; no canary-in-argument observation applies",
+    "CWE-319": "cleartext transmission is a transport-configuration property, not a runtime sink",
+    "CWE-16": "insecure configuration is a static property; nothing a canary triggers",
+    "CWE-732": "incorrect permission assignment is a filesystem-state property, not a taint sink",
+    "CWE-113": "CR/LF response-splitting is blocked at set-time by current WSGI/ASGI header "
+    "validation, so a tainted header value cannot reach a splittable response (model-asserted)",
+    "CWE-209": "information exposure through an error message is observed in output, not as a "
+    "canary in a dangerous argument; not dynamically proven this way",
+}
+
+
+def skip_reason(cwe: str) -> str:
+    """A precise reason this CWE is not dynamically provable, or '' if none is recorded."""
+    return SKIP_REASONS.get(cwe, "")
 
 
 def oracle_supports(finding: Finding) -> str:
@@ -62,9 +98,13 @@ def oracle_supports(finding: Finding) -> str:
         suffix = finding.file.rsplit(".", 1)[-1] if "." in finding.file else "?"
         return f"no dynamic sink oracle for .{suffix} files (Python only for now)"
     if finding.cwe not in SUPPORTED_CWES:
+        reason = skip_reason(finding.cwe)
+        if reason:
+            return f"{finding.cwe} is not dynamically provable: {reason}"
         return (
-            f"no sink oracle for {finding.cwe} (supported: SQL/command/code injection, "
-            "unsafe deserialization, path traversal, SSRF)"
+            f"no sink oracle for {finding.cwe} (dynamically proven families: SQL/command/code "
+            "injection, unsafe deserialization, path traversal, SSRF, SSTI, XPath, LDAP, NoSQL, "
+            "XXE, open redirect, file-name control, reflected unescaped output)"
         )
     return ""
 

@@ -266,3 +266,39 @@ FASTAPI_CMD_CASE = FixtureCase(
 
 DEPENDENCY_CASES: list[FixtureCase] = [FLASK_SQLI_CASE, FASTAPI_CMD_CASE]
 """Reachable only once the framework is provisioned: the before/after prove-rate set."""
+
+# The pygoat shape: a Django app at the repository ROOT whose vulnerable code lives in a
+# self-contained nested Flask lab with its OWN requirements.txt. Provisioning from the root
+# manifest (Django) leaves the lab dying at ``import flask``; the nearest-manifest fix walks
+# up from the sink to ``dockerized_labs/sqli_lab/requirements.txt`` (Flask) and installs that.
+NESTED_FLASK_SQLI_CASE = FixtureCase(
+    name="nested_flask_sqli_nearest_manifest",
+    fixture="nested_flask_app",
+    cwe="CWE-89",
+    sink_file="dockerized_labs/sqli_lab/app.py",
+    sink_line=40,
+    source=TraceStep(
+        file="dockerized_labs/sqli_lab/app.py",
+        line=37,
+        symbol='request.args.get("q")',
+        note="attacker-controlled GET param",
+    ),
+    honest_poc=(
+        "import os, sys\n"
+        'sys.path.insert(0, os.path.join(os.getcwd(), "dockerized_labs", "sqli_lab"))\n'
+        "from app import app  # nested Flask app: needs the NEAREST-manifest flask\n"
+        "client = app.test_client()\n"
+        'payload = os.environ["ONO_PAYLOAD"]\n'
+        'client.post("/login", data={"username": "admin", "password": "s3cret"})\n'
+        'client.get("/account/search", query_string={"q": payload})\n'
+    ),
+    naive_poc=(
+        "import os, sys\n"
+        'sys.path.insert(0, os.path.join(os.getcwd(), "dockerized_labs", "sqli_lab"))\n'
+        "from app import app\n"
+        'app.test_client().get("/account/search", query_string={"q": os.environ["ONO_PAYLOAD"]})\n'
+    ),
+    note="nested Flask SQLi; the fix must provision flask from the lab's own requirements.txt",
+    needs_deps=True,
+    expected_packages=("flask",),
+)

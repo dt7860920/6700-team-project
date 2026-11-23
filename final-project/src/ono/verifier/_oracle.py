@@ -51,6 +51,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
 import runpy
 import sys
 import time
@@ -67,15 +68,47 @@ TAIL_CHARS = 2000
 SHELLS = frozenset({"sh", "bash", "dash", "zsh", "ash", "ksh"})
 
 # CWE families: a hit of one member proves a finding labelled with any other member.
+# The KEY is the family's canonical root; members are alternate labels detectors may use.
 CWE_FAMILIES: dict[str, frozenset[str]] = {
-    "CWE-89": frozenset({"CWE-89", "CWE-943"}),
+    "CWE-89": frozenset({"CWE-89"}),
     "CWE-78": frozenset({"CWE-78", "CWE-77", "CWE-88"}),
     "CWE-94": frozenset({"CWE-94", "CWE-95", "CWE-96"}),
     "CWE-502": frozenset({"CWE-502", "CWE-20"}),
-    "CWE-22": frozenset({"CWE-22", "CWE-23", "CWE-36", "CWE-73"}),
+    "CWE-22": frozenset({"CWE-22", "CWE-23", "CWE-36"}),
     "CWE-918": frozenset({"CWE-918"}),
+    # -- added families (a secret canary reaching the dangerous argument is observable) --
+    "CWE-1336": frozenset({"CWE-1336", "CWE-917"}),  # server-side template injection (SSTI)
+    "CWE-643": frozenset({"CWE-643"}),  # XPath injection
+    "CWE-90": frozenset({"CWE-90"}),  # LDAP injection
+    "CWE-943": frozenset({"CWE-943"}),  # NoSQL / query-object injection
+    "CWE-611": frozenset({"CWE-611", "CWE-827"}),  # XML external entity (XXE)
+    "CWE-601": frozenset({"CWE-601"}),  # open redirect
+    "CWE-73": frozenset({"CWE-73"}),  # external control of file name/path (write & read)
+    "CWE-79": frozenset({"CWE-79", "CWE-80"}),  # reflected unescaped output (tainted->response)
 }
 SUPPORTED_CWES: frozenset[str] = frozenset().union(*CWE_FAMILIES.values())
+
+# The canary is normally alphanumeric so it survives transport and any sink unchanged:
+# for families whose SOLE defense is to RELOCATE the value out of the dangerous position
+# (SQL/LDAP-NoSQL bound parameters, XPath variable binding, template context vs. template
+# body, a hard-coded redirect target, a confined path) the plain core either reaches the
+# dangerous argument or it does not. A few families defend by NEUTRALISING a metacharacter
+# while keeping the surrounding text, so the alphanumeric core would match an escaped copy
+# too; for those the canary carries that metacharacter as a suffix probe and the sink hook
+# requires the WHOLE canary (probe intact) - an escaped/stripped copy no longer matches it.
+CANARY_CORE_LEN = 19  # "ONO" + secrets.token_hex(8)
+CANARY_PROBE: dict[str, str] = {
+    "CWE-79": "<x>",  # HTML-escaping turns < > into &lt; &gt;
+    "CWE-90": ")(|",  # LDAP filter escaping encodes ) ( \\ and *
+}
+
+
+def family_root(cwe: str) -> str:
+    """The canonical family key for ``cwe`` (itself if it heads no known family)."""
+    for root, members in CWE_FAMILIES.items():
+        if cwe in members:
+            return root
+    return cwe
 
 
 def family_of(cwe: str) -> frozenset[str]:
@@ -86,12 +119,22 @@ def family_of(cwe: str) -> frozenset[str]:
     return frozenset({cwe})
 
 
+def probe_for(cwe: str) -> str:
+    """The metacharacter suffix the canary must carry for ``cwe`` ("" for most families)."""
+    return CANARY_PROBE.get(family_root(cwe), "")
+
+
 class _State:
     """Everything a hook needs: the canary, the sink to match, the hits so far."""
 
     def __init__(self, config: dict[str, Any], root: str) -> None:
+        # ``canary`` is the full value the PoC injects (with any metacharacter probe); the
+        # alphanumeric ``core`` is what survives transport and is matched generically. The
+        # escaping-sensitive hooks additionally require the full canary (probe intact).
         self.canary: str = str(config["canary"])
-        self.canary_bytes = self.canary.encode("utf-8")
+        self.core: str = self.canary[:CANARY_CORE_LEN]
+        self.canary_bytes = self.core.encode("utf-8")
+        self.full_bytes = self.canary.encode("utf-8")
         self.sink_file: str = str(config["sink_file"]).replace("\\", "/").lstrip("./")
         self.line_start = int(config.get("line_start", 1))
         self.line_end = int(config.get("line_end", self.line_start))
@@ -162,24 +205,33 @@ class _State:
         )
 
     def contains(self, value: Any) -> bool:
-        """Does ``value`` (str / bytes / nested list-tuple-dict / anything) carry the canary?"""
+        """Does ``value`` (str / bytes / nested list-tuple-dict / anything) carry the canary
+        core? The core is alphanumeric, so it survives transport and escaping unchanged."""
+        return self._contains(value, self.core, self.canary_bytes)
+
+    def contains_full(self, value: Any) -> bool:
+        """Does ``value`` carry the WHOLE canary, metacharacter probe intact? Used by the
+        escaping-defended families (XSS/CRLF/LDAP): an escaped or stripped copy fails this."""
+        return self._contains(value, self.canary, self.full_bytes)
+
+    def _contains(self, value: Any, needle: str, needle_bytes: bytes) -> bool:
         try:
             if isinstance(value, str):
-                return self.canary in value
+                return needle in value
             if isinstance(value, (bytes, bytearray, memoryview)):
-                return self.canary_bytes in bytes(value)
+                return needle_bytes in bytes(value)
             if isinstance(value, (list, tuple, set, frozenset)):
-                return any(self.contains(v) for v in value)
+                return any(self._contains(v, needle, needle_bytes) for v in value)
             if isinstance(value, dict):
-                return any(self.contains(v) for v in value.values())
+                return any(self._contains(v, needle, needle_bytes) for v in value.values())
             if hasattr(value, "read") and hasattr(value, "seek"):
                 pos = value.tell()
                 data = value.read()
                 value.seek(pos)
-                return self.contains(data)
+                return self._contains(data, needle, needle_bytes)
             if value is None or isinstance(value, (int, float, bool)):
                 return False
-            return self.canary in str(value)
+            return needle in str(value)
         except Exception:
             return False
 
@@ -196,7 +248,8 @@ def _preview(value: Any, canary: str) -> str:
             text = str(value)
     except Exception:
         text = repr(value)
-    text = text.replace(canary, "<PAYLOAD>")
+    # Redact the full canary first (it contains the core), then the alphanumeric core.
+    text = text.replace(canary, "<PAYLOAD>").replace(canary[:CANARY_CORE_LEN], "<PAYLOAD>")
     return text[:PREVIEW_CHARS]
 
 
@@ -233,12 +286,13 @@ def _audit_hook(state: _State) -> Any:
             elif event == "open":
                 path = args[0]
                 if isinstance(path, (str, bytes, os.PathLike)):
-                    _record_path(state, "open", path)
+                    mode = args[1] if len(args) > 1 and isinstance(args[1], str) else "r"
+                    _record_path(state, "open", path, mode=mode)
             elif event in ("os.remove", "os.rmdir", "shutil.rmtree", "os.truncate"):
-                _record_path(state, event, args[0])
+                _record_path(state, event, args[0], mode="w")
             elif event in ("os.rename", "os.link", "os.symlink", "shutil.move", "shutil.copyfile"):
-                _record_path(state, event, args[0])
-                _record_path(state, event, args[1])
+                _record_path(state, event, args[0], mode="w")
+                _record_path(state, event, args[1], mode="w")
             elif event == "socket.getaddrinfo":
                 host = args[0]
                 state.record("CWE-918", "getaddrinfo", host, tainted=state.contains(host))
@@ -261,16 +315,27 @@ def _is_shell(executable: Any) -> bool:
         return False
 
 
-def _record_path(state: _State, kind: str, path: Any) -> None:
+def _record_path(state: _State, kind: str, path: Any, *, mode: str = "r") -> None:
     try:
         text = os.fsdecode(path) if isinstance(path, (bytes, os.PathLike)) else str(path)
     except Exception:
         return
     if not state.contains(text):
         return
-    parts = text.replace("\\", "/").split("/")
-    traversal = ".." in parts
+    normalized = text.replace("\\", "/")
+    segments = normalized.split("/")
+    traversal = ".." in segments
+    # CWE-22 (path traversal): the attacker's value walks OUT of the intended dir with ``..``.
     state.record("CWE-22", kind, text, tainted=traversal)
+    # CWE-73 (external control of file name/path, read OR write): the attacker's value escapes
+    # a confined LEAF - it either traverses with ``..`` or lands in a DIRECTORY component
+    # (controls where, not just which file). A safe handler confines to a fixed dir and keeps
+    # the attacker value as the final leaf only (``basename`` / allowlist), so core appears in
+    # no earlier segment and stays untainted. The open-mode is surfaced in the kind (write/read).
+    in_directory = any(state.contains(seg) for seg in segments[:-1])
+    writing = any(c in mode for c in ("w", "a", "x", "+"))
+    label = f"{kind}({'write' if writing else 'read'})"
+    state.record("CWE-73", label, text, tainted=traversal or in_directory)
 
 
 class _Proxy:
@@ -392,7 +457,388 @@ def _install_hooks(state: _State) -> list[str]:
         installed.append("yaml")
     except Exception:
         pass
+
+    _install_framework_hooks(state, installed)
     return installed
+
+
+# ---------------------------------------------------------------------------
+# Framework / library sink hooks (the added CWE families)
+#
+# Each wraps the REAL dangerous call of an optional third-party library and records whether
+# the secret canary reached its dangerous argument. All are best-effort and guarded: a
+# library that is not importable installs no hook (the finding then stays skipped/unproven,
+# never falsely failed). Like the audit hooks they only record while the PoC runs and only
+# count when the flagged line is on the call stack.
+# ---------------------------------------------------------------------------
+
+_SCHEME_RE = re.compile(r"^\s*(?:[a-z][a-z0-9+.\-]*:)?//", re.IGNORECASE)
+_XML_DTD = ("<!DOCTYPE", "<!ENTITY")
+_NOSQL_JS_OPS = ("$where", "$expr", "$function", "$accumulator", "$code")
+
+
+def _install_framework_hooks(state: _State, installed: list[str]) -> None:
+    for installer in (
+        _hook_templates,
+        _hook_xpath,
+        _hook_ldap,
+        _hook_nosql,
+        _hook_xxe,
+        _hook_redirect,
+        _hook_response,
+    ):
+        try:
+            installer(state, installed)
+        except Exception:  # one library's absence/oddity must never break the others
+            continue
+
+
+def _hook_templates(state: _State, installed: list[str]) -> None:
+    """SSTI (CWE-1336): the canary appears in a Jinja2 / Mako template BODY (vs. its context)."""
+    try:
+        import jinja2
+
+        env_cls = jinja2.Environment
+        original = env_cls.from_string
+
+        def from_string(self: Any, source: Any, *args: Any, **kwargs: Any) -> Any:
+            state.record("CWE-1336", "jinja2.from_string", source, tainted=state.contains(source))
+            return original(self, source, *args, **kwargs)
+
+        env_cls.from_string = from_string  # type: ignore[method-assign]
+        installed.append("jinja2")
+    except Exception:
+        pass
+    try:
+        import mako.template as mako_template
+
+        original_init = mako_template.Template.__init__
+
+        def init(self: Any, *args: Any, **kwargs: Any) -> None:
+            text = kwargs.get("text")
+            if text is None and args and isinstance(args[0], str):
+                text = args[0]
+            if isinstance(text, (str, bytes)):
+                state.record("CWE-1336", "mako.Template", text, tainted=state.contains(text))
+            original_init(self, *args, **kwargs)
+
+        mako_template.Template.__init__ = init
+        installed.append("mako")
+    except Exception:
+        pass
+
+
+def _hook_xpath(state: _State, installed: list[str]) -> None:
+    """XPath injection (CWE-643): the canary appears in the XPath EXPRESSION text."""
+    try:
+        from xml.etree import ElementPath
+
+        for name in ("find", "findall", "iterfind", "findtext"):
+            original = getattr(ElementPath, name, None)
+            if original is None:
+                continue
+            setattr(ElementPath, name, _xpath_wrapper(state, original, f"ElementTree.{name}"))
+        installed.append("xml.xpath")
+    except Exception:
+        pass
+    try:
+        from lxml import etree
+
+        for name in ("XPath", "ETXPath"):
+            original = getattr(etree, name, None)
+            if original is None:
+                continue
+            setattr(etree, name, _xpath_wrapper(state, original, f"lxml.{name}"))
+        installed.append("lxml.xpath")
+    except Exception:
+        pass
+
+
+def _xpath_wrapper(state: _State, original: Any, label: str) -> Any:
+    def wrapper(first: Any, *args: Any, **kwargs: Any) -> Any:
+        # ElementPath.<fn>(elem, path, ...): the expression is the SECOND positional;
+        # lxml.XPath(expr, ...): it is the first. Inspect whichever carries the canary.
+        expr = args[0] if label.startswith("ElementTree.") and args else first
+        state.record("CWE-643", label, expr, tainted=state.contains(expr))
+        return original(first, *args, **kwargs)
+
+    return wrapper
+
+
+def _hook_ldap(state: _State, installed: list[str]) -> None:
+    """LDAP injection (CWE-90): the canary (with its ``)(|`` probe INTACT) is in the filter."""
+    try:
+        import ldap3
+
+        original = ldap3.Connection.search
+
+        def search(self: Any, search_base: Any, search_filter: Any, *a: Any, **k: Any) -> Any:
+            state.record(
+                "CWE-90", "ldap3.search", search_filter, tainted=state.contains_full(search_filter)
+            )
+            return original(self, search_base, search_filter, *a, **k)
+
+        ldap3.Connection.search = search
+        installed.append("ldap3")
+    except Exception:
+        pass
+    try:
+        from ldap import ldapobject
+
+        for name in ("search_s", "search_ext_s", "search_st"):
+            original = getattr(ldapobject.LDAPObject, name, None)
+            if original is None:
+                continue
+            setattr(ldapobject.LDAPObject, name, _ldap_wrapper(state, original, f"ldap.{name}"))
+        installed.append("python-ldap")
+    except Exception:
+        pass
+
+
+def _ldap_wrapper(state: _State, original: Any, label: str) -> Any:
+    def wrapper(self: Any, base: Any, scope: Any, filterstr: Any = "", *a: Any, **k: Any) -> Any:
+        state.record("CWE-90", label, filterstr, tainted=state.contains_full(filterstr))
+        return original(self, base, scope, filterstr, *a, **k)
+
+    return wrapper
+
+
+def _hook_nosql(state: _State, installed: list[str]) -> None:
+    """NoSQL injection (CWE-943): the canary lands in a query OPERATOR (``$where`` JS, a
+    ``$``-prefixed key) rather than as a plain field value - operator/query-object injection."""
+    try:
+        from pymongo import collection
+
+        for name in (
+            "find",
+            "find_one",
+            "count_documents",
+            "delete_one",
+            "delete_many",
+            "update_one",
+            "update_many",
+        ):
+            original = getattr(collection.Collection, name, None)
+            if original is None:
+                continue
+            setattr(collection.Collection, name, _nosql_wrapper(state, original, f"pymongo.{name}"))
+        installed.append("pymongo")
+    except Exception:
+        pass
+
+
+def _nosql_wrapper(state: _State, original: Any, label: str) -> Any:
+    def wrapper(self: Any, query: Any = None, *a: Any, **k: Any) -> Any:
+        state.record("CWE-943", label, query, tainted=_nosql_tainted(state, query))
+        return original(self, query, *a, **k)
+
+    return wrapper
+
+
+def _nosql_tainted(state: _State, node: Any) -> bool:
+    """True if the canary core reaches a dangerous operator position in a Mongo query:
+    inside a JavaScript operator string (``$where`` / ``$expr`` / ...), or AS a ``$``-prefixed
+    operator KEY the attacker injected (query-object injection). A plain field value carrying
+    the canary - even under an ordinary operator like ``$regex`` / ``$gt`` - is the safe,
+    parameterised shape and does NOT count."""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if isinstance(key, str) and key in _NOSQL_JS_OPS and state.contains(value):
+                return True
+            if isinstance(key, str) and key.startswith("$") and state.contains(key):
+                return True
+            if _nosql_tainted(state, value):
+                return True
+        return False
+    if isinstance(node, (list, tuple)):
+        return any(_nosql_tainted(state, item) for item in node)
+    return False
+
+
+def _hook_xxe(state: _State, installed: list[str]) -> None:
+    """XXE (CWE-611): tainted XML carrying a DOCTYPE/ENTITY reaches an entity-resolving parser."""
+    try:
+        from lxml import etree
+
+        for name in ("fromstring", "XML", "parse"):
+            original = getattr(etree, name, None)
+            if original is None:
+                continue
+            setattr(etree, name, _xxe_wrapper(state, original, f"lxml.{name}"))
+        installed.append("lxml.xxe")
+    except Exception:
+        pass
+    try:
+        from xml.dom import minidom
+
+        original_parse_string = minidom.parseString
+
+        def parse_string(string: Any, *a: Any, **k: Any) -> Any:
+            dangerous = _xxe_source_dangerous(state, string)
+            state.record("CWE-611", "minidom.parseString", string, tainted=dangerous)
+            return original_parse_string(string, *a, **k)
+
+        minidom.parseString = parse_string
+        installed.append("minidom.xxe")
+    except Exception:
+        pass
+
+
+def _xxe_wrapper(state: _State, original: Any, label: str) -> Any:
+    def wrapper(source: Any, *args: Any, **kwargs: Any) -> Any:
+        parser = kwargs.get("parser")
+        if parser is None and args:
+            parser = args[0]
+        if _xxe_source_dangerous(state, source) and _parser_resolves_entities(parser):
+            state.record("CWE-611", label, source, tainted=True)
+        elif state.contains(source):
+            state.record("CWE-611", label, source, tainted=False)
+        return original(source, *args, **kwargs)
+
+    return wrapper
+
+
+def _xxe_source_dangerous(state: _State, source: Any) -> bool:
+    if not state.contains(source):
+        return False
+    try:
+        text = (
+            source.decode("utf-8", "replace")
+            if isinstance(source, (bytes, bytearray))
+            else str(source)
+        )
+    except Exception:
+        return False
+    return any(marker in text for marker in _XML_DTD)
+
+
+def _parser_resolves_entities(parser: Any) -> bool:
+    """A missing parser means the library default (lxml resolves internal entities); a parser
+    built with ``resolve_entities=False`` / ``no_network=True`` DTD-forbidding (defusedxml) is
+    the safe shape and reports False."""
+    if parser is None:
+        return True
+    return bool(getattr(parser, "resolve_entities", True))
+
+
+def _hook_redirect(state: _State, installed: list[str]) -> None:
+    """Open redirect (CWE-601): the canary forms an EXTERNAL redirect target (off-site URL)."""
+    try:
+        from werkzeug import utils as werkzeug_utils
+
+        original = werkzeug_utils.redirect
+
+        def redirect(location: Any, *a: Any, **k: Any) -> Any:
+            state.record(
+                "CWE-601", "werkzeug.redirect", location, tainted=_redirect_tainted(state, location)
+            )
+            return original(location, *a, **k)
+
+        werkzeug_utils.redirect = redirect
+        installed.append("werkzeug.redirect")
+        try:
+            import flask
+
+            if getattr(flask, "redirect", None) is original:
+                flask.redirect = redirect
+        except Exception:
+            pass
+    except Exception:
+        pass
+    _hook_class_init(
+        state, installed, "django.http", "HttpResponseRedirect", "CWE-601", "django.redirect", 0
+    )
+    _hook_class_init(
+        state,
+        installed,
+        "starlette.responses",
+        "RedirectResponse",
+        "CWE-601",
+        "starlette.redirect",
+        0,
+        tainted=lambda value: _redirect_tainted(state, value),
+    )
+
+
+def _redirect_tainted(state: _State, location: Any) -> bool:
+    return state.contains(location) and _looks_external(location)
+
+
+def _looks_external(location: Any) -> bool:
+    try:
+        if isinstance(location, (bytes, os.PathLike)):
+            text = os.fsdecode(location)
+        else:
+            text = str(location)
+    except Exception:
+        return False
+    return bool(_SCHEME_RE.match(text))
+
+
+def _hook_response(state: _State, installed: list[str]) -> None:
+    """Reflected unescaped output (CWE-79): the canary (``<x>`` probe intact) is in the HTTP
+    response BODY built at the flagged line (``Response(...)`` / ``make_response(...)``) with an
+    HTML content type. This proves tainted input reaches the response UNESCAPED; it does NOT
+    prove DOM-based or stored XSS (no browser, no DOM, no persisted sink is involved)."""
+    try:
+        from werkzeug import wrappers
+
+        original = wrappers.Response.__init__
+
+        def init(self: Any, response: Any = None, *a: Any, **k: Any) -> None:
+            mimetype = k.get("mimetype") or k.get("content_type")
+            if state.contains_full(response) and not _is_non_html(mimetype):
+                state.record("CWE-79", "werkzeug.Response", response, tainted=True)
+            elif state.contains(response):
+                state.record("CWE-79", "werkzeug.Response", response, tainted=False)
+            original(self, response, *a, **k)
+
+        wrappers.Response.__init__ = init  # type: ignore[method-assign]
+        installed.append("werkzeug.response")
+    except Exception:
+        pass
+
+
+def _is_non_html(mimetype: Any) -> bool:
+    if not isinstance(mimetype, str):
+        return False
+    lowered = mimetype.lower()
+    return "html" not in lowered and (
+        "json" in lowered or "plain" in lowered or "octet-stream" in lowered
+    )
+
+
+def _hook_class_init(
+    state: _State,
+    installed: list[str],
+    module_name: str,
+    class_name: str,
+    cwe: str,
+    label: str,
+    arg_index: int,
+    *,
+    tainted: Any = None,
+) -> None:
+    """Wrap ``Class.__init__`` so the ``arg_index``-th positional (the dangerous argument) is
+    inspected. ``tainted`` defaults to a plain canary-core check."""
+    try:
+        module = __import__(module_name, fromlist=[class_name])
+        cls = getattr(module, class_name, None)
+        if cls is None:
+            return
+        original = cls.__init__
+        predicate = tainted or (lambda value: state.contains(value))
+
+        def init(self: Any, *args: Any, **kwargs: Any) -> None:
+            if len(args) > arg_index:
+                value = args[arg_index]
+                state.record(cwe, label, value, tainted=bool(predicate(value)))
+            original(self, *args, **kwargs)
+
+        cls.__init__ = init
+        installed.append(label)
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -403,17 +849,18 @@ def _install_hooks(state: _State) -> list[str]:
 def run_oracle(config: dict[str, Any], root: str) -> dict[str, Any]:
     """Install hooks, run the PoC, and return the result document."""
     state = _State(config, root)
-    installed = _install_hooks(state)
     os.environ[PAYLOAD_ENV] = state.canary
     if root not in sys.path:
         sys.path.insert(0, root)
     # Provisioned third-party packages (the jail's read-only /deps). The oracle runs under
     # ``python3 -I`` so PYTHONPATH is ignored on purpose; the Executor-controlled directory
     # is appended explicitly - AFTER the workspace and the stdlib, so nothing in it can
-    # shadow either.
+    # shadow either. This happens BEFORE hook installation so the framework-library hooks
+    # (jinja2 / werkzeug / lxml / ldap3 / ...) can import and wrap the provisioned packages.
     for extra in config.get("sys_path") or []:
         if isinstance(extra, str) and os.path.isdir(extra) and extra not in sys.path:
             sys.path.append(extra)
+    installed = _install_hooks(state)
     os.chdir(root)
     out, err = io.StringIO(), io.StringIO()
     real_out, real_err = sys.stdout, sys.stderr

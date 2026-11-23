@@ -1,0 +1,4 @@
+# The NEAREST manifest to the vulnerable sink (dockerized_labs/sqli_lab/app.py): this lab is
+# its own self-contained Flask app, exactly like pygoat's dockerized_labs/<lab>/. The fix
+# provisions from HERE (Flask) rather than the Django root manifest.
+flask>=3.0,<4
