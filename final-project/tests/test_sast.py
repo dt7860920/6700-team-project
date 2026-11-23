@@ -237,6 +237,71 @@ def test_run_semgrep_zero_results_from_an_incomplete_run_is_unavailable(
     assert result.engine == "regex" and [c.file for c in result.candidates] == ["a.py"]
 
 
+def test_setarch_failed_detects_a_personality_error() -> None:
+    perm = subprocess.CompletedProcess(
+        ["setarch"], 1, "", "setarch: failed to set personality to x86_64: Operation not permitted"
+    )
+    assert sast.setarch_failed(perm) is True
+    # A clean (exit 0) run is never treated as a setarch failure, whatever stderr says.
+    assert (
+        sast.setarch_failed(subprocess.CompletedProcess(["setarch"], 0, "{}", "setarch:")) is False
+    )
+    # A genuine non-setarch failure (e.g. a bad rule) is not mistaken for one.
+    assert sast.setarch_failed(subprocess.CompletedProcess(["s"], 7, "", "invalid rule")) is False
+
+
+def test_run_semgrep_retries_without_setarch_when_the_prefix_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Issue #105 / hardened container: a setarch personality failure must trigger a
+    no-prefix retry, so semgrep actually runs instead of degrading to the regex fallback."""
+    monkeypatch.setattr(sast, "semgrep_executable", lambda: "/fake/semgrep")
+    monkeypatch.setattr(sast, "_aslr_safe_prefix", lambda: ["setarch", "x86_64", "-R"])
+    doc = {"results": [{"check_id": "r"}], "errors": []}
+    seen: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        seen.append(cmd)
+        if cmd[0] == "setarch":  # the prefixed attempt: personality change refused
+            return subprocess.CompletedProcess(
+                cmd, 1, "", "setarch: failed to set personality to x86_64: Operation not permitted"
+            )
+        return subprocess.CompletedProcess(cmd, 0, json.dumps(doc), "")  # the no-prefix retry
+
+    monkeypatch.setattr(sast.subprocess, "run", fake_run)
+    assert sast.run_semgrep(tmp_path, ["p/x"]) == doc
+    assert len(seen) == 2  # it tried the prefix, then retried without it
+    assert seen[0][0] == "setarch" and seen[1][0] == "/fake/semgrep"
+
+
+def test_shortlist_recovers_via_the_setarch_retry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """End to end: the setarch retry keeps the queue on the Semgrep engine, not regex."""
+    monkeypatch.setattr(sast, "semgrep_executable", lambda: "/fake/semgrep")
+    monkeypatch.setattr(sast, "_aslr_safe_prefix", lambda: ["setarch", "x86_64", "-R"])
+    doc = {
+        "results": [
+            {
+                "check_id": "js.cmd",
+                "path": "server.js",
+                "start": {"line": 3},
+                "extra": {"severity": "ERROR", "metadata": {"cwe": "CWE-78"}},
+            }
+        ],
+        "errors": [],
+    }
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        if cmd[0] == "setarch":
+            return subprocess.CompletedProcess(cmd, 1, "", "setarch: failed to set personality")
+        return subprocess.CompletedProcess(cmd, 0, json.dumps(doc), "")
+
+    monkeypatch.setattr(sast.subprocess, "run", fake_run)
+    result = sast.shortlist(tmp_path, rulesets=["p/x"], languages=["javascript"], max_candidates=5)
+    assert result.engine == "semgrep" and [c.file for c in result.candidates] == ["server.js"]
+
+
 def test_semgrep_failure_reason_accepts_completed_runs() -> None:
     assert sast.semgrep_failure_reason(0, []) is None
     assert sast.semgrep_failure_reason(3, [{"level": "warn", "type": "PartialParsing"}]) is None
