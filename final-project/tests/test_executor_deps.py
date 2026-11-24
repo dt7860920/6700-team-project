@@ -29,6 +29,9 @@ from ono.config import Settings
 from ono.executor import _builder
 from ono.executor._builder import (
     Build,
+    _npm_error,
+    era_cutoff,
+    exact_pin,
     find_manifests,
     is_pinned,
     manifest_install_sets,
@@ -59,6 +62,7 @@ from ono.executor.sandbox import (
     JailConfig,
     Sandbox,
     SandboxManager,
+    builder_image_for,
     builder_kwargs,
     jail_kwargs,
     snapshot_manifests,
@@ -150,6 +154,86 @@ def test_jail_config_carries_the_deps_settings() -> None:
     assert cfg.deps_max_bytes == 33_000_000
     defaults = JailConfig.from_settings(Settings(_env_file=None))
     assert defaults.deps_enabled is True and defaults.deps_mb == 256
+
+
+def test_builder_image_is_a_toolchain_image_decoupled_from_the_slim_jail() -> None:
+    s = Settings(
+        _env_file=None,
+        sandbox_builder_image="my/py-builder:tool",
+        sandbox_builder_image_node="my/node-builder:tool",
+    )
+    cfg = JailConfig.from_settings(s)
+    assert cfg.builder_image == "my/py-builder:tool"
+    assert cfg.builder_image_node == "my/node-builder:tool"
+    # the builder pairs with the jail's runtime, and is never the slim jail image itself
+    assert builder_image_for(cfg, cfg.image) == cfg.builder_image
+    assert builder_image_for(cfg, cfg.image_node) == cfg.builder_image_node
+    assert builder_image_for(cfg, cfg.image) != cfg.image
+    defaults = JailConfig.from_settings(Settings(_env_file=None))
+    assert "uv" in defaults.builder_image and defaults.builder_image != defaults.image
+    assert "slim" not in defaults.builder_image_node  # node-gyp needs a real toolchain
+
+
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [
+        ("Flask==1.0", ("flask", "1.0")),
+        ("  Werkzeug == 2.1.2 ", ("werkzeug", "2.1.2")),
+        ("Django==4.2 ; python_version>'3'", ("django", "4.2")),
+        ("requests[security]==2.28.1", ("requests", "2.28.1")),
+        ("flask>=1.0", None),  # not an exact pin -> does not date the era
+        ("flask~=1.0", None),
+        ("flask", None),
+        ("-e .", None),
+        ("git+https://x/y.git", None),
+    ],
+)
+def test_exact_pin(line: str, expected: tuple[str, str] | None) -> None:
+    assert exact_pin(line) == expected
+
+
+def test_era_cutoff_is_the_newest_pin_plus_a_day(monkeypatch: pytest.MonkeyPatch) -> None:
+    dates = {
+        ("flask", "1.0"): _builder._dt.date(2018, 4, 26),
+        ("werkzeug", "2.1.2"): _builder._dt.date(2022, 4, 28),
+        ("jinja2", "3.1.0"): _builder._dt.date(2022, 3, 24),
+    }
+    calls: list[tuple[str, str]] = []
+
+    def fake_date(name: str, version: str, _timeout: float) -> _builder._dt.date | None:
+        calls.append((name, version))
+        return dates.get((name, version))
+
+    monkeypatch.setattr(_builder, "pypi_upload_date", fake_date)
+    lines = ["Flask==1.0", "Werkzeug==2.1.2", "jinja2==3.1.0", "pytest>=7", "flask==1.0"]
+    cutoff = era_cutoff(lines, time.monotonic() + 30)
+    assert cutoff == "2022-04-29"  # newest (werkzeug 2022-04-28) + 1 day
+    assert ("flask", "1.0") in calls and ("pytest", "7") not in calls  # only exact pins, deduped
+
+
+def test_era_cutoff_is_none_without_pins_or_when_pypi_is_silent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(_builder, "pypi_upload_date", lambda *a: None)
+    assert era_cutoff(["flask", "requests>=2"], time.monotonic() + 30) is None
+    assert era_cutoff(["flask==1.0"], time.monotonic() + 30) is None  # pypi unreachable
+
+
+def test_npm_error_names_the_real_cause_not_the_log_footer() -> None:
+    output = (
+        "npm warn deprecated bcrypt@1.0.3: versions < v5 ...\n"
+        "npm error code 1\n"
+        "npm error path /work/node_modules/libxmljs\n"
+        "npm error node-pre-gyp ERR! install response status 404 Not Found\n"
+        "npm error ../node_modules/nan/nan.h:55: error: "
+        "'AccessorSignature' is not a member of 'v8'\n"
+        "npm error gyp ERR! stack at FanIn (/usr/local/lib/node_modules/npm/x.js:1:1)\n"
+        "npm notice New major version of npm available! 10 -> 12\n"
+        "npm error A complete log of this run can be found in: /tmp/x.log\n"
+    )
+    msg = _npm_error(output)
+    assert "AccessorSignature" in msg
+    assert "complete log" not in msg and "npm notice" not in msg
 
 
 # ---------------------------------------------------------------------------

@@ -259,6 +259,12 @@ class JailConfig:
     image_node: str = "nikolaik/python-nodejs:python3.13-nodejs20-slim"
     """Selected instead of ``image`` for a scan with any JS/TS finding (``runtime="node"``);
     must have Python (the guest helper always runs ``python3``) PLUS ``node``/``npm``."""
+    builder_image: str = "ghcr.io/astral-sh/uv:python3.13-bookworm"
+    """Image for the ephemeral dependency builder of a Python scan - a full toolchain + ``uv``,
+    NOT the slim jail image (see ``builder_image_for`` / ``sandbox_builder_image``)."""
+    builder_image_node: str = "nikolaik/python-nodejs:python3.13-nodejs20"
+    """Image for the dependency builder of a JS/TS scan - the non-slim combined image, so
+    node-gyp's toolchain is present (``sandbox_builder_image_node``)."""
     mem_mb: int = 1024
     cpus: float = 1.0
     pids_limit: int = 256
@@ -289,6 +295,8 @@ class JailConfig:
         return cls(
             image=settings.sandbox_image,
             image_node=settings.sandbox_image_node,
+            builder_image=settings.sandbox_builder_image,
+            builder_image_node=settings.sandbox_builder_image_node,
             mem_mb=settings.sandbox_mem_mb,
             cpus=settings.sandbox_cpus,
             pids_limit=settings.sandbox_pids_limit,
@@ -352,6 +360,18 @@ def select_image(config: JailConfig, runtime: str) -> str:
     FastAPI's ``Literal`` validation already restricts to these two values before this runs.
     """
     return config.image_node if runtime == "node" else config.image
+
+
+def builder_image_for(config: JailConfig, jail_image: str) -> str:
+    """The dependency-builder image to pair with a sandbox running ``jail_image``.
+
+    The builder is deliberately a DIFFERENT image from the jail: the jail is slim and
+    hardened (it only has to run the already-built code), while the builder needs a full
+    compiler toolchain so sdist-only packages build, plus ``uv`` for era-correct Python
+    resolution. The pairing follows the jail's runtime - a JS/TS jail (``image_node``) gets
+    the Node builder (node-gyp toolchain), everything else the Python builder.
+    """
+    return config.builder_image_node if jail_image == config.image_node else config.builder_image
 
 
 def jail_kwargs(
@@ -420,8 +440,9 @@ def builder_kwargs(
     the install target, ``/tmp`` for pip/npm's scratch), the same memory/CPU/PID caps, no
     host bind mounts and - like every target container - never the Docker socket. It is
     labelled with a short TTL so the sweeper removes it if the Executor dies mid-build.
-    ``image`` is the SAME image the jail it builds for uses (see :func:`select_image`): a
-    JS/TS scan's builder needs ``npm`` just as much as its jail needs ``node``.
+    ``image`` is the dedicated BUILDER image (see :func:`builder_image_for`): a full
+    toolchain + ``uv`` for a Python scan, the non-slim combined image for a JS/TS scan - NOT
+    the slim jail image, because building (unlike running) needs a compiler.
     """
     env = dict(_BUILDER_ENV)
     if config.deps_index_url:
@@ -664,6 +685,11 @@ class Sandbox:
     @property
     def effective_image(self) -> str:
         return self.image or self.config.image
+
+    @property
+    def builder_image(self) -> str:
+        """Toolchain image for this sandbox's dependency builder (never the slim jail image)."""
+        return builder_image_for(self.config, self.effective_image)
 
     def info(self) -> SandboxInfo:
         return SandboxInfo(
@@ -1480,14 +1506,15 @@ class SandboxManager:
                 **extra,
             )
 
+        builder_image = sandbox.builder_image
         kwargs = builder_kwargs(
             config,
             scan_id=sandbox.scan_id,
             sandbox_id=sandbox.sandbox_id,
-            image=sandbox.effective_image,
+            image=builder_image,
         )
         try:
-            self.ensure_image(sandbox.effective_image)
+            self.ensure_image(builder_image)
             container = self.client.containers.run(**kwargs)
         except SandboxError as exc:
             return failed(f"could not start the builder container: {exc}")
