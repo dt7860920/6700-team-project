@@ -679,6 +679,36 @@ def is_pinned(line: str) -> bool:
     return bool(match and match.group(3) and _PIN_RE.match(match.group(3).strip()))
 
 
+def _canon(name: str) -> str:
+    """PEP 503-ish name normalisation for comparing a requirement to an installed dist."""
+    return re.sub(r"[-_.]+", "-", name.strip().split("[")[0]).lower()
+
+
+def _drop_installed(item: InstallSet, installed: set[str]) -> InstallSet | None:
+    """``item`` with requirement lines whose package is already in ``installed`` removed.
+
+    Returns the item unchanged when nothing is dropped (keeps the efficient ``-r file``
+    install), a line-level set when some are, or ``None`` when every line was already
+    satisfied. Lines with no parseable package name (URLs, ``-e .``) are always kept.
+    """
+    kept: list[str] = []
+    for line in item.requirements:
+        name = requirement_name(line)
+        if name is not None and _canon(name) in installed:
+            continue
+        kept.append(line)
+    if len(kept) == len(item.requirements):
+        return item
+    if not kept:
+        return None
+    return InstallSet(
+        f"{item.label} (root deps already satisfied by the nearest manifest dropped)",
+        args=kept,
+        requirements=kept,
+        primary=item.primary,
+    )
+
+
 _EXACT_PIN_RE = re.compile(r"^==\s*([A-Za-z0-9][A-Za-z0-9.+!_-]*)$")
 _PINS_FOR_CUTOFF = 40  # bound the PyPI lookups; the newest few pins fix the era anyway
 _PYPI_TIMEOUT_S = 4.0
@@ -846,15 +876,14 @@ class Build:
         if node_manifest is not None:
             self._install_node(node_manifest)
 
-        sets: list[InstallSet] = []
+        near_sets: list[InstallSet] = []
         for rel in near_manifests:
-            near_sets, near_needs_build = manifest_install_sets(self.src, rel, primary=True)
-            sets += near_sets
+            rel_sets, near_needs_build = manifest_install_sets(self.src, rel, primary=True)
+            near_sets += rel_sets
             if near_needs_build:
-                self._build_into(sets, rel)
+                self._build_into(near_sets, rel)
         root_sets, warnings, needs_build = plan_installs(self.src, root_manifests)
         self.warnings += warnings
-        sets += root_sets
         if needs_build:
             reqs, why = build_metadata(self.src, self.remaining())
             if reqs is None:
@@ -865,23 +894,39 @@ class Build:
                     if "setup.py" in root_manifests
                     else ("pyproject.toml (built metadata)")
                 )
-                sets.insert(0, InstallSet(label, args=reqs, requirements=reqs, primary=True))
-        if not sets and node_manifest is None:
+                root_sets.insert(0, InstallSet(label, args=reqs, requirements=reqs, primary=True))
+        all_sets = near_sets + root_sets
+        if not all_sets and node_manifest is None:
             self.error = "no installable dependency declaration found in " + ", ".join(
                 self.manifests
             )
             return self.result(started, status="failed")
         # Era-correct resolution (uv only): date the app by its newest exact pin and resolve
         # everything no newer, so an old app's unpinned transitive deps stay in its own era.
-        if self._derive_cutoff and uv_available() and sets:
-            pins = [req for item in sets for req in item.requirements]
+        if self._derive_cutoff and uv_available() and all_sets:
+            pins = [req for item in all_sets for req in item.requirements]
             budget = min(30.0, max(0.0, self.remaining() * 0.25))
             self.exclude_newer = era_cutoff(pins, time.monotonic() + budget)
             if self.exclude_newer:
                 self.warnings.append(f"resolved dependencies as of {self.exclude_newer} (repo era)")
-        for item in sets:
+        # Install the sink's OWN (near) manifests first - they are the app that contains the
+        # flagged line - then union the repository root behind them, but DROP any root
+        # requirement a near manifest already satisfied. That keeps the union (the root still
+        # adds packages the sub-app lacks) while stopping a root pin from downgrading the
+        # sub-app's own framework - e.g. a repo that ships independent labs, where the root
+        # pins Werkzeug 2.1 but a lab pins Flask 2.3 (which needs a newer Werkzeug). Per-scan
+        # grouping (the verifier) keeps two different sub-apps out of one /deps entirely.
+        for item in near_sets:
             if not self.pip_ok(item):
                 break
+        if not self.error:
+            near_names = {_canon(p.split()[0]) for p in installed_packages(self.site) if p.split()}
+            for item in root_sets:
+                trimmed = _drop_installed(item, near_names) if near_names else item
+                if trimmed is None:
+                    continue
+                if not self.pip_ok(trimmed):
+                    break
         if not self.error:
             size = dir_size(self.site)
             if size > self.max_bytes:
