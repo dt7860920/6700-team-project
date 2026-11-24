@@ -561,6 +561,39 @@ class Settings(BaseSettings):
         ),
     )
 
+    # -- Software Composition Analysis (SCA): declared deps vs. OSV.dev -----------------
+    # A self-contained capability (ono/sca/) that checks a cloned repo's dependency
+    # manifests against the free, ecosystem-general OSV.dev database for known-vulnerable
+    # versions (CVE/GHSA) and malicious packages (OSV MAL- advisories). stdlib-only HTTP.
+    sca_enabled: bool = Field(
+        default=True,
+        description=(
+            "Run the OSV.dev dependency scan (POST /sca and the scan_dependencies entry point). "
+            "False = the SCA report is 'skipped' and OSV is never contacted."
+        ),
+    )
+    osv_api_url: str = Field(
+        default="https://api.osv.dev",
+        description=(
+            "Base URL of the OSV.dev API (querybatch/query/vulns). Point at a mirror if one exists."
+        ),
+    )
+    sca_timeout_s: float = Field(
+        default=20.0,
+        ge=1.0,
+        le=600.0,
+        description=(
+            "Per-request timeout for each OSV.dev HTTP call. A timeout degrades, never aborts."
+        ),
+    )
+    sca_offline: bool = Field(
+        default=False,
+        description=(
+            "Skip all OSV network calls and return the SCA report with status 'skipped'. For "
+            "air-gapped runs and the test suite; dependencies are still parsed, not queried."
+        ),
+    )
+
     @model_validator(mode="after")
     def _service_backend_requires_url(self) -> Self:
         if self.model_backend == "service" and not self.model_service_url:

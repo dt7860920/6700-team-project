@@ -127,6 +127,25 @@ class SourceCheckResponse(BaseModel):
     message: str
 
 
+class ScaRequest(BaseModel):
+    """Body of ``POST /sca``: dependency manifests to check against OSV.dev.
+
+    Manifests are supplied inline (``{relative/path: file content}``) so the endpoint is
+    self-contained - it does not clone a repository. The SCA library (``ono.sca``) is the
+    pipeline-facing entry point; this route exposes the same capability over HTTP.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    manifests: dict[str, str] = Field(
+        min_length=1,
+        description=(
+            "Map of manifest path (e.g. 'requirements.txt', 'go.mod', 'package-lock.json') to "
+            "its text content. At least one is required."
+        ),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Findings
 # ---------------------------------------------------------------------------

@@ -27,8 +27,10 @@ One process, one published port (8080). OpenAPI docs live at ``/docs``.
 from __future__ import annotations
 
 import logging
+import tempfile
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
@@ -49,11 +51,13 @@ from ono.models import (
     InfoResponse,
     Scan,
     ScanRequest,
+    ScaRequest,
     SourceCheckRequest,
     SourceCheckResponse,
     TargetsResponse,
     TargetSummary,
 )
+from ono.sca import ScaReport, scan_dependencies
 from ono.service import ScanService
 from ono.sources import SourceCheckError
 from ono.store import InMemoryScanStore, ScanStore, SqliteScanStore
@@ -71,6 +75,27 @@ def _service(request: Request) -> ScanService:
 
 
 ServiceDep = Annotated[ScanService, Depends(_service)]
+
+
+def _run_sca(body: ScaRequest, settings: Settings) -> ScaReport:
+    """Materialise the inline manifests under a throwaway workspace and run the SCA scan.
+
+    Writing to a temp directory lets the route reuse the exact on-disk manifest walker the
+    library entry point uses (``ono.sca.scan_dependencies``). Manifest paths are sanitised so
+    a client cannot escape the temp root.
+    """
+    with tempfile.TemporaryDirectory(prefix="ono-sca-") as tmp:
+        root = Path(tmp)
+        for raw_path, content in body.manifests.items():
+            dest = (root / raw_path).resolve()
+            if not dest.is_relative_to(root.resolve()):
+                raise HTTPException(
+                    status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    f"manifest path {raw_path!r} escapes the workspace",
+                )
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_text(content, encoding="utf-8")
+        return scan_dependencies(root, settings=settings)
 
 
 def create_app(
@@ -129,6 +154,7 @@ def create_app(
             {"name": "ops", "description": "Health and runtime info."},
             {"name": "targets", "description": "The authorized-target allowlist."},
             {"name": "scans", "description": "Start scans and read results."},
+            {"name": "sca", "description": "Dependency vulnerability scanning via OSV.dev."},
             {"name": "auth", "description": "GitHub sign-in and the session cookie."},
         ],
     )
@@ -202,6 +228,27 @@ def create_app(
         except SourceCheckError as exc:
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
         return SourceCheckResponse.model_validate(checked)
+
+    # -- sca --------------------------------------------------------------
+    # Software Composition Analysis: check declared dependencies against OSV.dev. Exposed as
+    # a standalone route (and the ono.sca.scan_dependencies library entry point) so it is
+    # usable without touching the agentic scan pipeline.
+    # TODO(sca): fold this into the scan worker so every /scans run also attaches an `sca`
+    # section to its result once the pipeline integration has been reviewed (see ono/sca/).
+    @app.post(
+        "/sca",
+        response_model=ScaReport,
+        tags=["sca"],
+        summary="Scan declared dependencies against the OSV.dev vulnerability database",
+        description=(
+            "Supply dependency manifests inline (requirements*.txt, Pipfile.lock, poetry.lock, "
+            "package-lock.json, go.mod, Gemfile.lock, pom.xml, Cargo.lock, *.csproj, "
+            "composer.lock, ...). Returns known-vulnerable (CVE/GHSA) and malicious (MAL-) "
+            "dependency findings. Status is ok | skipped | degraded."
+        ),
+    )
+    async def sca_scan(body: ScaRequest, svc: ServiceDep) -> ScaReport:
+        return await run_in_threadpool(_run_sca, body, svc.settings)
 
     # -- scans ------------------------------------------------------------
     @app.post(
