@@ -251,6 +251,10 @@ def scaffold_for(finding: Finding, window_text: str) -> str:
     framework = detect_framework(finding, window_text)
     parts: list[str] = [
         "HOW TO REACH THE SINK (drive the application, do not call the sink yourself):",
+        "- Import and drive the TARGET's OWN app object. Do NOT define a new application "
+        "(no fresh Flask(__name__) / express() / new route of your own): a re-implemented app "
+        "does not contain the flagged line, so the oracle never sees it and the finding cannot "
+        "be proven. You must exercise the real code at the sink.",
         f"- Attacker entry point (drive THIS): {entry_hint(finding)}",
         f"- Flagged sink to reach: {finding.location} ({finding.cwe})",
         "- Language: JavaScript/TypeScript - read the payload with process.env.ONO_PAYLOAD "

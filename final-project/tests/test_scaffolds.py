@@ -108,3 +108,59 @@ def test_scaffold_falls_back_to_generic_without_a_framework() -> None:
     scaffold = scaffold_for(_finding(), "def handle(request):\n    return run(request['q'])")
     assert "front-controller" in scaffold.lower() or "front controller" in scaffold.lower()
     assert "test_client()" not in scaffold  # no framework-specific block was added
+
+
+# ---------------------------------------------------------------------------
+# The prover's accept gate: wrong-language PoCs are rejected before a verify cycle
+# ---------------------------------------------------------------------------
+
+
+def _accept(code: str, *, is_js: bool):
+    from ono.agents.model import ToolCall
+    from ono.agents.prover import _accept as accept
+
+    return accept(ToolCall(name="submit_poc", args={"code": code}), is_js=is_js)
+
+
+PY_POC = (
+    'import os\npayload = os.environ["ONO_PAYLOAD"]\n'
+    'from app import app\napp.test_client().get("/s", query_string={"q": payload})\n'
+)
+JS_POC = (
+    "const http = require('http');\nconst app = require('./server');\n"
+    "const payload = process.env.ONO_PAYLOAD;\napp.listen(0, '127.0.0.1');\n"
+)
+
+
+def test_accept_takes_a_matching_python_poc_for_a_python_sink() -> None:
+    poc, why = _accept(PY_POC, is_js=False)
+    assert poc is not None and why == ""
+
+
+def test_accept_takes_a_matching_js_poc_for_a_js_sink() -> None:
+    poc, why = _accept(JS_POC, is_js=True)
+    assert poc is not None and why == ""
+
+
+def test_accept_rejects_a_python_poc_against_a_js_sink() -> None:
+    # the live run's dominant waste: a Python requests script aimed at an Express app
+    py_for_js = (
+        'import os\nimport requests\npayload = os.environ["ONO_PAYLOAD"]\n'
+        'requests.get("http://localhost:5000/s", params={"q": payload})\n'
+    )
+    poc, why = _accept(py_for_js, is_js=True)
+    assert poc is None and "JavaScript" in why and "node" in why
+
+
+def test_accept_rejects_a_js_poc_against_a_python_sink() -> None:
+    js_for_py = (
+        "const http = require('http');\n"
+        "const payload = process.env.ONO_PAYLOAD;\nconsole.log(payload);\n"
+    )
+    poc, why = _accept(js_for_py, is_js=False)
+    assert poc is None and "Python" in why
+
+
+def test_accept_still_requires_the_payload_env_var() -> None:
+    poc, why = _accept('import os\nfrom app import app\napp.test_client().get("/")\n', is_js=False)
+    assert poc is None and "ONO_PAYLOAD" in why
