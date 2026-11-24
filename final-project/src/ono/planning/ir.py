@@ -31,7 +31,7 @@ ExprKind = Literal[
     "other",  # anything else                      children=(sub-expressions...)
 ]
 
-Language = Literal["python", "javascript", "typescript"]
+Language = Literal["python", "javascript", "typescript", "php"]
 
 
 @dataclass(frozen=True, slots=True)

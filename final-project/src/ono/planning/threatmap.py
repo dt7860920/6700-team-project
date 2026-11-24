@@ -25,10 +25,18 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from ono.planning.catalog import HTTP_VERBS, PY_REQUEST_PARAM_NAMES, REQUEST_PROPS
-from ono.planning.ir import EntryPoint, Expr, Function, Module, chain, last_segment
+from ono.planning.catalog import (
+    HTTP_VERBS,
+    PHP_NONINPUT_PARAMS,
+    PHP_REQUEST_PARAM_NAMES,
+    PY_REQUEST_PARAM_NAMES,
+    REQUEST_PROPS,
+)
+from ono.planning.ir import EntryPoint, Expr, Function, Language, Module, chain, last_segment
 from ono.planning.js_frontend import EXTENSIONS as JS_EXTENSIONS
 from ono.planning.js_frontend import parse_js
+from ono.planning.php_frontend import EXTENSIONS as PHP_EXTENSIONS
+from ono.planning.php_frontend import parse_php
 from ono.planning.python_frontend import parse_python
 from ono.planning.taint import Evidence, FunctionTaint, Hop, SinkHit, analyze_module
 from ono.sast import Candidate, rank
@@ -163,7 +171,11 @@ def _iter_sources(root: Path) -> Iterable[Path]:
         if not path.is_file():
             continue
         suffix = path.suffix.lower()
-        if suffix not in _PY_EXTENSIONS and suffix not in JS_EXTENSIONS:
+        if (
+            suffix not in _PY_EXTENSIONS
+            and suffix not in JS_EXTENSIONS
+            and suffix not in PHP_EXTENSIONS
+        ):
             continue
         if _SKIP_DIRS.intersection(path.relative_to(root).parts[:-1]):
             continue
@@ -189,17 +201,24 @@ def parse_tree(root: Path, *, deadline_s: float, notes: list[str]) -> list[Modul
         except OSError:
             continue
         rel = path.relative_to(root).as_posix()
+        suffix = path.suffix.lower()
+        language: Language = (
+            "python"
+            if suffix in _PY_EXTENSIONS
+            else "php"
+            if suffix in PHP_EXTENSIONS
+            else "javascript"
+        )
         try:
-            module = (
-                parse_python(path, rel) if path.suffix.lower() == ".py" else parse_js(path, rel)
-            )
+            if suffix in _PY_EXTENSIONS:
+                module = parse_python(path, rel)
+            elif suffix in PHP_EXTENSIONS:
+                module = parse_php(path, rel)
+            else:
+                module = parse_js(path, rel)
         except Exception as exc:  # a front-end bug on one odd file must not fail the scan
             log.warning("threat map: failed to lower %s: %s", rel, exc)
-            module = Module(
-                file=rel,
-                language="python" if path.suffix == ".py" else "javascript",
-                parse_error=str(exc),
-            )
+            module = Module(file=rel, language=language, parse_error=str(exc))
         modules.append(module)
     return modules
 
@@ -242,6 +261,14 @@ def _ref_entry(fn: Function, kind: str, detail: str) -> EntryPoint:
             p for p in fn.params if p not in ("self", "cls") and p not in PY_REQUEST_PARAM_NAMES
         )
         props: tuple[str, ...] | None = tuple(sorted(REQUEST_PROPS["python"]))
+    elif fn.language == "php":
+        request = tuple(p for p in fn.params if p in PHP_REQUEST_PARAM_NAMES)
+        data = tuple(
+            p
+            for p in fn.params
+            if p not in PHP_REQUEST_PARAM_NAMES and p not in PHP_NONINPUT_PARAMS
+        )
+        props = tuple(sorted(REQUEST_PROPS["php"]))
     else:
         request = fn.params[:1]
         data = ()

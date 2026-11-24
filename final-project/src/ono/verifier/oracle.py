@@ -153,6 +153,12 @@ def oracle_supports(finding: Finding) -> str:
                 "narrower set than the Python oracle covers)"
             )
         return ""
+    # TODO(php prove-depth): PHP is statically mapped by ono.planning.php_frontend (entry
+    # points, taint, catalog sinks), but has no runtime oracle, jail image or PoC scaffolds
+    # yet - so a PHP finding is honestly unprovable here and verify just skips it. It still
+    # reaches the analyst and sits at rung <=2 (static evidence only), exactly like today's
+    # flag-only languages. Lifting PHP to prove-depth is a later PR (oracle_hooks.php +
+    # oracle_php.py, a php jail image in executor/sandbox.py, and php agents/scaffolds).
     suffix = finding.file.rsplit(".", 1)[-1] if "." in finding.file else "?"
     return f"no dynamic sink oracle for .{suffix} files (Python and JS/TS only for now)"
 

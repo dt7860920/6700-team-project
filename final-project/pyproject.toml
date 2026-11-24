@@ -28,6 +28,7 @@ dependencies = [
   "semgrep>=1.100",
   "tree-sitter>=0.25",
   "tree-sitter-javascript>=0.23",
+  "tree-sitter-php>=0.23",
   "tree-sitter-typescript>=0.23",
   "uvicorn[standard]>=0.32",
 ]
