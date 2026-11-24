@@ -156,7 +156,7 @@ def test_oracle_still_applies_the_universal_skip_reasons_to_js() -> None:
 def test_oracle_supports_an_unknown_extension() -> None:
     f = _finding("CWE-78", "server.rb", 10, 5)
     assert "no dynamic sink oracle for .rb files" in oracle_supports(f)
-    assert "Python and JS/TS only" in oracle_supports(f)
+    assert "Python, JS/TS and PHP only" in oracle_supports(f)
 
 
 def test_js_supported_cwes_cover_exactly_the_six_documented_families() -> None:

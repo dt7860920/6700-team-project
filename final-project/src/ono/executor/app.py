@@ -9,7 +9,8 @@ network with no ``ports:`` block - and every endpoint except ``/health`` require
     GET    /health                          liveness (no auth; reports Docker reachability)
     GET    /sandboxes                       list live sandboxes
     POST   /sandboxes?scan_id=...&runtime=  create: body = gzipped tar of the workspace;
-                                            runtime=python (default) or node (adds node/npm)
+                                            runtime=python (default), node (adds node/npm)
+                                            or php (adds php 8.x + uopz)
     GET    /sandboxes/{id}                  metadata
     DELETE /sandboxes/{id}                  destroy (teardown always succeeds)
     POST   /sandboxes/{id}/read             read a file / line range
@@ -346,12 +347,15 @@ def create_executor_app(
         request: Request,
         manager: ManagerDep,
         scan_id: Annotated[str, Query(pattern=SCAN_ID_PATTERN, max_length=64)],
-        # A closed two-value choice, not an arbitrary string: FastAPI 422s anything else
-        # before this ever reaches select_image - the client can only pick between the two
-        # images THIS Executor was configured with, never name an image of its own.
+        # A closed choice, not an arbitrary string: FastAPI 422s anything else before this
+        # ever reaches select_image - the client can only pick among the images THIS Executor
+        # was configured with, never name an image of its own.
         runtime: Annotated[
-            Literal["python", "node"],
-            Query(description="Jail base image: python (default) or node (adds node/npm)."),
+            Literal["python", "node", "php"],
+            Query(
+                description="Jail base image: python (default), node (adds node/npm) or "
+                "php (adds php 8.x + uopz)."
+            ),
         ] = "python",
     ) -> SandboxInfo:
         # The body goes straight to a file in the snapshot directory, one chunk at a

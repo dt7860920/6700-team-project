@@ -31,6 +31,8 @@ __all__ = [
     "JS_EXTENSIONS",
     "JS_SUPPORTED_CWES",
     "ORACLE_DIR",
+    "PHP_EXTENSIONS",
+    "PHP_SUPPORTED_CWES",
     "SKIP_REASONS",
     "OracleResult",
     "SinkOracle",
@@ -118,12 +120,41 @@ JS_SUPPORTED_CWES: frozenset[str] = frozenset(
 )
 
 
+PHP_EXTENSIONS: tuple[str, ...] = (".php", ".phtml", ".php3", ".php4", ".php5", ".phps")
+"""File suffixes routed to the PHP sink oracle (:mod:`ono.verifier.oracle_php`). Mirrors the
+suffixes :mod:`ono.planning.php_frontend` already lowers to IR language ``"php"``."""
+
+# The CWE families the PHP oracle (``oracle_hooks.php``) accepts - exactly the CWEs the PHP
+# catalog emits (see ``ono.planning.catalog``): OS command injection (78), code injection via
+# eval/assert/create_function (95), SQL injection (89), file inclusion (98), path traversal
+# (22), unsafe deserialization (502), SSRF (918) and reflected XSS (79), plus their family
+# alternates (a CWE number means the same thing in any language, so the shared
+# ``_oracle.family_of`` works unchanged). The FUNCTION-form members of each family are hooked
+# at runtime with ``uopz``; the PHP LANGUAGE CONSTRUCTS ``eval`` / ``include`` / ``echo`` /
+# backtick cannot be hooked, so a finding whose sink is purely one of those (notably CWE-98)
+# stays honestly ``skipped``/unproven at rung <= 2, never falsely failed (documented in
+# ``oracle_hooks.php``). Composer dependency provisioning is a follow-up; target
+# procedural/dependency-light PHP first.
+PHP_SUPPORTED_CWES: frozenset[str] = frozenset(
+    {"CWE-78", "CWE-77", "CWE-88"}  # command injection
+    | {"CWE-94", "CWE-95", "CWE-96"}  # code injection (eval/assert/create_function)
+    | {"CWE-89"}  # SQL injection
+    | {"CWE-98"}  # file inclusion (RFI/LFI) - language construct, stays unproven
+    | {"CWE-22", "CWE-23", "CWE-36"}  # path traversal
+    | {"CWE-502", "CWE-20"}  # unsafe deserialization
+    | {"CWE-918"}  # SSRF
+    | {"CWE-79", "CWE-80"}  # reflected unescaped output (echo/print/printf)
+)
+
+
 def language_of(file: str) -> str:
-    """``"python"`` / ``"javascript"`` / ``""`` (unknown) from a workspace-relative path."""
+    """``"python"`` / ``"javascript"`` / ``"php"`` / ``""`` (unknown) from a relative path."""
     if file.endswith(".py"):
         return "python"
     if file.endswith(JS_EXTENSIONS):
         return "javascript"
+    if file.endswith(PHP_EXTENSIONS):
+        return "php"
     return ""
 
 
@@ -153,14 +184,20 @@ def oracle_supports(finding: Finding) -> str:
                 "narrower set than the Python oracle covers)"
             )
         return ""
-    # TODO(php prove-depth): PHP is statically mapped by ono.planning.php_frontend (entry
-    # points, taint, catalog sinks), but has no runtime oracle, jail image or PoC scaffolds
-    # yet - so a PHP finding is honestly unprovable here and verify just skips it. It still
-    # reaches the analyst and sits at rung <=2 (static evidence only), exactly like today's
-    # flag-only languages. Lifting PHP to prove-depth is a later PR (oracle_hooks.php +
-    # oracle_php.py, a php jail image in executor/sandbox.py, and php agents/scaffolds).
+    if language == "php":
+        if finding.cwe not in PHP_SUPPORTED_CWES:
+            reason = skip_reason(finding.cwe)
+            if reason:
+                return f"{finding.cwe} is not dynamically provable: {reason}"
+            return (
+                f"no PHP sink oracle for {finding.cwe} (dynamically proven PHP families: OS "
+                "command injection, code injection (assert/create_function), SQL injection, "
+                "path traversal, unsafe deserialization, SSRF, reflected output - the "
+                "function-form sinks the uopz oracle hooks)"
+            )
+        return ""
     suffix = finding.file.rsplit(".", 1)[-1] if "." in finding.file else "?"
-    return f"no dynamic sink oracle for .{suffix} files (Python and JS/TS only for now)"
+    return f"no dynamic sink oracle for .{suffix} files (Python, JS/TS and PHP only for now)"
 
 
 @dataclass(slots=True)

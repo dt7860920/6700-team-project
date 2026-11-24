@@ -434,6 +434,17 @@ class Settings(BaseSettings):
             "image, not a swap, since a scan can mix Python and JS/TS findings in one jail."
         ),
     )
+    sandbox_image_php: str = Field(
+        default="ono-php-jail:local",
+        description=(
+            "Image selected instead of sandbox_image for a scan with any PHP finding "
+            "(runtime=php). Must carry php 8.x WITH the `uopz` PECL extension enabled (the "
+            "runtime oracle hooks PHP builtins through uopz), PLUS python3 (the in-jail "
+            "read/tree/grep guest helper always runs `python3`, regardless of the target's "
+            "language) and git. Built by docker/php-jail.Dockerfile - build or pull it on the "
+            "Executor host; the default tag is what that Dockerfile produces."
+        ),
+    )
     sandbox_builder_image: str = Field(
         default="ghcr.io/astral-sh/uv:python3.13-bookworm",
         description=(
