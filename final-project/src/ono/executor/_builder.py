@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import configparser
 import contextlib
+import datetime as _dt
 import json
 import os
 import re
@@ -40,6 +41,9 @@ import sys
 import tempfile
 import time
 import tomllib
+import urllib.error
+import urllib.parse
+import urllib.request
 from collections.abc import Callable
 from typing import Any
 
@@ -536,27 +540,55 @@ def plan_installs(root: str, manifests: list[str]) -> tuple[list[InstallSet], li
 # ---------------------------------------------------------------------------
 
 
-def run_pip(site: str) -> PipRunner:
-    """The real pip, as a child process of this (isolated) interpreter."""
+def uv_available() -> bool:
+    """``uv`` on PATH (the Python builder image ships it); gates era-correct resolution."""
+    return shutil.which("uv") is not None
+
+
+def run_pip(site: str, cutoff: Callable[[], str | None] = lambda: None) -> PipRunner:
+    """Install packages into ``site``; prefer ``uv`` with an era cutoff when it is available.
+
+    ``cutoff()`` returns an ``--exclude-newer`` date (``YYYY-MM-DD``) or ``None``. When ``uv``
+    is on PATH it runs ``uv pip install --exclude-newer <date>`` so a repo's *unpinned*
+    transitive dependencies resolve to the era of its *pinned* ones - the general cure for
+    "old app pins Flask but not Werkzeug, pip pulls a Werkzeug that the old Flask can't
+    import" (see :func:`era_cutoff`). With no ``uv`` or no cutoff it is plain pip, unchanged.
+    A configured mirror (``PIP_INDEX_URL``) forces plain pip so the mirror is still honoured.
+    """
+    use_uv = uv_available() and not os.environ.get("PIP_INDEX_URL")
 
     def runner(args: list[str], timeout_s: float) -> tuple[int, str]:
-        cmd = [
-            sys.executable,
-            "-m",
-            "pip",
-            "install",
-            "--target",
-            site,
-            "--no-cache-dir",
-            "--no-compile",
-            "--no-input",
-            "--disable-pip-version-check",
-            "--progress-bar",
-            "off",
-            "--prefer-binary",
-            "--no-warn-script-location",
-            *args,
-        ]
+        when = cutoff() if use_uv else None
+        if use_uv and when:
+            cmd = [
+                "uv",
+                "pip",
+                "install",
+                "--target",
+                site,
+                "--no-cache",
+                "--exclude-newer",
+                when,
+                *args,
+            ]
+        else:
+            cmd = [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "--target",
+                site,
+                "--no-cache-dir",
+                "--no-compile",
+                "--no-input",
+                "--disable-pip-version-check",
+                "--progress-bar",
+                "off",
+                "--prefer-binary",
+                "--no-warn-script-location",
+                *args,
+            ]
         try:
             proc = subprocess.run(  # fixed argv built above, no shell
                 cmd,
@@ -647,6 +679,73 @@ def is_pinned(line: str) -> bool:
     return bool(match and match.group(3) and _PIN_RE.match(match.group(3).strip()))
 
 
+_EXACT_PIN_RE = re.compile(r"^==\s*([A-Za-z0-9][A-Za-z0-9.+!_-]*)$")
+_PINS_FOR_CUTOFF = 40  # bound the PyPI lookups; the newest few pins fix the era anyway
+_PYPI_TIMEOUT_S = 4.0
+
+
+def exact_pin(line: str) -> tuple[str, str] | None:
+    """``flask==1.0 ; py>'3'`` -> ``("flask", "1.0")``; ``None`` for anything not ``==``-pinned.
+
+    Only exact pins date an app's era, so only they drive the cutoff (``>=`` / ``~=`` do not).
+    """
+    head = line.split(";", 1)[0].strip()
+    match = _NAME_RE.match(head)
+    if not match or not match.group(3):
+        return None
+    pin = _EXACT_PIN_RE.match(match.group(3).strip().rstrip(","))
+    return (match.group(1).lower(), pin.group(1)) if pin else None
+
+
+def pypi_upload_date(name: str, version: str, timeout_s: float) -> _dt.date | None:
+    """Newest file upload date for ``name==version`` on PyPI, or ``None`` (best effort)."""
+    # Always the hardcoded-https PyPI JSON API; name/version are URL-quoted.
+    url = f"https://pypi.org/pypi/{urllib.parse.quote(name)}/{urllib.parse.quote(version)}/json"
+    try:
+        with urllib.request.urlopen(url, timeout=timeout_s) as resp:
+            data = json.load(resp)
+    except (urllib.error.URLError, TimeoutError, ValueError, OSError):
+        return None
+    stamps = [
+        f.get("upload_time_iso_8601") or f.get("upload_time")
+        for f in (data.get("urls") or [])
+        if isinstance(f, dict)
+    ]
+    dates: list[_dt.date] = []
+    for stamp in stamps:
+        if not isinstance(stamp, str):
+            continue
+        with contextlib.suppress(ValueError):
+            dates.append(_dt.datetime.fromisoformat(stamp.replace("Z", "+00:00")).date())
+    return max(dates) if dates else None
+
+
+def era_cutoff(lines: list[str], deadline: float) -> str | None:
+    """A ``--exclude-newer`` date derived from the repo's OWN exact pins (newest + 1 day).
+
+    The newest explicitly pinned dependency dates the app; resolving everything else no newer
+    than that keeps an old app's unpinned transitive tree in its own era (so it still
+    imports) and leaves a modern app untouched (its cutoff is ~today). Repo-derived, so it
+    over-indexes on no particular framework. ``None`` when nothing is pinned or PyPI is
+    unreachable - callers then resolve latest, exactly as before.
+    """
+    seen: dict[str, str] = {}
+    for line in lines:
+        pin = exact_pin(line)
+        if pin and pin[0] not in seen:
+            seen[pin[0]] = pin[1]
+    newest: _dt.date | None = None
+    for name, version in list(seen.items())[:_PINS_FOR_CUTOFF]:
+        if time.monotonic() >= deadline:
+            break
+        when = pypi_upload_date(name, version, _PYPI_TIMEOUT_S)
+        if when and (newest is None or when > newest):
+            newest = when
+    if newest is None:
+        return None
+    return (newest + _dt.timedelta(days=1)).isoformat()
+
+
 # ---------------------------------------------------------------------------
 # The build
 # ---------------------------------------------------------------------------
@@ -660,7 +759,12 @@ class Build:
         self.site = str(config["site"])
         self.max_bytes = int(config.get("max_bytes", 256_000_000))
         self.deadline = time.monotonic() + float(config.get("timeout_s", 300.0))
-        self.pip = pip or run_pip(self.site)
+        # Era cutoff for uv's --exclude-newer, derived in run() from the repo's own pins.
+        # Only on the real path (default runner); an injected runner (tests) never derives it,
+        # so the unit tests stay offline regardless of whether uv is on the dev machine.
+        self.exclude_newer: str | None = None
+        self._derive_cutoff = pip is None
+        self.pip = pip or run_pip(self.site, lambda: self.exclude_newer)
         # Sink files the verifier wants provisioned FROM the nearest manifest (workspace-rel).
         self.near: list[str] = [str(p) for p in (config.get("near") or []) if isinstance(p, str)]
         self.manifests: list[str] = []
@@ -767,6 +871,14 @@ class Build:
                 self.manifests
             )
             return self.result(started, status="failed")
+        # Era-correct resolution (uv only): date the app by its newest exact pin and resolve
+        # everything no newer, so an old app's unpinned transitive deps stay in its own era.
+        if self._derive_cutoff and uv_available() and sets:
+            pins = [req for item in sets for req in item.requirements]
+            budget = min(30.0, max(0.0, self.remaining() * 0.25))
+            self.exclude_newer = era_cutoff(pins, time.monotonic() + budget)
+            if self.exclude_newer:
+                self.warnings.append(f"resolved dependencies as of {self.exclude_newer} (repo era)")
         for item in sets:
             if not self.pip_ok(item):
                 break
@@ -801,10 +913,24 @@ class Build:
             # `npm ci` is strict about a lockfile matching package.json; a stale lockfile in
             # an otherwise-fine repo should not cost the app its dependencies entirely.
             label = f"{rel} (npm install, after ci failed)"
-            ok, output2 = self._npm_install(work_dir, ci=False)
-            output += "\n" + output2
+            ok, out2 = self._npm_install(work_dir, ci=False)
+            output += "\n" + out2
         if not ok:
-            self.failed.append(f"{rel} (npm): {_last_line(output)}")
+            # Last resort: skip lifecycle scripts. A single legacy native addon that cannot
+            # compile against the current Node ABI (e.g. an old `nan`-based module on Node 20)
+            # otherwise fails the WHOLE install, even though the finding's sink path usually
+            # needs only pure-JS packages. --ignore-scripts installs the rest of the tree so
+            # the app's vulnerable route can still boot.
+            label = f"{rel} (npm install --ignore-scripts, after build failed)"
+            ok, out3 = self._npm_install(work_dir, ci=False, ignore_scripts=True)
+            output += "\n" + out3
+            if ok:
+                self.warnings.append(
+                    f"{rel} (npm): native builds skipped (--ignore-scripts); "
+                    f"a native dependency could not compile: {_npm_error(output)}"
+                )
+        if not ok:
+            self.failed.append(f"{rel} (npm): {_npm_error(output)}")
             return
         node_modules = os.path.join(work_dir, "node_modules")
         if not os.path.isdir(node_modules):
@@ -821,7 +947,9 @@ class Build:
         _strip_node_modules_symlinks(dest)
         self.installed_from.append(label)
 
-    def _npm_install(self, work_dir: str, *, ci: bool) -> tuple[bool, str]:
+    def _npm_install(
+        self, work_dir: str, *, ci: bool, ignore_scripts: bool = False
+    ) -> tuple[bool, str]:
         remaining = self.remaining()
         if remaining <= 0:
             return False, "build timed out before npm could run"
@@ -832,6 +960,8 @@ class Build:
             "--no-fund",
             "--loglevel=error",
         ]
+        if ignore_scripts:
+            cmd.append("--ignore-scripts")
         try:
             proc = subprocess.run(  # fixed argv, no shell
                 cmd,
@@ -896,6 +1026,31 @@ class Build:
 def _last_line(text: str) -> str:
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     return lines[-1][:200] if lines else "pip failed"
+
+
+# npm's final lines are boilerplate ("A complete log...", the update "npm notice"); the real
+# cause is an earlier `npm error` line. These skip the boilerplate and the giant JS stack
+# frames so the recorded reason names the actual failure (a 404 prebuilt, a compile error).
+_NPM_NOISE = re.compile(
+    r"(complete log of this run|npm notice|gyp ERR! stack|gyp info|node_modules/npm/|"
+    r"^npm error\s*$|^npm error code \d|install response status|Pre-built binaries)",
+)
+_NPM_ERROR_PREFIX = re.compile(r"^npm (error|ERR!)\s+")
+
+
+def _npm_error(text: str) -> str:
+    """The most informative line of an npm failure, past the trailing boilerplate."""
+    substantive: list[str] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or _NPM_NOISE.search(line):
+            continue
+        stripped = _NPM_ERROR_PREFIX.sub("", line)
+        if stripped and ("error" in line.lower() or "fail" in line.lower() or "not " in line):
+            substantive.append(stripped)
+    if substantive:
+        return substantive[-1][:200]
+    return _last_line(text)
 
 
 def dir_size(root: str) -> int:

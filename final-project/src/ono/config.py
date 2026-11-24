@@ -434,6 +434,25 @@ class Settings(BaseSettings):
             "image, not a swap, since a scan can mix Python and JS/TS findings in one jail."
         ),
     )
+    sandbox_builder_image: str = Field(
+        default="ghcr.io/astral-sh/uv:python3.13-bookworm",
+        description=(
+            "Image for the ephemeral dependency BUILDER (Python scans) - deliberately NOT the "
+            "jail image. The jail stays slim/hardened; the builder needs a full compiler "
+            "toolchain (gcc/g++/make) so sdist-only wheels build, and `uv` so transitive "
+            "dependencies resolve era-correctly (--exclude-newer; see _builder.py). Must have "
+            "python3, pip and `uv` on PATH. The builder is torn down after every build."
+        ),
+    )
+    sandbox_builder_image_node: str = Field(
+        default="nikolaik/python-nodejs:python3.13-nodejs20",
+        description=(
+            "Image for the dependency BUILDER of a JS/TS scan (runtime=node) - the non-slim "
+            "combined image, so node-gyp's toolchain (make/g++/python3) is present and native "
+            "addons that CAN build do. One uncompilable legacy addon no longer zeroes the "
+            "install: the builder falls back to `npm install --ignore-scripts` (see _builder.py)."
+        ),
+    )
     sandbox_mem_mb: int = Field(
         default=1024,
         ge=64,
