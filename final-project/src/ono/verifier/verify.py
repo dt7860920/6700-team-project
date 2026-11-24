@@ -68,6 +68,7 @@ from ono.verifier.oracle import (
     summarize,
 )
 from ono.verifier.oracle_js import JsSinkOracle
+from ono.verifier.oracle_php import PhpSinkOracle
 
 __all__ = [
     "ExecutorProvider",
@@ -131,15 +132,26 @@ def environment_note(result: ProvisionResult | None, language: str = "python") -
     stubbing its framework) and the ones that are not (so it stubs exactly those). It never
     carries a payload or the canary. ``language`` only changes which stubbing idiom is
     suggested (Python's ``unittest.mock`` vs. Node's ``require.cache`` / module-object
-    monkeypatching); the dependency facts themselves are language-agnostic.
+    monkeypatching vs. PHP's define-the-constant / set the superglobal before include); the
+    dependency facts themselves are language-agnostic.
     """
-    stub_hint = (
-        "stub any other import with unittest.mock (sys.modules[...] = MagicMock()) "
-        "before importing the app"
-        if language != "javascript"
-        else "stub any other require() by overwriting its exported object/functions, or "
-        "require.cache[require.resolve('<module>')] = {exports: {...}}, before requiring the app"
-    )
+    if language == "javascript":
+        stub_hint = (
+            "stub any other require() by overwriting its exported object/functions, or "
+            "require.cache[require.resolve('<module>')] = {exports: {...}}, before requiring "
+            "the app"
+        )
+    elif language == "php":
+        stub_hint = (
+            "satisfy an import-time dependency before include: define() a required constant, "
+            "set the getenv/$_ENV value (putenv) or the $_GET/$_POST/$_SERVER superglobal the "
+            "app reads at load time - no composer packages are provisioned in the jail yet"
+        )
+    else:
+        stub_hint = (
+            "stub any other import with unittest.mock (sys.modules[...] = MagicMock()) "
+            "before importing the app"
+        )
     if result is None or result.status != "provisioned":
         why = result.summary if result is not None else "provisioning did not run"
         return (
@@ -230,9 +242,21 @@ class GradedVerifier:
         if not items:
             return report
         total = len(items)
-        # One jail for the whole scan: if ANY finding needs the Node oracle, the jail must
-        # have `node` in it for the whole stage (mixed Python/JS findings share one sandbox).
-        runtime = "node" if any(language_of(f.file) == "javascript" for f in items) else "python"
+        # One jail for the whole scan, and one base image for it. The image is chosen by
+        # priority - node if ANY finding is JS/TS, else php if ANY is PHP, else python - so the
+        # common single-language scan always gets the right runtime. Every image carries
+        # python3 (the in-jail read/tree/grep guest helper always runs `python3`), so Python
+        # findings verify in any of the three. The KNOWN LIMITATION is a scan that MIXES JS/TS
+        # and PHP findings: node wins, the node image has no `php`, and those PHP findings come
+        # back with "php is not available in this sandbox image" (rung <= 2, honestly unproven,
+        # never falsely failed) - and symmetrically a php+... mix would lack `node`. A
+        # single-language PHP scan (the targeted case) gets the php image and the uopz oracle.
+        if any(language_of(f.file) == "javascript" for f in items):
+            runtime = "node"
+        elif any(language_of(f.file) == "php" for f in items):
+            runtime = "php"
+        else:
+            runtime = "python"
         report_progress(f"Opening the verifier sandbox for {total} finding(s) ({runtime} jail)")
         # Group findings by the dependency manifest NEAREST each sink, then provision + verify
         # one group at a time. A repo that bundles several independent apps (each with its own
@@ -625,8 +649,11 @@ def _oracle_for(
 ) -> SinkOracleProtocol:
     """Pick the Python or JS/TS sink oracle for ``finding``'s file (see ``oracle_supports``,
     which already refused anything that is neither before this is ever called)."""
-    if language_of(finding.file) == "javascript":
+    language = language_of(finding.file)
+    if language == "javascript":
         return JsSinkOracle(sandbox, timeout_s=timeout_s)
+    if language == "php":
+        return PhpSinkOracle(sandbox, timeout_s=timeout_s)
     return SinkOracle(sandbox, timeout_s=timeout_s)
 
 

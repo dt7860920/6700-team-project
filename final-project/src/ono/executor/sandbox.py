@@ -259,6 +259,11 @@ class JailConfig:
     image_node: str = "nikolaik/python-nodejs:python3.13-nodejs20-slim"
     """Selected instead of ``image`` for a scan with any JS/TS finding (``runtime="node"``);
     must have Python (the guest helper always runs ``python3``) PLUS ``node``/``npm``."""
+    image_php: str = "ono-php-jail:local"
+    """Selected instead of ``image`` for a scan with any PHP finding (``runtime="php"``); must
+    have Python (the guest helper always runs ``python3``) PLUS ``php`` 8.x with the ``uopz``
+    extension (the runtime oracle hooks PHP builtins through uopz). See
+    ``docker/php-jail.Dockerfile`` and ``sandbox_image_php``."""
     builder_image: str = "ghcr.io/astral-sh/uv:python3.13-bookworm"
     """Image for the ephemeral dependency builder of a Python scan - a full toolchain + ``uv``,
     NOT the slim jail image (see ``builder_image_for`` / ``sandbox_builder_image``)."""
@@ -295,6 +300,7 @@ class JailConfig:
         return cls(
             image=settings.sandbox_image,
             image_node=settings.sandbox_image_node,
+            image_php=settings.sandbox_image_php,
             builder_image=settings.sandbox_builder_image,
             builder_image_node=settings.sandbox_builder_image_node,
             mem_mb=settings.sandbox_mem_mb,
@@ -352,14 +358,19 @@ def load_seccomp_profile(spec: str | None) -> str | None:
 
 
 def select_image(config: JailConfig, runtime: str) -> str:
-    """The image for a sandbox's declared ``runtime``: ``"python"`` (default) or ``"node"``.
+    """The image for a sandbox's declared ``runtime``: ``"python"`` (default), ``"node"`` or
+    ``"php"``.
 
     This is the ONLY place a client-influenced value selects a Docker image, and it chooses
-    between exactly two Executor-configured images (never an arbitrary string from a
+    between exactly the three Executor-configured images (never an arbitrary string from a
     request) - see ``create_sandbox``'s ``runtime`` query parameter in ``app.py``, which
-    FastAPI's ``Literal`` validation already restricts to these two values before this runs.
+    FastAPI's ``Literal`` validation already restricts to these values before this runs.
     """
-    return config.image_node if runtime == "node" else config.image
+    if runtime == "node":
+        return config.image_node
+    if runtime == "php":
+        return config.image_php
+    return config.image
 
 
 def builder_image_for(config: JailConfig, jail_image: str) -> str:
@@ -1341,7 +1352,11 @@ class SandboxManager:
                 try:
                     # Streaming execs can be silent for the whole command budget: the HTTP
                     # read timeout must outlive it (the socket deadline is enforced by us).
-                    self._client = docker.from_env(timeout=int(self.config.cmd_timeout_s) + 60)
+                    # docker-py ships no type info; mypy sees `from_env` only once the module
+                    # graph pulls docker's __init__ in (which happens with the PHP modules added).
+                    self._client = docker.from_env(  # type: ignore[attr-defined]
+                        timeout=int(self.config.cmd_timeout_s) + 60
+                    )
                 except docker.errors.DockerException as exc:
                     raise DockerUnavailableError(f"cannot create docker client: {exc}") from exc
             return self._client

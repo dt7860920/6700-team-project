@@ -310,8 +310,8 @@ def test_give_up_when_no_poc_reaches_the_sink(workspace: Path) -> None:
 
 
 def test_unsupported_language_skips_the_oracle_without_claiming_proof(workspace: Path) -> None:
-    """A language neither oracle instruments (Ruby here) stays an honest, unconditional
-    skip - unlike JS/TS, which this PR gave a real oracle to (see the test right below)."""
+    """A language no oracle instruments (Ruby here) stays an honest, unconditional skip -
+    unlike JS/TS and PHP, which now have real oracles (see the test right below)."""
     (workspace / "app.rb").write_text("def q(id); db.query(id); end\n")
     model = ScriptedModel(script=_prover_fixer_script([], []))  # no agent should be called
     verifier, _ = _verifier(_settings(workspace), model)
@@ -328,7 +328,7 @@ def test_unsupported_language_skips_the_oracle_without_claiming_proof(workspace:
     assert (
         poc_check is not None
         and poc_check.status == "skipped"
-        and "Python and JS/TS only" in poc_check.detail
+        and "Python, JS/TS and PHP only" in poc_check.detail
     )
 
 

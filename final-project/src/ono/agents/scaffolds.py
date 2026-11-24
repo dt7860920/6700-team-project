@@ -25,6 +25,7 @@ before.
 from __future__ import annotations
 
 from ono.models import Finding, TraceStep
+from ono.verifier.oracle import language_of
 
 __all__ = ["detect_framework", "entry_hint", "scaffold_for"]
 
@@ -55,12 +56,23 @@ _JS_FRAMEWORK_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ),
     ("express", ("express(", "require('express')", 'require("express")', "app.get(", "app.post(")),
 )
+_PHP_FRAMEWORK_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("laravel", ("illuminate\\", "use illuminate", "->middleware(", "route::", "artisan")),
+    ("symfony", ("symfony\\", "use symfony", "abstractcontroller", "#[route(")),
+    ("slim", ("slim\\", "slim\\app", "$app->get(", "$app->post(", "psr\\http")),
+)
+
+_FRAMEWORK_MARKERS_BY_LANGUAGE: dict[str, tuple[tuple[str, tuple[str, ...]], ...]] = {
+    "python": _PY_FRAMEWORK_MARKERS,
+    "javascript": _JS_FRAMEWORK_MARKERS,
+    "php": _PHP_FRAMEWORK_MARKERS,
+}
 
 
 def detect_framework(finding: Finding, window_text: str) -> str:
     """Best-effort framework label from the sink window + trace, or ``""`` if unknown."""
     hay = (window_text + "\n" + "\n".join(t.symbol for t in finding.trace)).lower()
-    markers = _JS_FRAMEWORK_MARKERS if not finding.file.endswith(".py") else _PY_FRAMEWORK_MARKERS
+    markers = _FRAMEWORK_MARKERS_BY_LANGUAGE.get(language_of(finding.file), _JS_FRAMEWORK_MARKERS)
     for name, needles in markers:
         if any(needle.lower() in hay for needle in needles):
             return name
@@ -144,6 +156,41 @@ The jail blocks all egress EXCEPT loopback, so this always works:
 If `supertest` IS declared by the target (check package.json), `require('supertest')(app).get(...)`
 is a shorter equivalent - use whichever is available."""
 
+_IMPORT_STUB_RECIPE_PHP = """\
+Handle include-time dependencies FIRST. Including the app often runs top-level code that
+needs a constant, an environment value or a superglobal the jail does not set, raising before
+the sink is reached. Satisfy it rather than giving up:
+  - a required constant:  if (!defined('THE_CONST')) define('THE_CONST', 'x');  BEFORE include
+  - a required env value:  putenv('THE_VAR=x'); $_ENV['THE_VAR'] = 'x';  BEFORE include
+  - populate the request the handler reads: set $_GET / $_POST / $_SERVER / $_REQUEST keys
+    before calling the handler (the built-in `php -S` server path reads these from the real
+    HTTP request instead; either style works - loopback is allowed in the jail)
+  - wrap the drive in try/catch (\\Throwable): the oracle records AT the sink call, so an error
+    that happens AFTER the sink (a bad-SQL error, a missing file) does not matter.
+NO composer packages are installed in the jail yet: drive dependency-light / procedural PHP;
+only `require` files the repository itself ships."""
+
+_GENERIC_SCAFFOLD_PHP = """\
+Generic procedural PHP drive (works without a framework). The workspace root is the current
+working directory, so include the target by an absolute path built from getcwd():
+  <?php
+  putenv('THE_VAR=x');                  // satisfy include-time config, see above
+  require getcwd() . '/app.php';        // the target file that defines the handler/front controller
+  $payload = getenv('ONO_PAYLOAD');
+  // 1) satisfy any precondition the route checks (an API key, a session, a role)
+  // 2) drive the vulnerable entry point, putting the payload where attacker input enters
+  //    - either via a handler function the app exposes:
+  handle(['path' => '/diagnose', 'api_key' => '...', 'args' => ['host' => $payload]]);
+  //    - or via the superglobal the top-level script reads, then include it:
+  $_GET['host'] = $payload; require getcwd() . '/index.php';
+Alternative (drive the REAL app over HTTP, loopback is allowed in the jail): start the app's
+own entry with the built-in server and issue a request to it:
+  $srv = proc_open('php -S 127.0.0.1:8099 ' . escapeshellarg(getcwd() . '/index.php'),
+                   [], $pipes);  usleep(300000);
+  file_get_contents('http://127.0.0.1:8099/?host=' . urlencode($payload));
+Import, do not reimplement: a fresh script that redefines the route does NOT contain the
+flagged line, so the oracle never sees it and the finding cannot be proven."""
+
 _FRAMEWORK_SCAFFOLDS: dict[str, str] = {
     "flask": """\
 Flask - use the app's OWN test client so the real route runs:
@@ -211,6 +258,19 @@ minimal mock request/response rather than running the whole `next` server:
   const res = { status() { return this; }, json(v) { body = JSON.stringify(v); },
                 send(v) { body = String(v); }, setHeader() {} };
   await handler(req, res);""",
+    "laravel": """\
+Laravel - no composer vendor/ is provisioned yet, so bootstrapping the full framework will
+fail at `require vendor/autoload.php`. Target the controller METHOD directly instead: require
+the controller class the repository ships, construct it, and call the action with a Request
+whose input carries the payload (new Illuminate\\Http\\Request only if the framework is
+vendored). If that is not possible without vendor/, this finding stays unproven - note it.""",
+    "symfony": """\
+Symfony - same as Laravel: without a provisioned vendor/ the kernel cannot boot. Require and
+instantiate the controller class directly and invoke the action method with the payload in
+the request input; drive the real method, do not reimplement it.""",
+    "slim": """\
+Slim - require the file that builds the `$app`, then drive its route over loopback with the
+built-in server (see the generic PHP drive below), putting the payload where input enters.""",
 }
 
 
@@ -245,9 +305,28 @@ def _cwe_hint(cwe: str) -> str:
     return _CWE_HINTS.get(cwe, "")
 
 
+_LANGUAGE_LINE: dict[str, str] = {
+    "javascript": "- Language: JavaScript/TypeScript - read the payload with "
+    "process.env.ONO_PAYLOAD and write the script for `node` (CommonJS require(), not ESM import).",
+    "php": "- Language: PHP - read the payload with getenv('ONO_PAYLOAD') and write the script "
+    "for `php` (the workspace root is the current directory; require the target from there).",
+    "python": '- Language: Python - read the payload with os.environ["ONO_PAYLOAD"].',
+}
+_IMPORT_STUB_BY_LANGUAGE: dict[str, str] = {
+    "javascript": _IMPORT_STUB_RECIPE_JS,
+    "php": _IMPORT_STUB_RECIPE_PHP,
+    "python": _IMPORT_STUB_RECIPE,
+}
+_GENERIC_SCAFFOLD_BY_LANGUAGE: dict[str, str] = {
+    "javascript": _GENERIC_SCAFFOLD_JS,
+    "php": _GENERIC_SCAFFOLD_PHP,
+    "python": _GENERIC_SCAFFOLD,
+}
+
+
 def scaffold_for(finding: Finding, window_text: str) -> str:
     """The scaffold block injected into the prover's task prompt for this finding."""
-    is_js = not finding.file.endswith(".py")
+    language = language_of(finding.file) or "python"
     framework = detect_framework(finding, window_text)
     parts: list[str] = [
         "HOW TO REACH THE SINK (drive the application, do not call the sink yourself):",
@@ -257,12 +336,9 @@ def scaffold_for(finding: Finding, window_text: str) -> str:
         "be proven. You must exercise the real code at the sink.",
         f"- Attacker entry point (drive THIS): {entry_hint(finding)}",
         f"- Flagged sink to reach: {finding.location} ({finding.cwe})",
-        "- Language: JavaScript/TypeScript - read the payload with process.env.ONO_PAYLOAD "
-        "and write the script for `node` (CommonJS require(), not ESM import)."
-        if is_js
-        else '- Language: Python - read the payload with os.environ["ONO_PAYLOAD"].',
+        _LANGUAGE_LINE.get(language, _LANGUAGE_LINE["python"]),
         "",
-        _IMPORT_STUB_RECIPE_JS if is_js else _IMPORT_STUB_RECIPE,
+        _IMPORT_STUB_BY_LANGUAGE.get(language, _IMPORT_STUB_RECIPE),
         "",
     ]
     hint = _cwe_hint(finding.cwe)
@@ -273,5 +349,5 @@ def scaffold_for(finding: Finding, window_text: str) -> str:
         parts.append(f"Detected framework: {framework}.")
         parts.append(_FRAMEWORK_SCAFFOLDS[framework])
         parts.append("")
-    parts.append(_GENERIC_SCAFFOLD_JS if is_js else _GENERIC_SCAFFOLD)
+    parts.append(_GENERIC_SCAFFOLD_BY_LANGUAGE.get(language, _GENERIC_SCAFFOLD))
     return "\n".join(parts)

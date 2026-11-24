@@ -169,8 +169,9 @@ class ExecutorClient:
 
     # -- lifecycle ----------------------------------------------------------------
     def create(self, scan_id: str, workspace_dir: Path, *, runtime: str = "python") -> SandboxInfo:
-        """Pack ``workspace_dir`` and create a sandbox holding it. ``runtime`` ("python" or
-        "node") picks the jail's base image - see ``select_image`` on the Executor side."""
+        """Pack ``workspace_dir`` and create a sandbox holding it. ``runtime`` ("python",
+        "node" or "php") picks the jail's base image - see ``select_image`` on the Executor
+        side."""
         try:
             archive = pack_workspace(workspace_dir, max_bytes=self.max_archive_bytes)
         except ArchiveError as exc:
