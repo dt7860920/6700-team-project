@@ -48,7 +48,8 @@ class SinkRule:
 
 PY = frozenset({"python"})
 JS = frozenset({"javascript", "typescript"})
-ALL = PY | JS
+PHP = frozenset({"php"})
+ALL = PY | JS | PHP
 
 # Members of a request object that carry attacker-controlled data (Flask / Django / DRF /
 # FastAPI / Tornado / Express / Koa / Fastify / Next.js). ``request.user`` is deliberately
@@ -133,6 +134,54 @@ REQUEST_PROPS: dict[str, frozenset[str]] = {
     ),
 }
 REQUEST_PROPS["typescript"] = REQUEST_PROPS["javascript"]
+# PHP request accessors (``$request->..``) across Laravel / Symfony / Slim (PSR-7). The bare
+# superglobals ``$_GET`` / ``$_POST`` / ... are modelled as GLOBAL_SOURCES instead, below.
+REQUEST_PROPS["php"] = frozenset(
+    {
+        # Laravel Illuminate\Http\Request
+        "input",
+        "query",
+        "post",
+        "get",
+        "all",
+        "only",
+        "except",
+        "cookie",
+        "file",
+        "header",
+        "bearerToken",
+        "json",
+        "string",
+        "boolean",
+        "request",
+        "getContent",
+        "content",
+        "segment",
+        "path",
+        "url",
+        "fullUrl",
+        "ip",
+        "route",
+        "attributes",
+        # Symfony HttpFoundation\Request (query / request / cookies / files / headers are bags)
+        "cookies",
+        "files",
+        "headers",
+        "server",
+        # Slim / PSR-7 ServerRequestInterface
+        "getQueryParams",
+        "getParsedBody",
+        "getBody",
+        "getAttribute",
+        "getAttributes",
+        "getUploadedFiles",
+        "getCookieParams",
+        "getServerParams",
+        "getHeader",
+        "getHeaderLine",
+        "getUri",
+    }
+)
 
 # Names that are a request object wherever they appear (Flask's context-global proxy;
 # the conventional Express / Koa parameter names when a function was not matched to a route).
@@ -141,6 +190,10 @@ GLOBAL_REQUEST_NAMES: dict[str, frozenset[str]] = {
     "javascript": frozenset({"req", "request", "ctx"}),
 }
 GLOBAL_REQUEST_NAMES["typescript"] = GLOBAL_REQUEST_NAMES["javascript"]
+# The conventional PHP controller/handler request-object parameter names (Laravel / Symfony /
+# Slim all inject a ``$request``); ``$request->input(..)`` is then attacker data wherever it
+# appears, matching how ``req`` / ``ctx`` are treated in JS.
+GLOBAL_REQUEST_NAMES["php"] = frozenset({"$request", "$req"})
 
 # Dotted chains that are attacker-influenced wherever they are read.
 GLOBAL_SOURCES: dict[str, tuple[tuple[str, str], ...]] = {
@@ -173,6 +226,17 @@ GLOBAL_SOURCES: dict[str, tuple[tuple[str, str], ...]] = {
     ),
 }
 GLOBAL_SOURCES["typescript"] = GLOBAL_SOURCES["javascript"]
+# PHP superglobals: attacker-influenced wherever read (``$_GET['id']``), exactly like
+# ``sys.argv`` / ``process.env``. The chain of ``$_GET['id']`` resolves to ``$_GET`` (the
+# subscript index is transparent), so a bare-superglobal entry matches every member read.
+GLOBAL_SOURCES["php"] = (
+    ("$_GET", "HTTP GET parameter ($_GET)"),
+    ("$_POST", "HTTP POST parameter ($_POST)"),
+    ("$_REQUEST", "HTTP request parameter ($_REQUEST)"),
+    ("$_COOKIE", "HTTP cookie ($_COOKIE)"),
+    ("$_FILES", "uploaded file metadata ($_FILES)"),
+    ("$_SERVER", "request header / server value ($_SERVER)"),
+)
 
 # Calls whose *result* is attacker-controlled regardless of receiver (last segment match).
 SOURCE_METHODS: dict[str, frozenset[str]] = {
@@ -180,6 +244,7 @@ SOURCE_METHODS: dict[str, frozenset[str]] = {
     "javascript": frozenset(),
 }
 SOURCE_METHODS["typescript"] = SOURCE_METHODS["javascript"]
+SOURCE_METHODS["php"] = frozenset()
 
 # ---------------------------------------------------------------------------
 # Sanitizers: a call to one of these (last segment) stops propagation
@@ -240,6 +305,20 @@ SANITIZERS: frozenset[str] = frozenset(
         "md5",
         "uuid4",
         "randint",
+        # PHP: type coercions and injection-specific escapers
+        "intval",
+        "floatval",
+        "escapeshellarg",
+        "escapeshellcmd",
+        "htmlspecialchars",
+        "htmlentities",
+        "addslashes",
+        "mysqli_real_escape_string",
+        "real_escape_string",
+        "urlencode",
+        "rawurlencode",
+        "ctype_alnum",
+        "ctype_digit",
     }
 )
 
@@ -282,6 +361,23 @@ def _not_a_list(call: Expr) -> bool:
 
 def _string_building_arg(call: Expr) -> bool:
     return bool(call.args) and is_string_building(call.args[0])
+
+
+def _preg_replace_eval_modifier(call: Expr) -> bool:
+    """``preg_replace('/x/e', $repl, ..)`` - the ``e`` pattern modifier eval()s ``$repl``."""
+    if not call.args or call.args[0].kind != "literal":
+        return False
+    pattern = call.args[0].text.strip().strip("\"'")
+    if len(pattern) < 2:
+        return False
+    delimiter = pattern[0]
+    modifiers = pattern.rsplit(delimiter, 1)[-1]
+    return "e" in modifiers
+
+
+def _curl_setopt_url(call: Expr) -> bool:
+    """``curl_setopt($ch, CURLOPT_URL, $url)`` - only the URL option is SSRF-relevant."""
+    return len(call.args) >= 2 and "CURLOPT_URL" in call.args[1].text
 
 
 # ---------------------------------------------------------------------------
@@ -592,6 +688,83 @@ SINK_RULES: tuple[SinkRule, ...] = (
         severity="WARNING",
         require_taint=True,
     ),
+    # == PHP ==========================================================================
+    # ``echo`` / ``print`` / ``include`` / ``require`` and the backtick operator are lowered
+    # by :mod:`ono.planning.php_frontend` into synthetic calls so they match as plain rows.
+    # -- CWE-78 OS command injection ----------------------------------------------------
+    SinkRule(
+        "CWE-78",
+        "shell-command-from-input",
+        PHP,
+        ("system", "exec", "shell_exec", "passthru", "popen", "proc_open"),
+    ),
+    # -- CWE-95 / CWE-94 code injection -----------------------------------------------
+    SinkRule("CWE-95", "eval-of-dynamic-input", PHP, ("eval", "assert", "create_function")),
+    SinkRule(
+        "CWE-95",
+        "preg-replace-eval-modifier",
+        PHP,
+        ("preg_replace",),
+        arg=1,
+        condition=_preg_replace_eval_modifier,
+    ),
+    # -- CWE-89 SQL injection ----------------------------------------------------------
+    SinkRule("CWE-89", "sql-query-built-from-input", PHP, (".query", ".exec", "mysql_query")),
+    SinkRule(
+        "CWE-89",
+        "sql-query-built-from-input",
+        PHP,
+        ("mysqli_query", "pg_query", "pg_send_query"),
+        arg=1,
+    ),
+    # -- CWE-98 file inclusion (RFI/LFI) ----------------------------------------------
+    SinkRule(
+        "CWE-98",
+        "file-inclusion-from-input",
+        PHP,
+        ("include", "include_once", "require", "require_once"),
+    ),
+    # -- CWE-22 path traversal (taint-gated: file access is benign without input) ------
+    SinkRule(
+        "CWE-22",
+        "path-from-input",
+        PHP,
+        ("fopen", "file_get_contents", "file_put_contents", "readfile", "fpassthru", "unlink"),
+        severity="WARNING",
+        require_taint=True,
+    ),
+    # -- CWE-502 unsafe deserialization -----------------------------------------------
+    SinkRule("CWE-502", "unsafe-deserialization", PHP, ("unserialize",)),
+    # -- CWE-918 SSRF (taint-gated) ----------------------------------------------------
+    SinkRule(
+        "CWE-918",
+        "request-url-from-input",
+        PHP,
+        ("file_get_contents", "curl_exec"),
+        arg="any",
+        severity="WARNING",
+        require_taint=True,
+    ),
+    SinkRule(
+        "CWE-918",
+        "request-url-from-input",
+        PHP,
+        ("curl_setopt",),
+        arg=2,
+        severity="WARNING",
+        require_taint=True,
+        condition=_curl_setopt_url,
+    ),
+    # -- CWE-79 XSS (server-side echo/print of tainted data; taint-gated) --------------
+    SinkRule(
+        "CWE-79",
+        "html-from-input",
+        PHP,
+        ("echo", "print", "printf", "vprintf"),
+        arg="any",
+        severity="WARNING",
+        require_taint=True,
+    ),
 )
 
 # JS property assignments that are XSS sinks: ``el.innerHTML = tainted``.
@@ -689,6 +862,16 @@ JS_EXPORTED_HANDLER_NAMES = frozenset(
     {"handler", "default", "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "middleware"}
 )
 JS_EVENT_RECEIVERS = frozenset({"socket", "io", "ws", "wss", "client", "server", "process", "bot"})
+
+# PHP route registration (Laravel ``Route::get``, Slim/Lumen ``$app->get`` / ``$router->post``)
+# and the controller/handler request-object parameter names. ``match`` / ``any`` / ``map`` cover
+# the multi-verb registrars. Attribute routes (Symfony ``#[Route]``) reuse ``HTTP_VERBS``.
+PHP_ROUTE_METHODS = HTTP_VERBS | {"any", "match", "map", "route"}
+PHP_ROUTE_RECEIVERS = frozenset({"Route", "$route", "$router", "$routes", "$app", "$r", "$group"})
+PHP_REQUEST_PARAM_NAMES = frozenset({"$request", "$req"})
+# Handler/closure parameters that are framework-supplied, never attacker input (PSR-7 response,
+# middleware ``next``, the app/container) - excluded when tainting a route's "data" parameters.
+PHP_NONINPUT_PARAMS = frozenset({"$response", "$res", "$next", "$app", "$handler", "$this"})
 
 
 def excerpt_of(call: Expr) -> str:
