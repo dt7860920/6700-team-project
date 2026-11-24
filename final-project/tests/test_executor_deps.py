@@ -478,6 +478,43 @@ def test_build_provisions_from_the_nearest_manifest(tmp_path: Path) -> None:
     assert {p.split()[0].lower() for p in before["installed"]} == {"django"}
 
 
+def test_root_union_does_not_downgrade_a_nested_apps_own_pins(tmp_path: Path) -> None:
+    """The pygoat conflict: a repo that ships an independent lab with its own framework pin,
+    while the root pins an OLDER version of a shared package. The lab (nearest, primary) must
+    keep its own version; the root may only ADD packages the lab lacks - it must not reinstall
+    (downgrade) one the lab already provided."""
+    (tmp_path / "labs" / "a").mkdir(parents=True)
+    (tmp_path / "labs" / "a" / "requirements.txt").write_text("flask\nwerkzeug==2.3\n")
+    (tmp_path / "labs" / "a" / "app.py").write_text("x = 1\n")
+    (tmp_path / "requirements.txt").write_text("django\nwerkzeug==2.1\n")
+    site = tmp_path / "site"
+    site.mkdir()
+    pip = FakePip(site)
+    result = Build(_build_config(tmp_path, site, near=["labs/a/app.py"]), pip).run()
+    assert result["status"] == "provisioned", result
+    names = {p.split()[0].lower() for p in result["installed"]}
+    assert {"flask", "werkzeug", "django"} <= names  # union preserved: root still added django
+    # the root's conflicting werkzeug==2.1 was dropped (the lab's werkzeug already won)
+    assert any("already satisfied" in lbl for lbl in result["installed_from"])
+    assert not any("werkzeug==2.1" in arg for call in pip.calls for arg in call)
+
+
+def test_drop_installed_filters_only_satisfied_names() -> None:
+    from ono.executor._builder import InstallSet, _canon, _drop_installed
+
+    assert _canon("Flask_Login[extra]") == "flask-login"
+    item = InstallSet(
+        "root",
+        args=["-r", "x"],
+        requirements=["django==4.2", "Werkzeug==2.1", "newpkg"],
+        primary=True,
+    )
+    trimmed = _drop_installed(item, {"werkzeug"})
+    assert trimmed is not None and trimmed.requirements == ["django==4.2", "newpkg"]
+    assert _drop_installed(item, set()) is item  # nothing dropped -> unchanged
+    assert _drop_installed(item, {"django", "werkzeug", "newpkg"}) is None  # all satisfied
+
+
 def test_provision_from_nearest_manifest_on_the_fake_docker(
     manager: SandboxManager, fake: FakeDocker
 ) -> None:

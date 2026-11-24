@@ -44,6 +44,7 @@ from ono.agents.tools import SandboxExecutor, ToolBox
 from ono.agents.trajectory import Trajectory, TrajectoryWriter
 from ono.config import Settings
 from ono.errors import PipelineError
+from ono.executor._builder import nearest_manifests, nearest_node_manifest
 from ono.executor.client import (
     ExecutorAuthError,
     ExecutorError,
@@ -233,37 +234,56 @@ class GradedVerifier:
         # have `node` in it for the whole stage (mixed Python/JS findings share one sandbox).
         runtime = "node" if any(language_of(f.file) == "javascript" for f in items) else "python"
         report_progress(f"Opening the verifier sandbox for {total} finding(s) ({runtime} jail)")
+        # Group findings by the dependency manifest NEAREST each sink, then provision + verify
+        # one group at a time. A repo that bundles several independent apps (each with its own
+        # requirements.txt / package.json pinning its own framework) cannot be served by one
+        # shared /deps - flattening them produces an incoherent environment (e.g. two labs
+        # pinning different Werkzeug versions). Each group gets its own coherent build; the
+        # common single-app repo is one group, i.e. exactly the previous behaviour.
+        groups = _group_by_manifest(workspace, items)
         try:
             with self.executor.sandbox(scan_id, workspace, runtime=runtime) as sandbox:
-                near = _dedupe([finding.file for finding in items])
-                report.dependencies = self._provision(scan_id, sandbox, report_progress, near)
-                for index, finding in enumerate(items):
-                    if index:
-                        sandbox.reset()  # a fresh copy: no patch leaks between findings
-                    report_progress(
-                        f"Verifying finding {index + 1} of {total} - {finding.location} "
-                        f"({finding.cwe})"
-                    )
-                    try:
-                        proven = self._verify_one(
-                            scan_id, sandbox, finding, budget, report.dependencies
+                proven_by_id: dict[str, Finding] = {}
+                main_dep: ProvisionResult | None = None
+                main_size = -1
+                done = 0
+                stopped = False
+                for group in groups:
+                    near = _dedupe([finding.file for finding in group])
+                    dep = self._provision(scan_id, sandbox, report_progress, near)
+                    if len(group) > main_size:  # the scan-level summary names the main app
+                        main_dep, main_size = dep, len(group)
+                    for finding in group:
+                        if done:
+                            sandbox.reset()  # fresh copy + this group's deps: no leaks between
+                        done += 1
+                        report_progress(
+                            f"Verifying finding {done} of {total} - {finding.location} "
+                            f"({finding.cwe})"
                         )
-                    except BudgetExhaustedError as exc:
-                        report.stopped_early = str(exc)
+                        try:
+                            proven = self._verify_one(scan_id, sandbox, finding, budget, dep)
+                        except BudgetExhaustedError as exc:
+                            report.stopped_early = str(exc)
+                            stopped = True
+                            break
+                        proven_by_id[finding.finding_id] = proven
+                        if proven.rung >= RUNG_REACHABLE:
+                            report.reachable += 1
+                        if proven.rung >= RUNG_FIXED:
+                            report.fixed += 1
+                        report_progress(
+                            f"Finding {done} of {total}: "
+                            + (
+                                f"PROVEN rung {proven.rung}"
+                                if proven.verified
+                                else f"unproven (rung {proven.rung})"
+                            )
+                        )
+                    if stopped:
                         break
-                    items[index] = proven
-                    if proven.rung >= RUNG_REACHABLE:
-                        report.reachable += 1
-                    if proven.rung >= RUNG_FIXED:
-                        report.fixed += 1
-                    report_progress(
-                        f"Finding {index + 1} of {total}: "
-                        + (
-                            f"PROVEN rung {proven.rung}"
-                            if proven.verified
-                            else f"unproven (rung {proven.rung})"
-                        )
-                    )
+                report.dependencies = main_dep
+                items = [proven_by_id.get(f.finding_id, f) for f in items]
         except ExecutorAuthError as exc:
             raise PipelineError(f"executor rejected EXECUTOR_TOKEN during verify: {exc}") from exc
         except ExecutorUnavailableError as exc:
@@ -619,6 +639,33 @@ def _dedupe(items: Sequence[str]) -> list[str]:
             seen.add(item)
             out.append(item)
     return out
+
+
+def _group_by_manifest(workspace: Path, findings: Sequence[Finding]) -> list[list[Finding]]:
+    """Group findings by the dependency manifest(s) NEAREST their sink, preserving order.
+
+    Findings whose sinks resolve to the same nearest Python requirement/project manifest and
+    the same nearest ``package.json`` share a dependency environment; findings in different
+    bundled sub-apps do not. Sinks with no manifest above them fall into one shared group (no
+    third-party deps anyway). Best-effort: if the workspace cannot be read the finding lands
+    in the default group, so the whole scan degrades to a single provision (the old behaviour).
+    """
+    groups: dict[tuple[tuple[str, ...], str], list[Finding]] = {}
+    order: list[tuple[tuple[str, ...], str]] = []
+    root = str(workspace)
+    for finding in findings:
+        try:
+            key = (
+                tuple(nearest_manifests(root, finding.file)),
+                nearest_node_manifest(root, finding.file) or "",
+            )
+        except OSError:
+            key = ((), "")
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(finding)
+    return [groups[key] for key in order]
 
 
 def _rerun_staged_poc(oracle: SinkOracleProtocol, finding: Finding, canary: str) -> OracleResult:
