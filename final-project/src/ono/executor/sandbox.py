@@ -1352,7 +1352,11 @@ class SandboxManager:
                 try:
                     # Streaming execs can be silent for the whole command budget: the HTTP
                     # read timeout must outlive it (the socket deadline is enforced by us).
-                    self._client = docker.from_env(timeout=int(self.config.cmd_timeout_s) + 60)
+                    # docker-py ships no type info; mypy sees `from_env` only once the module
+                    # graph pulls docker's __init__ in (which happens with the PHP modules added).
+                    self._client = docker.from_env(  # type: ignore[attr-defined]
+                        timeout=int(self.config.cmd_timeout_s) + 60
+                    )
                 except docker.errors.DockerException as exc:
                     raise DockerUnavailableError(f"cannot create docker client: {exc}") from exc
             return self._client
