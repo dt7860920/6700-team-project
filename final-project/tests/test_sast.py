@@ -501,6 +501,22 @@ def test_fallback_detects_uncovered_languages_on_disk_even_if_undeclared(
     assert "javascript" not in result.degraded
 
 
+def test_c_cpp_csharp_are_recognised_languages(no_semgrep: None, tmp_path: Path) -> None:
+    """Flag-depth coverage: C and C# get real Semgrep packs; C/C++/C# are recognised at
+    ingest and reported as uncovered by the Python-only regex fallback (never silently lost)."""
+    from ono import sources
+
+    assert {"C", "C++", "C#"} <= sources.SUPPORTED_LANGUAGES
+    assert sast.LANGUAGE_PACKS["c"] == "p/c" and sast.LANGUAGE_PACKS["c#"] == "p/csharp"
+    (tmp_path / "ok.py").write_text("print('x')\n")
+    (tmp_path / "main.c").write_text("system(input);\n")
+    (tmp_path / "App.cs").write_text("Process.Start(input);\n")
+    (tmp_path / "lib.cpp").write_text("std::system(input);\n")
+    result = sast.shortlist(tmp_path, rulesets=["p/x"], languages=[], max_candidates=20)
+    # the regex fallback (Python-only) reports every C/C++/C# file it saw as uncovered
+    assert "c, c#, c++ source was not analyzed" in result.degraded
+
+
 def test_fallback_on_a_python_target_is_not_degraded(no_semgrep: None) -> None:
     result = sast.shortlist(
         FIXTURE_REPO, rulesets=["p/x"], languages=["python", "html", "cobol"], max_candidates=20

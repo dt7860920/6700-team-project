@@ -11,7 +11,9 @@ import httpx
 from ono.targets import Target
 
 GITHUB_API = "https://api.github.com"
-SUPPORTED_LANGUAGES = frozenset({"Python", "JavaScript", "TypeScript", "Java", "Go", "Ruby", "PHP"})
+SUPPORTED_LANGUAGES = frozenset(
+    {"Python", "JavaScript", "TypeScript", "Java", "Go", "Ruby", "PHP", "C", "C++", "C#"}
+)
 _OWNER = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$")
 _REPO = re.compile(r"^[A-Za-z0-9_.-]{1,100}$")
 

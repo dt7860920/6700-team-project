@@ -127,6 +127,11 @@ LANGUAGE_PACKS: dict[str, str] = {
     "go": "p/golang",
     "ruby": "p/ruby",
     "php": "p/php",
+    "c": "p/c",
+    "c#": "p/csharp",
+    # C++ has no dedicated Semgrep registry pack (p/cpp is 404); .cpp/.cc/.hpp files are still
+    # scanned by the language-agnostic base ruleset (config.sast_base_ruleset), and C++ is
+    # recognised at ingest + reported by the regex fallback (see _UNCOVERED_EXTENSIONS).
 }
 
 _CWE_NUMBER = re.compile(r"CWE[-_ ]?(\d+)", re.IGNORECASE)
@@ -219,6 +224,14 @@ _UNCOVERED_EXTENSIONS: dict[str, str] = {
     ".go": "go",
     ".rb": "ruby",
     ".php": "php",
+    ".c": "c",
+    ".h": "c",
+    ".cc": "c++",
+    ".cpp": "c++",
+    ".cxx": "c++",
+    ".hpp": "c++",
+    ".hh": "c++",
+    ".cs": "c#",
 }
 _WALK_EXTENSIONS = _REGEX_EXTENSIONS | frozenset(_UNCOVERED_EXTENSIONS)
 _SKIP_DIRS = frozenset(
