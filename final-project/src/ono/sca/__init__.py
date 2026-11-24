@@ -11,11 +11,14 @@ adding a new ecosystem means adding one parser to :mod:`ono.sca.manifests`.
 
 from __future__ import annotations
 
+from ono.sca.intel import IntelClient, IntelResult
 from ono.sca.osv import OsvClient, OsvResult, Vuln
 from ono.sca.scan import DependencyFinding, ScaReport, scan_dependencies
 
 __all__ = [
     "DependencyFinding",
+    "IntelClient",
+    "IntelResult",
     "OsvClient",
     "OsvResult",
     "ScaReport",

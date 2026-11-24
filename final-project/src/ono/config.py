@@ -590,8 +590,33 @@ class Settings(BaseSettings):
         default=False,
         description=(
             "Skip all OSV network calls and return the SCA report with status 'skipped'. For "
-            "air-gapped runs and the test suite; dependencies are still parsed, not queried."
+            "air-gapped runs and the test suite; dependencies are still parsed, not queried. "
+            "Also skips the KEV/EPSS exploitation-intel enrichment below."
         ),
+    )
+
+    # -- Exploitation-based prioritization: CISA KEV + EPSS (ono/sca/intel.py) ----------
+    # Enrich each OSV finding with two free, daily-updated, ecosystem-agnostic feeds that key
+    # on CVE id, then re-rank so the findings most likely to be exploited surface first:
+    # CISA's Known Exploited Vulnerabilities catalog and FIRST.org's Exploit Prediction
+    # Scoring System. Best effort and stdlib-only HTTP; a feed being down never aborts a scan.
+    kev_epss_enabled: bool = Field(
+        default=True,
+        description=(
+            "Enrich SCA findings with CISA KEV membership and EPSS probability and re-rank by "
+            "likely exploitation. False = findings keep their malicious/severity order and the "
+            "feeds are never contacted. Also skipped when sca_offline is true."
+        ),
+    )
+    cisa_kev_url: str = Field(
+        default=(
+            "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
+        ),
+        description="URL of the CISA Known Exploited Vulnerabilities catalog JSON.",
+    )
+    epss_api_url: str = Field(
+        default="https://api.first.org/data/v1",
+        description="Base URL of the FIRST.org EPSS API (the /epss batch endpoint).",
     )
 
     @model_validator(mode="after")

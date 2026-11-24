@@ -267,7 +267,7 @@ def test_known_vulnerable_version_maps_to_cve(tmp_path: Path) -> None:
             )
         ]
     }
-    settings = Settings(_env_file=None)
+    settings = Settings(_env_file=None, kev_epss_enabled=False)
     report = scan_dependencies(tmp_path, settings=settings, client=_client(db))
     assert report.status == "ok"
     assert len(report.findings) == 1
@@ -403,7 +403,8 @@ def test_per_package_fallback_when_querybatch_fails(tmp_path: Path) -> None:
         return base(url, body, timeout_s)
 
     client = OsvClient(base_url="https://osv.test", transport=flaky)
-    report = scan_dependencies(tmp_path, settings=Settings(_env_file=None), client=client)
+    settings = Settings(_env_file=None, kev_epss_enabled=False)
+    report = scan_dependencies(tmp_path, settings=settings, client=client)
     assert report.status == "ok"
     assert report.findings[0].vuln_ids == ["CVE-x"]
 
@@ -425,7 +426,7 @@ def test_sca_route_offline(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_sca_route_reports_findings(monkeypatch: pytest.MonkeyPatch) -> None:
     db = {("PyPI", "flask", "0.5"): [_vuln_record("CVE-y", aliases=["CVE-y"], fixed="1.0")]}
     monkeypatch.setattr(sca_scan, "_client_factory", lambda _settings: _client(db))
-    settings = Settings(_env_file=None)
+    settings = Settings(_env_file=None, kev_epss_enabled=False)
     with TestClient(create_app(settings, mount_ui=False)) as client:
         resp = client.post("/sca", json={"manifests": {"requirements.txt": "flask==0.5\n"}})
     assert resp.status_code == 200
