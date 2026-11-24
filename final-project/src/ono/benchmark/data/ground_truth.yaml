@@ -1,0 +1,68 @@
+# Curated ground truth for ONO's benchmark repos: the vulnerabilities each repo is KNOWN to
+# contain, used ONLY by ono.benchmark.score (offline, after a scan) to measure detection and
+# verification recall. Never imported by the scan pipeline, so it cannot leak into the prover.
+#
+# Each entry: cwe + location (a path substring a matching finding's sink file must contain).
+# Curated conservatively from each repo's own layout/docs, so recall is an honest LOWER BOUND;
+# extend freely - adding a repo or a vuln is just another list item.
+repos:
+  - key: pygoat
+    name: PyGoat
+    language: python
+    source: "dockerized_labs/* and challenge labs, one OWASP category each"
+    expected:
+      - {cwe: CWE-89,  location: "sql_injection_lab",      note: "SQL injection lab"}
+      - {cwe: CWE-78,  location: "command_injection_lab",  note: "OS command injection lab"}
+      - {cwe: CWE-79,  location: "xss_lab",                note: "cross-site scripting lab"}
+      - {cwe: CWE-918, location: "ssrf_lab",               note: "server-side request forgery lab"}
+      - {cwe: CWE-502, location: "insec_des_lab",          note: "insecure deserialization lab"}
+      - {cwe: CWE-611, location: "xxe_lab",                note: "XML external entity lab"}
+      - {cwe: CWE-327, location: "crypto_failure_lab",     note: "weak cryptography lab"}
+      - {cwe: CWE-639, location: "broken_access_lab",      note: "broken access control lab"}
+      - {cwe: CWE-287, location: "auth_failure_lab",       note: "authentication failure lab"}
+      - {cwe: CWE-345, location: "software_integrity_lab", note: "software/data integrity lab"}
+
+  - key: DVWA
+    name: Damn Vulnerable Web Application
+    language: php
+    source: "vulnerabilities/<name>/source/*.php"
+    expected:
+      - {cwe: CWE-78,  location: "vulnerabilities/exec",         note: "command injection"}
+      - {cwe: CWE-89,  location: "vulnerabilities/sqli",         note: "SQL injection"}
+      - {cwe: CWE-89,  location: "vulnerabilities/sqli_blind",   note: "blind SQL injection"}
+      - {cwe: CWE-79,  location: "vulnerabilities/xss_r",        note: "reflected XSS"}
+      - {cwe: CWE-79,  location: "vulnerabilities/xss_s",        note: "stored XSS"}
+      - {cwe: CWE-98,  location: "vulnerabilities/fi",           note: "file inclusion"}
+      - {cwe: CWE-434, location: "vulnerabilities/upload",       note: "unrestricted file upload"}
+      - {cwe: CWE-352, location: "vulnerabilities/csrf",         note: "cross-site request forgery"}
+      - {cwe: CWE-601, location: "vulnerabilities/open_redirect", note: "open redirect"}
+
+  - key: NodeGoat
+    name: OWASP NodeGoat
+    language: javascript
+    source: "app/routes/* (OWASP Top 10 tutorial app)"
+    expected:
+      - {cwe: CWE-95,  location: "app/routes/contributions", note: "server-side eval injection"}
+      - {cwe: CWE-918, location: "app/routes/research",      note: "SSRF via url parameter"}
+      - {cwe: CWE-79,  location: "app/routes/memos",         note: "stored XSS"}
+      - {cwe: CWE-639, location: "app/routes/allocations",   note: "insecure direct object reference"}
+      - {cwe: CWE-601, location: "app/routes/index",         note: "open redirect"}
+
+  - key: dvna
+    name: Damn Vulnerable NodeJS Application
+    language: javascript
+    source: "core/appHandler.js and routes"
+    expected:
+      - {cwe: CWE-89,  location: "appHandler", note: "SQL injection in userSearch"}
+      - {cwe: CWE-78,  location: "appHandler", note: "command injection"}
+      - {cwe: CWE-502, location: "appHandler", note: "insecure deserialization (node-serialize)"}
+      - {cwe: CWE-611, location: "appHandler", note: "XXE (libxmljs)"}
+      - {cwe: CWE-601, location: "appHandler", note: "open redirect"}
+
+  - key: dvpwa
+    name: Damn Vulnerable Python Web Application
+    language: python
+    source: "sqli/ and app views (aiohttp)"
+    expected:
+      - {cwe: CWE-89,  location: "sqli",   note: "SQL injection"}
+      - {cwe: CWE-327, location: "sqli",   note: "weak password hashing"}
