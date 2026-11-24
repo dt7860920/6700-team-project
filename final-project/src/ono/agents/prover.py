@@ -72,7 +72,7 @@ def run_prover(
         budget=budget,
         deadline=deadline,
         trajectory=trajectory,
-        accept=_accept,
+        accept=lambda call: _accept(call, is_js=not finding.file.endswith(".py")),
         text_fallback=_bare_script,
         last_step_hint=(
             "This is your LAST step. Answer now with submit_poc(code, how) using what you "
@@ -116,7 +116,7 @@ def _task_prompt(
     return text
 
 
-def _accept(call: ToolCall) -> tuple[Poc | None, str]:
+def _accept(call: ToolCall, *, is_js: bool) -> tuple[Poc | None, str]:
     code = str(call.args.get("code") or call.args.get("script") or "").strip("\n")
     if not code.strip():
         return None, 'the "code" field must contain the complete script'
@@ -129,7 +129,40 @@ def _accept(call: ToolCall) -> tuple[Poc | None, str]:
             "TypeScript) and pass it into the application; a hard-coded payload cannot be "
             "verified"
         )
+    ok, why = _language_ok(code, is_js=is_js)
+    if not ok:
+        return None, why
     return Poc(code=code + "\n", how=str(call.args.get("how") or "")[:300]), ""
+
+
+# A PoC in the wrong language cannot possibly drive the target (the live run's dominant
+# waste: a Python `requests` script submitted against a JavaScript Express app). The sink's
+# runtime is decided by the sink file's extension - the jail runs a JS sink's PoC with
+# `node` and a Python sink's with `python3` - so a cross-language script is rejected here
+# rather than burning a whole verify cycle on a script that can never reach the sink.
+_PY_SIGNALS = ("os.environ", "import os", "import sys", "\ndef ", "print(", "if __name__")
+_JS_SIGNALS = ("process.env", "require(", "=>", "console.log", "module.exports", "await ")
+
+
+def _language_ok(code: str, *, is_js: bool) -> tuple[bool, str]:
+    """Reject a script written in the wrong language for the sink's runtime (clear mismatch
+    only - a script showing one language's hallmarks and none of the other's)."""
+    has_py = any(s in code for s in _PY_SIGNALS)
+    has_js = any(s in code for s in _JS_SIGNALS)
+    if is_js and has_py and not has_js:
+        return False, (
+            "this is a JavaScript/TypeScript target: the jail runs the PoC with `node`, so a "
+            "Python script can never reach the sink. Rewrite it in JavaScript (CommonJS "
+            "require()), read the payload with process.env.ONO_PAYLOAD, and drive the app's "
+            "exported route on an ephemeral 127.0.0.1 port (see the Node drive in the scaffold)."
+        )
+    if not is_js and has_js and not has_py:
+        return False, (
+            "this is a Python target: the jail runs the PoC with `python3`, so a Node/JS "
+            'script can never reach the sink. Rewrite it in Python, read os.environ["ONO_PAYLOAD"],'
+            " and drive the app's OWN entry point (its test client / front controller)."
+        )
+    return True, ""
 
 
 def _bare_script(text: str) -> ToolCall | None:
