@@ -7,7 +7,8 @@ function clock(iso: string): string {
 
 export function ActivityLog({ events, live }: { events: ProgressEvent[]; live: boolean }) {
   if (events.length === 0) return null;
-  // Most recent last; show newest at the bottom so the log reads like a transcript.
+  // Newest first: new events appear at the top of the list.
+  const newestFirst = [...events].reverse();
   return (
     <div className="card">
       <div className="mb-3 flex items-center gap-2">
@@ -15,10 +16,10 @@ export function ActivityLog({ events, live }: { events: ProgressEvent[]; live: b
         {live && <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-brand" />}
       </div>
       <ol className="space-y-1.5">
-        {events.map((e, i) => {
-          const last = i === events.length - 1;
+        {newestFirst.map((e, i) => {
+          const last = i === 0;
           return (
-            <li key={i} className="flex gap-3 text-sm">
+            <li key={events.length - i} className="flex gap-3 text-sm">
               <span className="shrink-0 pt-px font-mono text-xs text-faint">{clock(e.at)}</span>
               <span className={`${last && live ? "text-ink" : "text-body"}`}>
                 {last && live && <span className="mr-1 text-brand">›</span>}

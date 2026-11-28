@@ -4,6 +4,7 @@ import type { TargetSummary } from "../api/types";
 import { ActivityLog } from "../components/ActivityLog";
 import { FindingsList } from "../components/FindingsList";
 import { StageTimeline } from "../components/StageTimeline";
+import { WorkflowGraph } from "../components/WorkflowGraph";
 import type { useScan } from "../hooks/useScan";
 
 const STATUS_TONE: Record<string, string> = {
@@ -59,6 +60,7 @@ export function ScanPage({ scan, targets }: Props) {
 
       {s && (
         <>
+          <WorkflowGraph scan={s} />
           <StageTimeline scan={s} />
           <ActivityLog events={s.events} live={running} />
           {scan.phase === "done" && <FindingsList scan={s} findings={scan.findings} />}
