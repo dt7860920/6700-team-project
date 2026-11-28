@@ -7,8 +7,8 @@ Team: Sazan Khalid · Kenedy Ducheine · Junyi Tang · Jeffrey Pinarchick
 
 | | |
 |---|---|
-| Live app (Jetstream2) | [http://149.165.154.219:8080/ui/](http://149.165.154.219:8080/ui/), running the `service` backend with `qwen2.5-coder:7b` |
-| API docs (OpenAPI) | [http://149.165.154.219:8080/docs](http://149.165.154.219:8080/docs) |
+| Live app (Jetstream2) | [http://149.165.154.115:8080/ui/](http://149.165.154.115:8080/ui/), running the `service` backend with `qwen2.5-coder:7b` |
+| API docs (OpenAPI) | [http://149.165.154.115:8080/docs](http://149.165.154.115:8080/docs) |
 | Repository | [`dt7860920/6700-team-project`](https://github.com/dt7860920/6700-team-project), in `final-project/` |
 | Design docs | [Project plan](docs/plan.md) · [Deliverable 2 write-up](docs/deliverable2.md) · [Access control and TLS](docs/auth.md) · [Executor deployment hardening](docs/executor-hardening.md) |
 
@@ -76,6 +76,31 @@ curl http://localhost:8080/health             # {"status":"ok"}
 ```
 
 The image is based on `ghcr.io/astral-sh/uv:python3.13-bookworm-slim`, installs dependencies from the lockfile in a cached layer *before* copying source, runs as a non-root user, and carries a `HEALTHCHECK` against `/health`. Only port **8080** is exposed.
+
+## Connect to the live instance
+
+The team instance runs on Jetstream2 as `exouser`, with the repo at `~/6700-team-project/final-project`. Its floating IP changed from `149.165.154.219` to `149.165.154.115` in November 2026. If the IP changes again, look it up in [Exosphere](https://jetstream2.exosphere.app).
+
+From your laptop:
+
+```bash
+ssh exouser@149.165.154.115
+```
+
+On the instance:
+
+```bash
+cd ~/6700-team-project/final-project
+git pull                                # or: git checkout <branch> && git pull
+docker compose up -d --build            # rebuild and restart (also rebuilds the React UI)
+docker compose ps                       # wait for both services to be "healthy"
+curl http://localhost:8080/health
+docker compose logs -f app              # follow app logs; Ctrl-C to stop
+```
+
+The UI is then at `http://149.165.154.115:8080/ui/`.
+
+If `ssh` prints `REMOTE HOST IDENTIFICATION HAS CHANGED`, the instance was rebuilt or the IP now belongs to another VM. Check the instance and its IP in Exosphere first. Then remove the stale key with `ssh-keygen -R <old-ip>` and connect to the current IP.
 
 ## Run with Compose on Jetstream2
 

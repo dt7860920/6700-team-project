@@ -1,10 +1,15 @@
-import { useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   Background,
   BackgroundVariant,
+  Controls,
   Handle,
   Position,
   ReactFlow,
+  ReactFlowProvider,
+  applyNodeChanges,
+  useReactFlow,
+  type NodeChange,
   type Edge,
   type Node,
   type NodeProps,
@@ -68,6 +73,25 @@ function derive(scan: Scan | null): Derived {
   };
 }
 
+// The node the camera should sit on: the stage that is running now, or the
+// outcome the scan ended in.
+function focusNode(scan: Scan | null, d: Derived): string {
+  if (!scan) return "ingest";
+  if (d.noCandidates) return "nocand";
+  if (d.verifyOk) return "verified";
+  if (d.verifyFailed) return "unverified";
+  const failed = STAGE_ORDER.find((s) => d.st[s] === "failed");
+  if (failed) return failed;
+  const active = STAGE_ORDER.find((s) => d.st[s] === "active");
+  if (active) return active === "sast" && d.usedRegex ? "regex" : active;
+  const lastDone = [...STAGE_ORDER].reverse().find((s) => d.st[s] === "ok");
+  return lastDone ?? "ingest";
+}
+
+const NODE_W = 150;
+const NODE_H = 64;
+const FOLLOW_ZOOM = 1.55;
+
 // ---- node rendering --------------------------------------------------------
 
 const RING: Record<NodeState, string> = {
@@ -128,7 +152,18 @@ const LABEL = { fill: "#6E6B64", fontFamily: "ui-monospace, monospace", fontSize
 const LABEL_BG = { fill: "#FBFAF7" } as const;
 
 export function WorkflowGraph({ scan }: { scan: Scan | null }) {
-  const { nodes, edges } = useMemo(() => {
+  return (
+    <ReactFlowProvider>
+      <FollowingGraph scan={scan} />
+    </ReactFlowProvider>
+  );
+}
+
+function FollowingGraph({ scan }: { scan: Scan | null }) {
+  const { setCenter } = useReactFlow();
+  const [ready, setReady] = useState(false);
+
+  const { nodes, edges, focus } = useMemo(() => {
     const d = derive(scan);
     const sub = (s: StageName) => scan?.pipeline.find((p) => p.stage === s)?.summary;
 
@@ -203,26 +238,57 @@ export function WorkflowGraph({ scan }: { scan: Scan | null }) {
       ctx("analyze-model", "analyze", "b", "model", "tt", "", d.running),
     ];
 
-    return { nodes, edges };
+    return { nodes, edges, focus: focusNode(scan, d) };
   }, [scan]);
 
+  // Keep React Flow's own node state so measured sizes survive each poll.
+  // Without this, nodes rebuilt from the latest scan lose their measurements
+  // and React Flow keeps them hidden.
+  const [rfNodes, setRfNodes] = useState<Node[]>(nodes);
+  useEffect(() => {
+    setRfNodes((prev) =>
+      nodes.map((n) => {
+        const old = prev.find((p) => p.id === n.id);
+        return old?.measured ? { ...n, measured: old.measured } : n;
+      }),
+    );
+  }, [nodes]);
+  const onNodesChange = (changes: NodeChange[]) =>
+    setRfNodes((ns) => applyNodeChanges(changes, ns));
+
+  // Follow the scan: whenever the current step changes, glide the zoomed-in
+  // camera to it. Dragging the map pans freely until the next step starts.
+  useEffect(() => {
+    if (!ready) return;
+    const n = nodes.find((x) => x.id === focus);
+    if (!n) return;
+    setCenter(n.position.x + NODE_W / 2, n.position.y + NODE_H / 2, {
+      zoom: FOLLOW_ZOOM,
+      duration: 900,
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focus, ready]);
+
   return (
-    <div className="card h-[380px] overflow-hidden p-0">
+    <div className="card h-[520px] overflow-hidden p-0">
       <ReactFlow
-        nodes={nodes}
+        nodes={rfNodes}
         edges={edges}
         nodeTypes={nodeTypes}
-        fitView
-        fitViewOptions={{ padding: 0.22 }}
+        onNodesChange={onNodesChange}
+        onInit={() => setReady(true)}
         minZoom={0.3}
+        maxZoom={2.5}
         proOptions={{ hideAttribution: true }}
         nodesDraggable={false}
         nodesConnectable={false}
         elementsSelectable={false}
         panOnDrag
         zoomOnScroll={false}
+        zoomOnPinch
       >
         <Background variant={BackgroundVariant.Dots} gap={22} size={1} color="#E4E0D6" />
+        <Controls showInteractive={false} position="bottom-right" />
       </ReactFlow>
     </div>
   );
